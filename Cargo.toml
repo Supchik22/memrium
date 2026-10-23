@@ -1,0 +1,50 @@
+[package]
+name = "memrium-de"
+version = "0.1.0"
+edition = "2021"
+description = "The Memrium desktop shell: a Wayland compositor with a GPU jelly-glass renderer, bars, dock, launcher, settings, and the library its programs share."
+license = "MIT"
+repository = "https://github.com/Supchik22/memrium"
+default-run = "memrium_compositor"
+
+[[bin]]
+name = "memrium_preview"
+path = "src/main.rs"
+
+[dependencies]
+chebrium = { git = "https://github.com/Supchik22/chebrium" }
+wgpu = { version = "25" }
+pollster = "0.4"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "ico"] }
+smithay = { version = "0.7", default-features = false, features = ["wayland_frontend", "xwayland"] }
+calloop = "0.14"
+ash = "0.38"
+libloading = "0.8"
+zbus = "5"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+resvg = { version = "0.45", default-features = false, features = ["raster-images"] }
+libc = "0.2"
+wayland-scanner = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["server"] }
+wayland-protocols = { version = "0.32", features = ["client"] }
+x11rb = { version = "0.13", default-features = false }
+drm = "0.14"
+drm-fourcc = "2"
+input = "0.9"
+libseat = "0.2"
+rustix = { version = "1", features = ["event", "fs"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+# archives (the archive manager and the "Extract" / "Compress" entries of Files)
+zip = { version = "2", default-features = false, features = ["deflate", "bzip2"] }
+tar = "0.4"
+flate2 = "1"
+bzip2 = "0.5"
+xz2 = "0.1"
+zstd = "0.13"
+sevenz-rust2 = { version = "0.13", default-features = false, features = ["compress"] }

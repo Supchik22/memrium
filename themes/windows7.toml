@@ -1,0 +1,73 @@
+name = "Aero"
+layout = "taskbar"
+dark = false
+accent = [0.20, 0.55, 0.95]
+files = "Details"
+
+# Aero: translucent sky-blue glass with a glossy sheen and a white border, over a white content area
+[glass]
+blur = 10.0
+refraction = 4.0
+bezel = 10.0
+dispersion = 0.0
+rim = 0.30
+gloss = 0.85
+saturation = 1.30
+tint = [0.52, 0.76, 0.97, 0.52]
+border = [1.0, 1.0, 1.0, 0.70]
+shadow = [0.32, 24.0, 8.0]
+
+[window]
+decoration = "aero"
+radius = 8.0
+titlebar = 30.0
+title_align = "left"
+client_opacity = 0.97
+
+# motion: Aero is quick and snappy, Fluent fades, macOS is springy
+[animations]
+speed = 1.4
+switch = "circle"
+switch_ms = 520
+rim = false
+
+[wallpaper]
+kind = "image"
+path = "builtin:meadow"
+
+[[bars]]
+name = "taskbar"
+edge = "bottom"
+shape = "strip"
+surface = "glass"
+height = 42.0
+left = [
+    { kind = "start", style = "orb", size = 40.0 },
+    { kind = "tasks", icon_size = 32.0, button_w = 56.0, indicator = "glass" },
+]
+right = [
+    { kind = "tray", icons = ["wifi", "volume-2"] },
+    { kind = "clock", format = "%l:%M %p", format2 = "%m/%d/%Y" },
+    { kind = "show-desktop" },
+]
+
+[bars.glass]
+blur = 14.0
+refraction = 0.0
+bezel = 8.0
+dispersion = 0.0
+rim = 0.0
+gloss = 0.8
+saturation = 1.2
+tint = [0.20, 0.38, 0.62, 0.58]
+border = [1.0, 1.0, 1.0, 0.45]
+shadow = [0.0, 0.0, 0.0]
+
+[launcher]
+style = "start_menu_win7"
+
+[icons]
+shape = "rounded"
+plate = "tile"
+tile = "vivid"
+padding = 0.16

@@ -1,0 +1,69 @@
+name = "Fluent"
+layout = "taskbar"
+dark = false
+accent = [0.0, 0.47, 0.84]
+
+# flat, acrylic-like surfaces: blur without refraction, soft corners, no rim light
+[glass]
+blur = 28.0
+refraction = 0.0
+bezel = 8.0
+dispersion = 0.0
+rim = 0.0
+gloss = 0.0
+saturation = 1.35
+tint = [0.96, 0.97, 0.99, 0.72]
+border = [0.0, 0.0, 0.0, 0.10]
+shadow = [0.22, 30.0, 10.0]
+
+[window]
+decoration = "win11"
+radius = 8.0
+titlebar = 32.0
+title_align = "left"
+
+[[bars]]
+name = "taskbar"
+edge = "bottom"
+shape = "strip"
+surface = "glass"
+height = 48.0
+center = [
+    { kind = "start", style = "logo" },
+    { kind = "search-box", width = 190.0 },
+    { kind = "tasks", icon_size = 26.0, button_w = 44.0, indicator = "underline" },
+]
+right = [
+    { kind = "tray", icons = ["wifi", "volume-2", "battery-full"] },
+    { kind = "clock", format = "%l:%M %p", format2 = "%m/%d/%Y" },
+]
+
+[bars.glass]
+blur = 30.0
+refraction = 0.0
+bezel = 8.0
+dispersion = 0.0
+rim = 0.0
+gloss = 0.0
+saturation = 1.35
+tint = [0.95, 0.96, 0.98, 0.78]
+border = [0.0, 0.0, 0.0, 0.12]
+shadow = [0.0, 0.0, 0.0]
+
+[launcher]
+style = "start_menu_win11"
+
+[icons]
+shape = "rounded"
+plate = "tile"
+tile = "vivid"
+padding = 0.16
+
+# motion: Aero is quick and snappy, Fluent fades, macOS is springy
+[animations]
+speed = 1.15
+switch = "fade"
+switch_ms = 450
+rim = false
+
+

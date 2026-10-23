@@ -1,0 +1,68 @@
+name = "Jelly Glass"
+layout = "macos"
+dark = false
+accent = [0.04, 0.52, 1.0]
+
+[glass]
+blur = 5.9902
+refraction = 30.5948
+bezel = 90.0
+dispersion = 0.0469
+rim = 0.5293
+rim_sharp = 0.7842
+gloss = 0.0694
+saturation = 1.2873
+adapt = 0.1203
+tint = [0.7336, 0.84, 0.92, 0.1109]
+border = [0.0, 0.0, 0.0, 0.0325]
+shadow = [0.1836, 22.0, 8.0]
+
+[window]
+decoration = "mac"
+radius = 26.0
+titlebar = 40.0
+title_align = "center"
+# a maximized window gives up its title bar: the close / minimize / zoom buttons move into the menu bar
+hide_title_max = true
+
+[menubar]
+height = 38.0
+bar = true
+kind = "glass"
+opacity = 0.35
+blur = 16.0
+border = true
+show_title = true
+
+[dock]
+icon_size = 64.0
+magnify = true
+radius = 36.0
+gap = 14.0
+
+[launcher]
+style = "figlet"
+
+[icons]
+shape = "rounded"
+plate = "tile"
+tile = "vivid"
+padding = 0.16
+
+# Which widgets the top bar holds. A widget is a name or a table with options.
+# Names: logo, title, app-menu, clock {format}, battery, wifi, bluetooth, volume, search,
+#        button {icon, action}, text {text, bold}, spacer {width}, divider, control-center
+# Actions: launcher, settings, files, terminal, screenshot, screenshot-region, control-center, edit-controls, quit
+# [bar]
+# left   = ["logo", "title", "app-menu"]
+# center = []
+# right  = ["battery", "wifi", "search", "control-center", "clock"]
+
+# motion: Aero is quick and snappy, Fluent fades, macOS is springy
+[animations]
+speed = 1.0
+switch = "circle"
+switch_ms = 800
+rim = true
+
+

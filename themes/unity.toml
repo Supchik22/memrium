@@ -1,0 +1,94 @@
+name = "Unity"
+layout = "macos"
+dark = true
+# Ubuntu orange
+accent = [0.91, 0.33, 0.13]
+
+# aubergine glass: a little blur, soft light, a purple cast
+[glass]
+blur = 14.0
+refraction = 8.0
+bezel = 14.0
+dispersion = 0.01
+rim = 0.25
+rim_sharp = 0.4
+gloss = 0.02
+saturation = 1.08
+adapt = 0.0
+tint = [0.20, 0.05, 0.15, 0.62]
+border = [1.0, 1.0, 1.0, 0.08]
+shadow = [0.30, 24.0, 8.0]
+
+# windows with the buttons on the left, like Unity's
+[window]
+decoration = "mac"
+radius = 8.0
+titlebar = 34.0
+title_align = "center"
+shadow = [0.40, 36.0, 14.0]
+shadow_idle = [0.22, 24.0, 8.0]
+client_opacity = 0.96
+
+# the top panel: dark aubergine, with the focused app's name and menus (Unity's global menu)
+[menubar]
+height = 30.0
+bar = true
+kind = "solid"
+opacity = 0.94
+blur = 0.0
+border = false
+show_title = true
+color = [0.17, 0.04, 0.12]
+
+[dock]
+icon_size = 46.0
+magnify = false
+radius = 10.0
+gap = 8.0
+
+# the Dash
+[launcher]
+style = "figlet"
+
+[icons]
+shape = "rounded"
+plate = "tile"
+tile = "vivid"
+padding = 0.14
+
+# the panel on top, and the Launcher down the left side: the Dash button, then the apps
+[[bars]]
+name = "panel"
+edge = "top"
+shape = "strip"
+left = ["title", "app-menu"]
+right = [{ kind = "tray", chevron = true, wifi = false, volume = false, battery = false, bluetooth = false }, "battery", "wifi", "volume", "control-center", "clock"]
+
+[[bars]]
+name = "launcher"
+edge = "left"
+shape = "strip"
+surface = "glass"
+height = 66.0
+left = [
+    { kind = "button", icon = "layout-grid", action = "launcher" },
+    { kind = "dock", icon_size = 46.0, gap = 8.0, magnify = false, tooltips = false, indicator = "dot", separators = false, bounce = true },
+]
+
+[bars.glass]
+blur = 14.0
+refraction = 0.0
+bezel = 8.0
+dispersion = 0.0
+rim = 0.0
+gloss = 0.0
+saturation = 1.1
+tint = [0.20, 0.05, 0.15, 0.70]
+border = [1.0, 1.0, 1.0, 0.06]
+shadow = [0.0, 0.0, 0.0]
+
+[animations]
+speed = 1.0
+switch = "fade"
+switch_ms = 500
+rim = false

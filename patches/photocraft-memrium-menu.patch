@@ -1,0 +1,246 @@
+diff --git a/apps/photocraft/src/memrium_menu.rs b/apps/photocraft/src/memrium_menu.rs
+new file mode 100644
+index 0000000..8418b14
+--- /dev/null
++++ b/apps/photocraft/src/memrium_menu.rs
+@@ -0,0 +1,169 @@
++//! The menu bar of the Memrium desktop, through its AppMenu service on the session bus
++//! (`io.github.supchik22.Memrium.AppMenu`). The menus themselves, in the layout of the in-window bar, come from
++//! `photocraft_ui_egui::native_menu::plain_layout`; this file sends them and brings back the clicks.
++//!
++//! - `Set(app_id, rows)` hands over the whole menu as flat rows `(node, parent, label, key, id, flags)`: nodes count from 1
++//!   depth-first, parent 0 is the bar itself, flags are 1 enabled, 2 checked, 4 separator.
++//! - A click comes back as the `Activated(app_id, id)` signal. The wire ids are numbers: the command id is hashed, and
++//!   the table of what was sent turns the number back into the command.
++//! - With no shell serving the name (another desktop) nothing is installed and the window keeps its own menus. The menus
++//!   are sent again only when they changed.
++
++use std::collections::HashMap;
++use std::hash::{DefaultHasher, Hash, Hasher};
++use std::sync::{Arc, Mutex};
++
++use photocraft_ui_egui::native_menu::{self, Backend, Event, MenuBar, Node};
++use zbus::blocking::Connection;
++use zbus::message::Type;
++
++const BUS: &str = "io.github.supchik22.Memrium.AppMenu";
++const PATH: &str = "/io/github/supchik22/Memrium/AppMenu";
++const IFACE: &str = "io.github.supchik22.Memrium.AppMenu";
++
++const ENABLED: u8 = 1;
++const CHECKED: u8 = 2;
++const SEPARATOR: u8 = 4;
++
++type Row = (u32, u32, String, String, u32, u8);
++
++pub struct MemriumMenu {
++    conn: Connection,
++    app_id: String,
++    sent: Vec<Row>,
++    /// wire id -> command id, for what was sent
++    commands: HashMap<u32, String>,
++    clicks: Arc<Mutex<Vec<u32>>>,
++    table: Arc<Mutex<HashMap<u32, String>>>,
++}
++
++pub fn install(app_id: &str, ctx: &egui::Context, app: &photocraft_ui_egui::PhotocraftApp) -> Option<native_menu::NativeMenu> {
++    let conn = Connection::session().ok()?;
++    let dbus = zbus::blocking::fdo::DBusProxy::new(&conn).ok()?;
++    if !dbus.name_has_owner(BUS.try_into().ok()?).unwrap_or(false) {
++        return None;
++    }
++    let clicks = Arc::new(Mutex::new(Vec::new()));
++    let table = Arc::new(Mutex::new(HashMap::new()));
++    {
++        let (conn, id, clicks, ctx) = (conn.clone(), app_id.to_string(), clicks.clone(), ctx.clone());
++        std::thread::Builder::new()
++            .name("appmenu-clicks".into())
++            .spawn(move || {
++                let rule = zbus::MatchRule::builder().msg_type(Type::Signal).interface(IFACE).ok()?.member("Activated").ok()?.build();
++                for msg in zbus::blocking::MessageIterator::for_match_rule(rule, &conn, None).ok()?.flatten() {
++                    if let Ok((app, item)) = msg.body().deserialize::<(String, u32)>() {
++                        if app == id {
++                            if let Ok(mut q) = clicks.lock() {
++                                q.push(item);
++                            }
++                            ctx.request_repaint();
++                        }
++                    }
++                }
++                Some(())
++            })
++            .ok()?;
++    }
++    let mut menu = MemriumMenu { conn, app_id: app_id.to_string(), sent: Vec::new(), commands: HashMap::new(), clicks, table };
++    let lang = photocraft_ui_egui::i18n::Lang::from_pref(&app.session.prefs().interface.language);
++    menu.sync(&native_menu::plain_layout(&photocraft_ui_egui::menus::menu_items(app), lang).bar);
++    log::info!("menu: the desktop's global menu bar is serving this window");
++    Some(native_menu::NativeMenu::new(Box::new(menu)))
++}
++
++/// A number for a command id that stays the same from one send to the next.
++fn wire_id(command: &str) -> u32 {
++    let mut h = DefaultHasher::new();
++    command.hash(&mut h);
++    (h.finish() as u32).max(1)
++}
++
++/// `Cmd` is the platform's command key: Ctrl here.
++fn key_text(shortcut: &str) -> String {
++    shortcut.replace("Cmd", "Ctrl")
++}
++
++fn rows(bar: &MenuBar) -> (Vec<Row>, HashMap<u32, String>) {
++    fn walk(nodes: &[Node], parent: u32, rows: &mut Vec<Row>, ids: &mut HashMap<u32, String>) {
++        for n in nodes {
++            let node = rows.len() as u32 + 1;
++            match n {
++                Node::Item(it) => {
++                    let id = wire_id(&it.id);
++                    ids.insert(id, it.id.clone());
++                    let flags = (it.enabled as u8 * ENABLED) | (it.checked == Some(true)) as u8 * CHECKED;
++                    rows.push((node, parent, it.label.clone(), it.shortcut.as_deref().map(key_text).unwrap_or_default(), id, flags));
++                }
++                Node::Separator => rows.push((node, parent, String::new(), String::new(), 0, SEPARATOR)),
++                Node::Submenu { label, children, .. } => {
++                    rows.push((node, parent, label.clone(), String::new(), 0, ENABLED));
++                    walk(children, node, rows, ids);
++                }
++                // what a Mac menu holds; not in this layout
++                Node::Standard(_) => {}
++            }
++        }
++    }
++    let (mut out, mut ids) = (Vec::new(), HashMap::new());
++    for m in &bar.menus {
++        let node = out.len() as u32 + 1;
++        out.push((node, 0, m.title.clone(), String::new(), 0, ENABLED));
++        walk(&m.children, node, &mut out, &mut ids);
++    }
++    (out, ids)
++}
++
++impl Backend for MemriumMenu {
++    fn sync(&mut self, bar: &MenuBar) {
++        let (rows, ids) = rows(bar);
++        if rows == self.sent {
++            return;
++        }
++        // the table first: a click on the new menu can arrive before this call returns
++        if let Ok(mut t) = self.table.lock() {
++            t.extend(ids.clone());
++        }
++        if self.conn.call_method(Some(BUS), PATH, Some(IFACE), "Set", &(self.app_id.as_str(), &rows)).is_ok() {
++            self.sent = rows;
++            self.commands = ids;
++        }
++    }
++
++    fn drain(&mut self) -> Vec<Event> {
++        let ids: Vec<u32> = self.clicks.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
++        let table = self.table.lock().map(|t| t.clone()).unwrap_or_default();
++        ids.into_iter().filter_map(|i| table.get(&i).cloned().map(Event::Click)).collect()
++    }
++
++    fn plain(&self) -> bool {
++        true
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use native_menu::{Item, Menu, MenuRole};
++
++    fn item(id: &str, label: &str) -> Node {
++        Node::Item(Item { id: id.into(), label: label.into(), shortcut: Some("Cmd+O".into()), enabled: true, checked: None, role: None })
++    }
++
++    #[test]
++    fn menus_become_flat_rows() {
++        let bar = MenuBar {
++            menus: vec![Menu {
++                title: "File".into(),
++                role: MenuRole::Normal,
++                children: vec![item("file.open", "Open"), Node::Separator, Node::Submenu { label: "Recent".into(), children: vec![item("file.recent.0", "a.psd")], role: None }],
++            }],
++        };
++        let (rows, ids) = rows(&bar);
++        assert_eq!(rows.len(), 5);
++        assert_eq!((rows[0].1, rows[1].1, rows[4].1), (0, 1, 4), "parents: the bar, File, Recent");
++        assert_eq!(rows[1].3, "Ctrl+O");
++        assert_eq!(rows[2].5, SEPARATOR);
++        assert_eq!(ids.get(&rows[1].4).map(String::as_str), Some("file.open"));
++    }
++}
+diff --git a/apps/photocraft/src/main.rs b/apps/photocraft/src/main.rs
+index b4cf01d..caee57a 100644
+--- a/apps/photocraft/src/main.rs
++++ b/apps/photocraft/src/main.rs
+@@ -49,6 +49,9 @@ mod file_dialog_probe;
+ mod gpu_startup;
+ #[cfg(target_os = "linux")]
+ mod icon_theme;
++// The global menu of a desktop shell that serves one (the Memrium shell).
++#[cfg(target_os = "linux")]
++mod memrium_menu;
+ #[cfg(target_os = "macos")]
+ mod mac_menu;
+ #[cfg(target_os = "macos")]
+@@ -844,7 +847,12 @@ fn main() -> eframe::Result {
+                     app.services.native_menu = mac_menu::install(&cc.egui_ctx, &app);
+                 }
+             }
+-            #[cfg(not(target_os = "macos"))]
++            // A shell that serves a global menu bar gets the menus; without one the window keeps its own.
++            #[cfg(target_os = "linux")]
++            if !in_window_menus {
++                app.services.native_menu = memrium_menu::install(APP_ID, &cc.egui_ctx, &app);
++            }
++            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+             let _ = in_window_menus;
+             // Files from later launches (Explorer, file managers) open here as new tabs.
+             #[cfg(not(target_os = "macos"))]
+diff --git a/crates/ui-egui/src/native_menu.rs b/crates/ui-egui/src/native_menu.rs
+index e76c20e..fa10bb2 100644
+--- a/crates/ui-egui/src/native_menu.rs
++++ b/crates/ui-egui/src/native_menu.rs
+@@ -623,6 +623,16 @@ pub fn photocraft_layout(items: &[MenuItem], lang: Lang, language: &str) -> Layo
+     layout
+ }
+ 
++/// PhotoCraft's menus for a desktop's global menu bar that is not a Mac's: the same menus as the in-window bar, in the UI
++/// language, with Window and Help marked as such.
++pub fn plain_layout(items: &[MenuItem], lang: Lang) -> Layout {
++    let mut bar = from_items(&crate::menus::TOP_MENUS, items);
++    bar.tag_menu("Window", MenuRole::Window);
++    bar.tag_menu("Help", MenuRole::Help);
++    translate(&mut bar, lang);
++    Layout { bar, clashes: Vec::new() }
++}
++
+ // ----------------------------------------------------------------------------- the app's side
+ 
+ /// What the native menu reports.
+@@ -642,6 +652,11 @@ pub trait Backend {
+     /// Events since the last call. Platform items (Hide, Services, Zoom, …) are handled by the
+     /// backend and not reported.
+     fn drain(&mut self) -> Vec<Event>;
++    /// The desktop's menu bar takes the menus as they are in the window (no Mac app menu, no Mac key rules): a
++    /// desktop shell that serves a global menu (the Memrium shell's AppMenu service) says so here.
++    fn plain(&self) -> bool {
++        false
++    }
+ }
+ 
+ /// The native menu bar, while PhotoCraft uses one (the in-window menus are hidden then).
+@@ -721,7 +736,8 @@ pub fn sync(app: &mut PhotocraftApp, ctx: &egui::Context) {
+     for it in &mut items {
+         it.enabled &= crate::menus::modal_allows(app, &it.id);
+     }
+-    let layout = photocraft_layout(&items, lang, &app.session.prefs().interface.language);
++    let plain = app.services.native_menu.as_ref().is_some_and(|m| m.backend.plain());
++    let layout = if plain { plain_layout(&items, lang) } else { photocraft_layout(&items, lang, &app.session.prefs().interface.language) };
+     let Some(menu) = app.services.native_menu.as_mut() else { return };
+     if !menu.logged {
+         for c in &layout.clashes {

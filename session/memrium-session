@@ -1,0 +1,31 @@
+#!/bin/sh
+# Start Memrium as a real desktop session (from a TTY login or a display manager).
+# Needs: a free VT, libseat access (logind or seatd), the GPU and input devices of the seat.
+
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=Memrium
+export XDG_SESSION_DESKTOP=Memrium
+export MOZ_ENABLE_WAYLAND=1
+export QT_QPA_PLATFORM="wayland;xcb"
+export GDK_BACKEND="wayland,x11"
+# (SDL_VIDEODRIVER is left alone: SDL picks Wayland and falls back to X11 by itself, which games inside Steam need)
+# Qt programs follow the shell's look through the chebrium style (qtstyle/), when it is built or installed next to the session
+for d in "${XDG_DATA_HOME:-$HOME/.local/share}/memrium-de/qt-plugins" "$(dirname "$(readlink -f "$0")")/../qtstyle/build" "$(dirname "$(readlink -f "$0")")/qt-plugins"; do
+    if [ -f "$d/styles/libchebrium.so" ]; then
+        export QT_PLUGIN_PATH="$d${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
+        export QT_STYLE_OVERRIDE="${QT_STYLE_OVERRIDE:-chebrium}"
+        break
+    fi
+done
+export _JAVA_AWT_WM_NONREPARENTING=1
+
+here=$(dirname "$(readlink -f "$0")")
+bin="${MEMRIUM_COMPOSITOR:-$here/memrium_compositor}"
+# next to the script when installed; otherwise the cargo build of this repository
+[ -x "$bin" ] || bin="$here/../target/release/memrium_compositor"
+
+# a session D-Bus is needed by many apps; start one unless the login already has it
+if command -v dbus-run-session >/dev/null 2>&1 && [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+    exec dbus-run-session -- "$bin" --session "$@"
+fi
+exec "$bin" --session "$@"

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Memrium
+Comment=Configurable Wayland desktop: Jelly Glass, Fluent and Aero looks
+Exec=memrium-session
+Type=Application
+DesktopNames=Memrium
