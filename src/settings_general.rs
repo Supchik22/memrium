@@ -245,10 +245,12 @@ pub(super) fn page_general(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, c
     ui.section(x, f.y - 2.0, "SCREENSHOTS");
     f.skip(22.0);
     let s = &mut cfg.screenshots;
+    f.pick(ui, "Save to", &mut s.target, &[(crate::shots::ShotTarget::Folder, "Folder"), (crate::shots::ShotTarget::Clipboard, "Clipboard"), (crate::shots::ShotTarget::Both, "Both")]);
     f.toggle(ui, "Flash", &mut s.flash);
     f.toggle(ui, "Notice in the corner", &mut s.notice);
     f.toggle(ui, "Shutter sound", &mut s.sound);
     f.slider(ui, "Volume", &mut s.volume, 0.0, 1.5, "");
+    f.pick(ui, "Recording speed", &mut s.record_fps, &[(15, "15 fps"), (30, "30 fps"), (60, "60 fps")]);
     f.text(ui, "Folder", "shots-dir", &mut s.dir, None);
     ui.section(x, f.y - 2.0, "WIDGETS PANEL");
     f.skip(22.0);

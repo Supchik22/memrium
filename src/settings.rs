@@ -151,6 +151,8 @@ pub struct SettingsCtx<'a> {
     pub app_icon: &'a dyn Fn(&str) -> Option<u32>,
     /// the app ids whose icons a page showed without having them: the shell loads them for the next frame
     pub want_icons: &'a mut Vec<String>,
+    /// the names of the icons of the icon pack in use (for a widget's icon picker); empty until the index is built
+    pub icon_names: &'a [String],
 }
 
 pub struct Settings {
@@ -206,6 +208,10 @@ struct PanelsState {
     sel: Option<(usize, usize)>,
     /// zone the add-widget picker is open for
     add_zone: Option<usize>,
+    /// (zone, index) of the widget the icon picker is open for, the page it is on and what it is filtered by
+    pick: Option<(usize, usize)>,
+    pick_page: usize,
+    pick_q: String,
 }
 
 impl Default for Settings {
@@ -661,6 +667,8 @@ fn bar_preview(ui: &mut Ui, r: [f32; 4], t: &Theme, b: &BarConfig) {
     let ink = if dark { [0.92; 3] } else { [0.15, 0.18, 0.25] };
     let top = b.edge == Edge::Top;
     // width of each widget's mark, in picture pixels
+    // (a Dock in its taskbar style is the row of task buttons)
+    let look = |sp: &WidgetSpec| -> String { if sp.kind == "dock" && (sp.num("button_w").unwrap_or(0.0) > 0.0 || sp.bool("labels") == Some(true)) { "tasks".into() } else { sp.kind.clone() } };
     let mark_w = |kind: &str| -> f32 {
         match kind {
             "start" => 11.0,
@@ -676,7 +684,7 @@ fn bar_preview(ui: &mut Ui, r: [f32; 4], t: &Theme, b: &BarConfig) {
         }
     };
     let zones = [&b.left, &b.center, &b.right];
-    let zone_w = |z: usize| -> f32 { zones[z].iter().map(|s| mark_w(&s.kind)).sum() };
+    let zone_w = |z: usize| -> f32 { zones[z].iter().map(|s| mark_w(&look(s))).sum() };
     if b.shape == BarShape::Floating {
         // the Dock: a pill of app icons
         let n = 7.0;
@@ -717,8 +725,8 @@ fn bar_preview(ui: &mut Ui, r: [f32; 4], t: &Theme, b: &BarConfig) {
     for (z, specs) in zones.iter().enumerate() {
         let mut mx = starts[z];
         for sp in specs.iter() {
-            let kw = mark_w(&sp.kind);
-            match sp.kind.as_str() {
+            let kw = mark_w(&look(sp));
+            match look(sp).as_str() {
                 "start" => {
                     if sp.str("style") == Some("orb") {
                         ui.fill([mx, cy - 4.0, 8.0, 8.0], 4.0, [0.25, 0.6, 1.0], 1.0);
@@ -1006,7 +1014,7 @@ fn page_panels(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, st: 
 
     // while the add-widget picker is open the page underneath ignores the pointer
     let (click, held) = (ui.click, ui.held);
-    if st.add_zone.is_some() {
+    if st.add_zone.is_some() || st.pick.is_some() {
         ui.click = false;
         ui.held = false;
     }
@@ -1023,7 +1031,7 @@ fn page_panels(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, st: 
         }
     }
     if ui.button([x + cw - 140.0, y + 80.0, 66.0, 30.0], "+ New", false) {
-        bars.push(BarConfig { name: format!("panel {}", bars.len() + 1), edge: Edge::Bottom, surface: BarSurface::Glass, height: Some(44.0), center: vec![WidgetSpec::new("tasks")], right: vec![WidgetSpec::new("clock")], ..Default::default() });
+        bars.push(BarConfig { name: format!("panel {}", bars.len() + 1), edge: Edge::Bottom, surface: BarSurface::Glass, height: Some(44.0), center: vec![WidgetSpec::taskbar()], right: vec![WidgetSpec::new("clock")], ..Default::default() });
         st.panel = bars.len() - 1;
         st.sel = None;
         ui.changed = true;
@@ -1099,6 +1107,21 @@ fn page_panels(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, st: 
     if ui.segmented([x + 66.0, y + 212.0, colw - 66.0, 24.0], &["Off", "At the edge"], &mut sel) {
         bar.autohide = if sel == 0 { widget::AutoHide::Off } else { widget::AutoHide::Always };
     }
+    // how it goes away and comes back; the rows below move down by the room this takes
+    let y = if bar.autohide != widget::AutoHide::Off {
+        use widget::HideAnim;
+        const ANIMS: [HideAnim; 4] = [HideAnim::Slide, HideAnim::Squeeze, HideAnim::Fade, HideAnim::Drop];
+        ui.row(x, y + 254.0, "Animation");
+        let mut sel = ANIMS.iter().position(|a| *a == bar.hide_anim).unwrap_or(0);
+        if ui.segmented([x + 66.0, y + 242.0, colw - 66.0, 24.0], &["Slide", "Squeeze", "Fade", "Drop"], &mut sel) {
+            bar.hide_anim = ANIMS[sel];
+        }
+        ui.row(x2, y + 254.0, "Speed");
+        ui.slider(sl(x2, y + 254.0), &mut bar.hide_speed, 0.3, 3.0, "");
+        y + 30.0
+    } else {
+        y
+    };
 
     // widgets, by zone
     ui.section(x, y + 244.0, "WIDGETS");
@@ -1167,6 +1190,7 @@ fn page_panels(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, st: 
                     ui.text(x, y + 446.0, "This widget has nothing to configure.", 12.5, false, ui.ink, 0.55, Align::Left);
                 }
                 let mut f = Form::new(x, y + 440.0, cw, 30.0);
+                let preset_before = spec.str("preset").map(str::to_string);
                 for o in &opts {
                     match o.kind {
                         OptKind::Num(lo, hi, _) => {
@@ -1192,6 +1216,15 @@ fn page_panels(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, st: 
                             if f.text(ui, o.label, &key, &mut t, hint.as_deref()) {
                                 spec.set_str(o.key, &t);
                             }
+                            if o.key == "pack_icon" {
+                                // (any icon of the pack in use: the shell shows them and the pointer picks)
+                                if ui.button([f.x + 150.0, f.y, 170.0, 28.0], "Choose from the pack…", false) {
+                                    st.pick = Some((z, i));
+                                    st.pick_page = 0;
+                                    st.pick_q.clear();
+                                }
+                                f.skip(34.0);
+                            }
                         }
                         OptKind::Choice(choices, _) => {
                             let cur = spec.opt_choice(o);
@@ -1202,7 +1235,82 @@ fn page_panels(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, st: 
                         }
                     }
                 }
+                // a new preset of the start button replaces its look
+                if spec.kind == "start" && spec.str("preset").map(str::to_string) != preset_before {
+                    if let Some(name) = spec.str("preset").map(str::to_string) {
+                        widget::apply_start_preset(spec, &name);
+                        ui.changed = true;
+                    }
+                }
             }
+        }
+    }
+
+    // the icon picker: every icon of the pack in use, a page at a time
+    if let Some((z, i)) = st.pick {
+        ui.click = click;
+        ui.held = held;
+        let r = [x - 10.0, y + 96.0, cw + 20.0, 400.0];
+        let bg = if ui.dark { [0.139, 0.139, 0.139] } else { [0.98, 0.99, 1.0] };
+        ui.fill([r[0] - 1.0, r[1] - 1.0, r[2] + 2.0, r[3] + 2.0], 13.0, ui.ink, 0.18);
+        ui.fill(r, 12.0, bg, 0.98);
+        ui.text(r[0] + 16.0, r[1] + 26.0, "Choose an icon from the pack", 13.5, true, ui.ink, 0.95, Align::Left);
+        let mut f = Form::new(r[0] + 16.0, r[1] + 36.0, r[2] - 32.0, 30.0);
+        let before = st.pick_q.clone();
+        f.text(ui, "Search", "iconpick:q", &mut st.pick_q, None);
+        if st.pick_q != before {
+            st.pick_page = 0;
+        }
+        let q = st.pick_q.trim().to_lowercase();
+        let names: Vec<&String> = ctx.icon_names.iter().filter(|n| q.is_empty() || n.to_lowercase().contains(&q)).collect();
+        let (cols, rows, cell) = (7usize, 3usize, 58.0);
+        let per = cols * rows;
+        let pages = names.len().div_ceil(per).max(1);
+        st.pick_page = st.pick_page.min(pages - 1);
+        let gx = r[0] + (r[2] - cols as f32 * cell) / 2.0;
+        let mut chosen: Option<String> = None;
+        if names.is_empty() {
+            ui.text(r[0] + r[2] / 2.0, r[1] + 190.0, if ctx.icon_names.is_empty() { "The icons are still being indexed…" } else { "No icon has that name" }, 12.5, false, ui.ink, 0.6, Align::Center);
+        }
+        for (n, name) in names.iter().skip(st.pick_page * per).take(per).enumerate() {
+            let c = [gx + (n % cols) as f32 * cell, r[1] + 84.0 + (n / cols) as f32 * (cell + 18.0), cell - 6.0, cell - 6.0];
+            let hov = ui.hit(c);
+            ui.fill(c, 9.0, ui.ink, if hov { 0.16 } else { 0.06 });
+            let id = crate::widget::pack_icon_key(name);
+            match (ctx.app_icon)(&id) {
+                Some(cellid) => ui.d.image([c[0] + 6.0, c[1] + 6.0, c[2] - 12.0, c[3] - 12.0], 7.0, cellid),
+                None => ctx.want_icons.push(id),
+            }
+            let short: String = if name.chars().count() > 10 { name.chars().take(9).collect::<String>() + "…" } else { name.to_string() };
+            ui.text_raw(c[0] + c[2] / 2.0, c[1] + c[3] + 12.0, &short, 10.0, false, ui.ink, 0.7, Align::Center);
+            if ui.click && hov {
+                chosen = Some(name.to_string());
+            }
+        }
+        let fy = r[1] + r[3] - 40.0;
+        if ui.button([r[0] + 16.0, fy, 36.0, 28.0], "←", false) && st.pick_page > 0 {
+            st.pick_page -= 1;
+        }
+        ui.text(r[0] + 100.0, fy + 19.0, &format!("{} / {}", st.pick_page + 1, pages), 12.5, false, ui.ink, 0.7, Align::Center);
+        if ui.button([r[0] + 148.0, fy, 36.0, 28.0], "→", false) && st.pick_page + 1 < pages {
+            st.pick_page += 1;
+        }
+        let clear = ui.button([r[0] + r[2] - 190.0, fy, 80.0, 28.0], "No icon", false);
+        let cancel = ui.button([r[0] + r[2] - 90.0, fy, 74.0, 28.0], "Cancel", false);
+        if let Some(name) = chosen {
+            if let Some(spec) = bar.zone_mut(z).get_mut(i) {
+                spec.set_str("pack_icon", &name);
+            }
+            st.pick = None;
+            ui.changed = true;
+        } else if clear {
+            if let Some(spec) = bar.zone_mut(z).get_mut(i) {
+                spec.set_str("pack_icon", "");
+            }
+            st.pick = None;
+            ui.changed = true;
+        } else if cancel {
+            st.pick = None;
         }
     }
 
@@ -1296,7 +1404,7 @@ fn page_layout(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
         ui,
         "Launcher",
         &mut ctx.theme.launcher.style,
-        &[(theme::LauncherKind::Figlet, "Figlet"), (theme::LauncherKind::Launchpad, "Launchpad"), (theme::LauncherKind::StartMenuWin11, "Start (Fluent)"), (theme::LauncherKind::StartMenuWin7, "Start (Aero)")],
+        &[(theme::LauncherKind::Figlet, "Figlet"), (theme::LauncherKind::Launchpad, "Launchpad"), (theme::LauncherKind::StartMenuWin11, "Start (Fluent)"), (theme::LauncherKind::StartMenuWin7, "Start (Aero)"), (theme::LauncherKind::Plasma, "Plasma")],
     );
     f.toggle(ui, "Icons on the desktop", &mut ctx.cfg.desktop.show);
     f.slider(ui, "Desktop icon size", &mut ctx.cfg.desktop.icon_size, 32.0, 128.0, " px");
@@ -1482,7 +1590,21 @@ fn page_animations(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) 
 }
 
 /// Whether the "Ours" icon kind is offered on the icons page.
-const SHOW_OWN_ICONS: bool = false;
+const SHOW_OWN_ICONS: bool = true;
+
+/// A few of our icons to show the looks with: the usual apps first, when they were made, then any others.
+fn own_sample() -> Vec<String> {
+    let dir = crate::iconrender::theme_dir().join("64x64/apps");
+    let mut made: Vec<String> = std::fs::read_dir(dir).map(|rd| rd.flatten().filter_map(|e| e.path().file_stem().map(|n| n.to_string_lossy().to_string())).collect()).unwrap_or_default();
+    made.sort();
+    let usual = ["system-file-manager", "org.kde.dolphin", "firefox", "internet-web-browser", "utilities-terminal", "org.kde.konsole", "preferences-system", "systemsettings"];
+    let mut out: Vec<String> = usual.iter().filter(|u| made.iter().any(|m| m == *u)).map(|u| u.to_string()).collect();
+    out.extend(made.into_iter().filter(|m| !m.contains(':')));
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|n| seen.insert(n.clone()));
+    out.truncate(4);
+    out
+}
 
 /// Returns the rectangle where the live preview goes (drawn in the shell layer, see `icon_preview`).
 fn page_icons(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) -> [f32; 4] {
@@ -1497,7 +1619,6 @@ fn page_icons(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) -> [f
     let is_own = icons.is_own();
     let half = (cw - 10.0) / 2.0;
     for (i, (glyph, title, sub)) in [("layers", "Simple, with a plate", "A pack's icons on the shell's plate"), ("sparkles", "Ours", "Made in Memrium Icons, each with its own plate")].iter().enumerate() {
-        // "Ours" is hidden for now
         if i == 1 && !SHOW_OWN_ICONS {
             continue;
         }
@@ -1525,19 +1646,52 @@ fn page_icons(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) -> [f
         }
     }
     f.skip(74.0);
-    // which look of our icons the shell shows
+    // which look of our icons the shell shows: a card per look, with a few of our icons drawn in it
     if icons.is_own() {
-        let cols = 4usize;
-        let gap = 6.0;
+        static OWN_SAMPLE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let sample = OWN_SAMPLE.get_or_init(own_sample);
+        let (cols, gap, card_h) = (4usize, 10.0, 82.0);
         let w = (cw - gap * (cols as f32 - 1.0)) / cols as f32;
-        for (i, (key, name, _)) in crate::theme::OWN_LOOKS.iter().enumerate() {
-            let r = [x + (i % cols) as f32 * (w + gap), f.y - 12.0 + (i / cols) as f32 * 34.0, w, 28.0];
-            if ui.button(r, name, icons.own_look == *key) && icons.own_look != *key {
+        for (i, (key, name, theme)) in crate::theme::OWN_LOOKS.iter().enumerate() {
+            let r = [x + (i % cols) as f32 * (w + gap), f.y - 12.0 + (i / cols) as f32 * (card_h + gap), w, card_h];
+            let selected = icons.own_look == *key;
+            let hov = ui.hit(r);
+            if hov {
+                ui.want_cursor(chebrium::ui::Cursor::Pointer);
+            }
+            ui.fill(r, 12.0, ui.ink, if hov { 0.10 } else { 0.05 });
+            if selected {
+                ui.fill([r[0] - 1.5, r[1] - 1.5, r[2] + 3.0, r[3] + 3.0], 13.0, accent, 0.9);
+                ui.fill(r, 12.0, if ui.dark { [0.181, 0.181, 0.181] } else { [0.93, 0.95, 1.0] }, 1.0);
+                ui.fill(r, 12.0, accent, 0.14);
+            }
+            // the look that follows light and dark shows half its icons in each
+            let n = sample.len().min(4);
+            let sw = ((r[2] - 16.0) / 4.0).min(34.0);
+            let start = r[0] + (r[2] - n as f32 * sw) / 2.0;
+            for (k, icon) in sample.iter().take(n).enumerate() {
+                let pack = match theme.is_empty() {
+                    true if k < n / 2 => crate::theme::OWN_ICON_THEME.to_string(),
+                    true => format!("{}-Dark", crate::theme::OWN_ICON_THEME),
+                    false => theme.to_string(),
+                };
+                let id = format!("pack:{pack}:{icon}");
+                let cell = [start + k as f32 * sw + 2.0, r[1] + 12.0, sw - 4.0, sw - 4.0];
+                match (ctx.app_icon)(&id) {
+                    Some(c) => ui.d.image(cell, 7.0, c),
+                    None => {
+                        ui.fill(cell, 7.0, ui.ink, 0.07);
+                        ctx.want_icons.push(id);
+                    }
+                }
+            }
+            ui.text_raw(r[0] + r[2] / 2.0, r[1] + r[3] - 13.0, name, 12.0, selected, ui.ink, if selected { 1.0 } else { 0.8 }, Align::Center);
+            if ui.click && hov && !selected {
                 icons.own_look = key.to_string();
                 ui.changed = true;
             }
         }
-        f.skip(((crate::theme::OWN_LOOKS.len() + cols - 1) / cols) as f32 * 34.0 + 10.0);
+        f.skip(((crate::theme::OWN_LOOKS.len() + cols - 1) / cols) as f32 * (card_h + gap) + 4.0);
     }
     f.pick(ui, "Shape", &mut icons.shape, &[(IconShape::None, "Original"), (IconShape::Squircle, "Squircle"), (IconShape::Circle, "Circle"), (IconShape::Rounded, "Rounded")]);
     if f.pick(ui, "Plate behind icons", &mut icons.plate, &[(Plate::None, "None"), (Plate::Glass, "Glass"), (Plate::Solid, "Solid"), (Plate::Tile, "Tile")]) && icons.plate == Plate::Tile && icons.padding < 0.04 {
@@ -1547,56 +1701,59 @@ fn page_icons(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) -> [f
         f.pick(ui, "Tile colour", &mut icons.tile, &[(TileMode::Auto, "Auto"), (TileMode::Light, "Light"), (TileMode::Dark, "Dark"), (TileMode::Vivid, "Vivid")]);
     }
     f.slider(ui, "Inner padding", &mut icons.padding, 0.0, 0.4, "");
-    // the icon pack app icons come from: a card per installed pack, with a few of its icons
-    ui.section(x, f.y, "ICON PACK");
-    f.skip(14.0);
-    static PACKS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    // (the themes of our icons are chosen above, not among the packs)
-    let packs = PACKS.get_or_init(|| crate::apps::installed_icon_themes().into_iter().filter(|n| !n.starts_with(crate::theme::OWN_ICON_THEME)).collect());
-    const SAMPLE: [&str; 4] = ["system-file-manager", "internet-web-browser", "utilities-terminal", "preferences-system"];
-    let (cols, gap, card_h) = (3usize, 10.0, 88.0);
-    let card_w = (cw - gap * (cols as f32 - 1.0)) / cols as f32;
-    let auto = icons.theme.is_empty() || icons.theme == "auto";
-    // "Auto" first: the desktop's own pack
-    let mut cards: Vec<(&str, &str)> = vec![("auto", "Follow the desktop")];
-    cards.extend(packs.iter().map(|p| (p.as_str(), p.as_str())));
-    for (i, (value, name)) in cards.iter().enumerate() {
-        let r = [x + (i % cols) as f32 * (card_w + gap), f.y + (i / cols) as f32 * (card_h + gap) - 15.0, card_w, card_h];
-        let selected = if *value == "auto" { auto } else { icons.theme == *value };
-        let hov = ui.hit(r);
-        if hov {
-            ui.want_cursor(chebrium::ui::Cursor::Pointer);
-        }
-        ui.fill(r, 12.0, ui.ink, if hov { 0.10 } else { 0.05 });
-        if selected {
-            ui.fill([r[0] - 1.5, r[1] - 1.5, r[2] + 3.0, r[3] + 3.0], 13.0, accent, 0.9);
-            ui.fill(r, 12.0, if ui.dark { [0.181, 0.181, 0.181] } else { [0.93, 0.95, 1.0] }, 1.0);
-            ui.fill(r, 12.0, accent, 0.14);
-        }
-        if *value == "auto" {
-            ui.glyph(r[0] + r[2] / 2.0, r[1] + 32.0, 24.0, "monitor", ui.ink, 0.7);
-        } else {
-            let sw = 34.0;
-            let start = r[0] + (r[2] - SAMPLE.len() as f32 * sw) / 2.0;
-            for (k, icon) in SAMPLE.iter().enumerate() {
-                let id = format!("pack:{value}:{icon}");
-                let cell = [start + k as f32 * sw + 2.0, r[1] + 14.0, 30.0, 30.0];
-                match (ctx.app_icon)(&id) {
-                    Some(c) => ui.d.image(cell, 7.0, c),
-                    None => {
-                        ui.fill(cell, 7.0, ui.ink, 0.07);
-                        ctx.want_icons.push(id);
+    // the icon pack app icons come from, a card per installed pack with a few of its icons (only for the simple icons:
+    // ours bring their own)
+    if !icons.is_own() {
+        ui.section(x, f.y, "ICON PACK");
+        f.skip(14.0);
+        static PACKS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        // (the themes of our icons are chosen above, not among the packs)
+        let packs = PACKS.get_or_init(|| crate::apps::installed_icon_themes().into_iter().filter(|n| !n.starts_with(crate::theme::OWN_ICON_THEME)).collect());
+        const SAMPLE: [&str; 4] = ["system-file-manager", "internet-web-browser", "utilities-terminal", "preferences-system"];
+        let (cols, gap, card_h) = (3usize, 10.0, 88.0);
+        let card_w = (cw - gap * (cols as f32 - 1.0)) / cols as f32;
+        let auto = icons.theme.is_empty() || icons.theme == "auto";
+        // "Auto" first: the desktop's own pack
+        let mut cards: Vec<(&str, &str)> = vec![("auto", "Follow the desktop")];
+        cards.extend(packs.iter().map(|p| (p.as_str(), p.as_str())));
+        for (i, (value, name)) in cards.iter().enumerate() {
+            let r = [x + (i % cols) as f32 * (card_w + gap), f.y + (i / cols) as f32 * (card_h + gap) - 15.0, card_w, card_h];
+            let selected = if *value == "auto" { auto } else { icons.theme == *value };
+            let hov = ui.hit(r);
+            if hov {
+                ui.want_cursor(chebrium::ui::Cursor::Pointer);
+            }
+            ui.fill(r, 12.0, ui.ink, if hov { 0.10 } else { 0.05 });
+            if selected {
+                ui.fill([r[0] - 1.5, r[1] - 1.5, r[2] + 3.0, r[3] + 3.0], 13.0, accent, 0.9);
+                ui.fill(r, 12.0, if ui.dark { [0.181, 0.181, 0.181] } else { [0.93, 0.95, 1.0] }, 1.0);
+                ui.fill(r, 12.0, accent, 0.14);
+            }
+            if *value == "auto" {
+                ui.glyph(r[0] + r[2] / 2.0, r[1] + 32.0, 24.0, "monitor", ui.ink, 0.7);
+            } else {
+                let sw = 34.0;
+                let start = r[0] + (r[2] - SAMPLE.len() as f32 * sw) / 2.0;
+                for (k, icon) in SAMPLE.iter().enumerate() {
+                    let id = format!("pack:{value}:{icon}");
+                    let cell = [start + k as f32 * sw + 2.0, r[1] + 14.0, 30.0, 30.0];
+                    match (ctx.app_icon)(&id) {
+                        Some(c) => ui.d.image(cell, 7.0, c),
+                        None => {
+                            ui.fill(cell, 7.0, ui.ink, 0.07);
+                            ctx.want_icons.push(id);
+                        }
                     }
                 }
             }
+            ui.text_raw(r[0] + r[2] / 2.0, r[1] + r[3] - 14.0, name, 12.0, selected, ui.ink, if selected { 1.0 } else { 0.8 }, Align::Center);
+            if ui.click && hov && !selected {
+                icons.theme = value.to_string();
+                ui.changed = true;
+            }
         }
-        ui.text_raw(r[0] + r[2] / 2.0, r[1] + r[3] - 14.0, name, 12.0, selected, ui.ink, if selected { 1.0 } else { 0.8 }, Align::Center);
-        if ui.click && hov && !selected {
-            icons.theme = value.to_string();
-            ui.changed = true;
-        }
+        f.skip(((cards.len() + cols - 1) / cols) as f32 * (card_h + gap) + 6.0);
     }
-    f.skip(((cards.len() + cols - 1) / cols) as f32 * (card_h + gap) + 6.0);
     let mut mono = icons.tint.is_some();
     let before = mono;
     f.toggle(ui, "One-colour icons", &mut mono);
@@ -1700,6 +1857,8 @@ pub fn live_choices() -> Vec<WallItem> {
         ("Liquid Gradient", "liquid-gradient", [0.45, 0.25, 0.95], [0.95, 0.45, 0.60]),
         ("Ocean Waves", "ocean", [0.02, 0.18, 0.40], [0.20, 0.65, 0.85]),
         ("Starfield", "starfield", [0.01, 0.02, 0.08], [0.20, 0.25, 0.55]),
+        ("Spectrum", "spectrum", [0.04, 0.02, 0.12], [0.90, 0.30, 0.75]),
+        ("Pulse", "pulse", [0.02, 0.02, 0.10], [0.45, 0.35, 0.95]),
     ]
     .iter()
     .map(|(name, id, a, b)| WallItem { name: name.to_string(), spec: WallpaperSpec { kind: WallKind::Live, path: id.to_string() }, cell: None, colors: Some((*a, *b)) }))

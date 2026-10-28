@@ -209,7 +209,7 @@ pub struct ControlCenter {
     drag_track: (f32, f32),
     press: Option<TilePress>,
     /// which list the edit mode's gallery shows: 0 = controls, 1 = desktop widgets
-    gallery_tab: usize,
+    pub(crate) gallery_tab: usize,
     media_tile: usize,
     wifi_tile: usize,
     bt_tile: usize,
@@ -1038,7 +1038,7 @@ impl ControlCenter {
             }
         } else {
             for (i, (kind, ..)) in crate::deskwidgets::KINDS.iter().enumerate() {
-                let [x, y, w, h] = gallery_cell(i);
+                let [x, y, w, h] = widget_cell(i);
                 let (c, s) = self.mapped(x, y, w, h);
                 if Self::rect_hit(m, c, s) {
                     self.events.push(CcEvent::AddWidget(kind.to_string()));
@@ -1266,12 +1266,20 @@ impl ControlCenter {
                 continue;
             }
             let mut p = a.item;
-            if matches!(p.params[1] as u32, 1 | 5) && Self::is_ink([p.tint[0], p.tint[1], p.tint[2]]) {
+            // the pill's glyph with no glass under it sits on the bar itself: it takes the bar's ink like the other widgets
+            // (the glass tint says nothing about an opaque bar, and over a dark wallpaper it made the glyph white on a white bar)
+            let on_bare_bar = bar && a.tile == self.menu_tile && !(self.pill_on && fade > 0.01);
+            if on_bare_bar && p.params[1] == 5.0 && Self::is_ink([p.tint[0], p.tint[1], p.tint[2]]) {
+                let ink = if self.menu_light { WHITE } else { INK };
+                p.tint[..3].copy_from_slice(&ink);
+            } else if matches!(p.params[1] as u32, 1 | 5) && Self::is_ink([p.tint[0], p.tint[1], p.tint[2]]) {
                 if let Some(u) = self.under(a.tile, bar) {
                     p = p.auto_ink(u);
                 }
             }
-            if self.menu_light && bar && p.params[1] == 5.0 && (p.tint[0] - INK[0]).abs() < 1e-4 && (p.tint[2] - INK[2]).abs() < 1e-4 {
+            // the Mac pill is light glass: its dark glyph stays dark, white on it would vanish (the Windows one has no glass)
+            let on_light_pill = self.style == CcStyle::Mac && a.tile == self.menu_tile;
+            if self.menu_light && bar && !on_light_pill && p.params[1] == 5.0 && (p.tint[0] - INK[0]).abs() < 1e-4 && (p.tint[2] - INK[2]).abs() < 1e-4 {
                 p.tint[0] = 1.0;
                 p.tint[1] = 1.0;
                 p.tint[2] = 1.0;
@@ -1406,7 +1414,7 @@ impl ControlCenter {
         let mut g = Gal { p: Vec::new(), l: Vec::new(), pivot, k, fit: self.fit() };
 
         // frame
-        let mut base = g.glass(0.0, 0.0, GW, GH, 34.0, [0.92, 0.96, 1.0, 0.30]);
+        let mut base = g.glass(0.0, 0.0, GW, GH, 34.0, [0.92, 0.96, 1.0, 0.44]);
         base.fx[0] = 16.0; // frosted
         base.extra = [0.30, 64.0, 26.0, 0.0];
         g.p.push(base);
@@ -1445,28 +1453,79 @@ impl ControlCenter {
                 g.glyph(x + w - 22.0, y + h / 2.0, 14.0, "plus", INK, 0.7 * a);
             }
         } else {
-            // the widgets of the desktop
-            for (i, (kind, label, _)) in crate::deskwidgets::KINDS.iter().enumerate() {
-                let [x, y, w, h] = gallery_cell(i);
+            // the widgets of the desktop: a card with a little picture of each, its name and its size
+            for (i, (kind, label, size)) in crate::deskwidgets::KINDS.iter().enumerate() {
+                let [x, y, w, h] = widget_cell(i);
                 let (icon, bg) = widget_look(kind);
-                g.glass_t(x, y, w, h, 14.0, [0.58, 0.62, 0.74, 0.35]);
-                g.solid(x + 8.0, y + 8.0, 28.0, 28.0, 8.0, bg, bg, 1.0);
-                g.glyph(x + 22.0, y + 22.0, 15.0, icon, WHITE, 1.0);
-                g.text(x + 46.0, y + 27.0, 12.5, false, INK, 0.92, Align::Left, label);
-                g.glyph(x + w - 22.0, y + h / 2.0, 14.0, "plus", INK, 0.7);
+                g.glass_t(x, y, w, h, 18.0, [0.62, 0.66, 0.78, 0.42]);
+                let dark = [bg[0] * 0.62, bg[1] * 0.62, bg[2] * 0.62];
+                let (px, py, pw, ph) = (x + 10.0, y + 10.0, 60.0, 60.0);
+                g.solid(px, py, pw, ph, 13.0, bg, dark, 1.0);
+                match *kind {
+                    "clock" | "glassclock" => {
+                        g.text(px + pw / 2.0, py + ph / 2.0 + 6.0, 17.0, true, WHITE, 1.0, Align::Center, "12:45");
+                    }
+                    "calendar" => {
+                        g.solid(px + 8.0, py + 12.0, pw - 16.0, ph - 20.0, 5.0, [1.0; 3], [0.93, 0.94, 0.97], 1.0);
+                        g.solid(px + 8.0, py + 12.0, pw - 16.0, 11.0, 5.0, [1.0, 0.30, 0.30], [0.85, 0.20, 0.25], 1.0);
+                        for n in 0..9 {
+                            let (cx, cy) = (px + 15.0 + (n % 3) as f32 * 12.0, py + 31.0 + (n / 3) as f32 * 7.5);
+                            g.solid(cx, cy, 5.0, 4.0, 2.0, [0.35, 0.38, 0.46], [0.35, 0.38, 0.46], if n == 4 { 1.0 } else { 0.45 });
+                        }
+                    }
+                    "system" => {
+                        for (n, f) in [0.8, 0.5, 0.65].into_iter().enumerate() {
+                            let by = py + 14.0 + n as f32 * 14.0;
+                            g.solid(px + 9.0, by, pw - 18.0, 5.0, 2.5, WHITE, WHITE, 0.3);
+                            g.solid(px + 9.0, by, (pw - 18.0) * f, 5.0, 2.5, WHITE, WHITE, 0.95);
+                        }
+                    }
+                    "disk" => {
+                        g.glyph(px + pw / 2.0, py + 24.0, 22.0, icon, WHITE, 1.0);
+                        g.solid(px + 9.0, py + 44.0, pw - 18.0, 5.0, 2.5, WHITE, WHITE, 0.3);
+                        g.solid(px + 9.0, py + 44.0, (pw - 18.0) * 0.6, 5.0, 2.5, WHITE, WHITE, 0.95);
+                    }
+                    "vinyl" => {
+                        g.solid(px + 6.0, py + 6.0, pw - 12.0, ph - 12.0, 24.0, [0.10, 0.10, 0.13], [0.04, 0.04, 0.06], 1.0);
+                        g.solid(px + 20.0, py + 20.0, 20.0, 20.0, 10.0, [1.0, 0.55, 0.75], [0.60, 0.40, 1.0], 1.0);
+                        g.solid(px + 28.5, py + 28.5, 3.0, 3.0, 1.5, [0.05; 3], [0.05; 3], 1.0);
+                    }
+                    "visualizer" => {
+                        for (n, v) in [0.35, 0.6, 0.9, 0.5, 0.75, 0.4, 0.55].into_iter().enumerate() {
+                            let bh = 36.0 * v;
+                            g.solid(px + 9.0 + n as f32 * 6.8, py + ph - 11.0 - bh, 4.0, bh, 2.0, WHITE, [0.85, 0.80, 1.0], 0.95);
+                        }
+                    }
+                    "music" => {
+                        g.glyph(px + pw / 2.0, py + 24.0, 22.0, icon, WHITE, 1.0);
+                        g.solid(px + 9.0, py + 46.0, pw - 18.0, 4.0, 2.0, WHITE, WHITE, 0.3);
+                        g.solid(px + 9.0, py + 46.0, (pw - 18.0) * 0.4, 4.0, 2.0, WHITE, WHITE, 0.95);
+                    }
+                    _ => g.glyph(px + pw / 2.0, py + ph / 2.0, 26.0, icon, WHITE, 1.0),
+                }
+                g.text(x + 82.0, y + 33.0, 13.5, true, INK, 0.95, Align::Left, label);
+                g.text(x + 82.0, y + 53.0, 11.0, false, INK, 0.6, Align::Left, &format!("{} \u{00d7} {}", size[0] as i32, size[1] as i32));
+                g.glyph(x + w - 24.0, y + h / 2.0, 15.0, "plus", INK, 0.7);
             }
         }
 
         // how to use it
-        let hy = 72.0 + 8.0 * 52.0 + 18.0;
-        g.hairline(24.0, hy - 8.0, GW - 48.0);
-        let hints: &[&str] = if self.gallery_tab == 0 {
-            &["Drag a tile to move it, tap the \u{2212} on its corner to remove it.", "Tap a Now Playing tile to change its look (player, record, half record),", "or a slider to switch between Display and Sound.", "The layout is saved as [[cc_tiles]] in config.toml; there you can also", "give a tile any icon and a shell action (or exec:program)."]
+        if self.gallery_tab == 0 {
+            let hy = 72.0 + 8.0 * 52.0 + 18.0;
+            g.hairline(24.0, hy - 8.0, GW - 48.0);
+            for (i, line) in ["Drag a tile to move it, tap the \u{2212} on its corner to remove it.", "Tap a Now Playing tile to change its look (player, record, half record),", "or a slider to switch between Display and Sound.", "The layout is saved as [[cc_tiles]] in config.toml; there you can also", "give a tile any icon and a shell action (or exec:program)."].iter().enumerate() {
+                g.text(24.0, hy + 14.0 + i as f32 * 16.0, 11.0, false, INK, 0.7, Align::Left, line);
+            }
         } else {
-            &["Tap a widget to put it on the desktop, drag it to move it,", "tap the \u{2212} on its corner to remove it.", "Right-click a widget for its own options (clock style, 24-hour, size).", "Everything is saved when you press Done."]
-        };
-        for (i, line) in hints.iter().enumerate() {
-            g.text(24.0, hy + 14.0 + i as f32 * 16.0, 11.0, false, INK, 0.7, Align::Left, line);
+            g.hairline(24.0, 510.0, GW - 48.0);
+            g.text(24.0, 528.0, 11.0, false, INK, 0.7, Align::Left, "Tap a card to put the widget on the desktop. Right-click a widget for its options.");
+            // what the keys do while a widget is dragged
+            for (i, (key, what)) in [("Drag", "lines up with the other widgets and the screen"), ("Ctrl", "snaps to a 20 px grid"), ("Shift", "moves along one line only"), ("Ctrl + Shift", "sits next to the others with an even gap"), ("Alt", "free, nothing pulls")].into_iter().enumerate() {
+                let y = 548.0 + i as f32 * 17.0;
+                g.glass_t(24.0, y, 82.0, 15.0, 7.5, [0.58, 0.62, 0.74, 0.40]);
+                g.text(65.0, y + 11.0, 10.5, true, INK, 0.9, Align::Center, key);
+                g.text(118.0, y + 11.5, 11.0, false, INK, 0.75, Align::Left, what);
+            }
         }
 
         // footer
@@ -1498,6 +1557,11 @@ fn widget_look(kind: &str) -> (&'static str, [f32; 3]) {
 }
 
 /// A control's cell in the gallery (relative to the gallery's top-left): two columns, reading order.
+/// A desktop widget's card in the gallery: two columns of cards with a small picture of the widget.
+fn widget_cell(i: usize) -> [f32; 4] {
+    [24.0 + (i % 2) as f32 * 258.0, 72.0 + (i / 2) as f32 * 88.0, 246.0, 80.0]
+}
+
 fn gallery_cell(i: usize) -> [f32; 4] {
     [24.0 + (i % 2) as f32 * 258.0, 72.0 + (i / 2) as f32 * 52.0, 246.0, 44.0]
 }
@@ -1739,7 +1803,7 @@ mod tests {
         // a tap on a widget asks the shell to put it on the desktop; no tile is added
         let n = cc.layout.len();
         let vinyl = crate::deskwidgets::KINDS.iter().position(|(k, ..)| *k == "vinyl").unwrap();
-        let [x, y, w, h] = gallery_cell(vinyl);
+        let [x, y, w, h] = widget_cell(vinyl);
         let (c, _) = cc.mapped(x, y, w, h);
         assert!(cc.mouse_down(c));
         assert_eq!(cc.take_events(), vec![CcEvent::AddWidget("vinyl".into())]);

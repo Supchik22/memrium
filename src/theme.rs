@@ -68,6 +68,8 @@ pub enum LauncherKind {
     Figlet,
     StartMenuWin11,
     StartMenuWin7,
+    /// a Plasma "Kickoff" style launcher: the user and a search field on top, favourites as a list or grid
+    Plasma,
     /// a full-screen, paged grid of every app with a search field on top
     Launchpad,
 }
@@ -832,7 +834,7 @@ pub const OWN_ICON_THEME: &str = "Memrium-Icons";
 
 /// The looks of our icons the shell can show: (key, name, the theme of that look; empty for the light/dark one that follows
 /// the shell).
-pub const OWN_LOOKS: [(&str, &str, &str); 7] = [
+pub const OWN_LOOKS: [(&str, &str, &str); 8] = [
     ("auto", "Follow light / dark", ""),
     ("default", "Default", "Memrium-Icons"),
     ("dark", "Dark", "Memrium-Icons-Dark"),
@@ -840,6 +842,7 @@ pub const OWN_LOOKS: [(&str, &str, &str); 7] = [
     ("clear-dark", "Clear (dark)", "Memrium-Icons-Clear-Dark"),
     ("tinted-light", "Tinted (light)", "Memrium-Icons-Tinted-Light"),
     ("tinted-dark", "Tinted (dark)", "Memrium-Icons-Tinted-Dark"),
+    ("tinted-icon", "Tinted by icon", "Memrium-Icons-Tinted-Icon"),
 ];
 
 impl Default for IconStyle {
@@ -859,6 +862,25 @@ impl IconStyle {
             Some((_, _, name)) if !name.is_empty() => name.to_string(),
             _ => if dark { "Memrium-Icons-Dark".to_string() } else { OWN_ICON_THEME.to_string() },
         }
+    }
+
+    /// The icon theme the shell itself looks icons up in: `theme_name`, except that for a clear look of our icons it is the
+    /// version without plates (when the editor wrote one), whose plates the shell draws as live glass (`push_app_icon`).
+    /// The other programs keep the theme with the plates painted in.
+    pub fn shell_theme_name(&self, dark: bool) -> String {
+        let name = self.theme_name(dark);
+        if self.is_own() && self.live_look() {
+            let live = format!("{name}{}", crate::iconrender::LIVE_SUFFIX);
+            if crate::iconrender::theme_dir().with_file_name(&live).join("index.theme").exists() {
+                return live;
+            }
+        }
+        name
+    }
+
+    /// Is a clear look of our icons chosen (their plate drawn live by the shell)?
+    pub fn live_look(&self) -> bool {
+        matches!(self.own_look.as_str(), "clear-light" | "clear-dark")
     }
 
     /// Are our own icons (made in the editor, each with its own plate) in use?
@@ -977,11 +999,71 @@ impl IconStyle {
     }
 }
 
+/// The application icons whose plate the shell draws live (atlas cells of icons from a `-Live` theme), and the glass
+/// settings of the editor that say what shape that plate is. Kept here because the icons are drawn from many places that
+/// only know the cell.
+struct LiveIcons {
+    cells: std::collections::HashSet<u32>,
+    tune: crate::iconrender::GlassTune,
+}
+
+static LIVE_ICONS: std::sync::RwLock<Option<LiveIcons>> = std::sync::RwLock::new(None);
+
+/// Forget the live icons (the icons are loaded again) and read the editor's glass settings again.
+pub fn reset_live_icons() {
+    if let Ok(mut l) = LIVE_ICONS.write() {
+        *l = Some(LiveIcons { cells: Default::default(), tune: crate::iconrender::GlassTune::load() });
+    }
+}
+
+/// Mark atlas cell `cell` as an icon whose plate is drawn live (or not).
+pub fn set_live_icon(cell: u32, live: bool) {
+    if let Ok(mut l) = LIVE_ICONS.write() {
+        let l = l.get_or_insert_with(|| LiveIcons { cells: Default::default(), tune: crate::iconrender::GlassTune::load() });
+        if live {
+            l.cells.insert(cell);
+        } else {
+            l.cells.remove(&cell);
+        }
+    }
+}
+
+/// The live plate of the icon in `cell` of `size` px: its side and corner radius (see `iconrender::live_plate`).
+fn live_plate(cell: u32, size: f32) -> Option<(f32, f32)> {
+    let l = LIVE_ICONS.read().ok()?;
+    let l = l.as_ref()?;
+    if !l.cells.contains(&cell) {
+        return None;
+    }
+    crate::iconrender::live_plate(&l.tune, size)
+}
+
 /// Push the panels of an application icon (optional plate, then the icon) in the theme's icon style.
 pub fn push_app_icon(theme: &Theme, out: &mut Vec<crate::renderer::Panel>, cx: f32, cy: f32, size: f32, cell: u32, shadow: (f32, f32, f32)) {
     use crate::renderer::Panel;
     let st = &theme.icons;
     let r = st.radius(size);
+    // a clear icon of ours: its plate is glass drawn here, over what is really behind it (the picture holds the layers only)
+    if st.is_own() && st.live_look() {
+        if let Some((side, radius)) = live_plate(cell, size) {
+            let dark = st.own_look == "clear-dark";
+            let mut g = theme.glass.panel(cx, cy, side, side, radius);
+            // a small slab, not a big lens: the bending and bezel scale with it (as the glass plates of the simple icons)
+            g.params[2] = g.params[2].min(side * 0.20);
+            g.params[3] = g.params[3].min(side * 0.12);
+            g.fx[0] = g.fx[0].clamp(6.0, 9.0);
+            g.fx[1] = g.fx[1].min(0.04);
+            // the clear plates of the editor: a pale frost in the light look, a smoky one in the dark
+            g.tint = if dark { [0.10, 0.10, 0.12, 0.42] } else { [0.97, 0.97, 1.0, 0.24] };
+            g.extra = [shadow.0, shadow.1, shadow.2, theme.glass.saturation];
+            out.push(g);
+            let mut ic = Panel::app_icon(cx, cy, size, cell, 1.0);
+            ic.params[0] = r;
+            ic.params[3] = 0.0;
+            out.push(ic);
+            return;
+        }
+    }
     match st.plate {
         Plate::None => {}
         Plate::Glass => {
@@ -1070,6 +1152,7 @@ pub fn appearance_text(theme: &Theme, language: &str) -> String {
 pub fn export_appearance(theme: &Theme, language: &str) {
     crate::gtkcss::export(theme);
     crate::kdecolors::export(theme);
+    crate::iconrender::follow_accent(theme.accent);
     let text = appearance_text(theme, language);
     let path = config_dir().join("appearance.toml");
     if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {

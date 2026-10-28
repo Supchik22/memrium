@@ -2,10 +2,13 @@
 //! talk to) and the toasts that show them, drawn with the shell's glass in a corner of the screen.
 
 use crate::state::State;
+use memrium_de::files::IconState;
+use memrium_de::fsops;
 use memrium_de::renderer::{Align, Label, Panel};
 use chebrium::spring::Spring;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     mpsc::{channel, Receiver, Sender},
@@ -32,6 +35,24 @@ pub struct Notification {
     pub urgency: u8,
     /// milliseconds; -1 = server default, 0 = stays until dismissed
     pub expire_ms: i32,
+    /// the program plays its own sound (it said so with `suppress-sound`, or it is a messenger that always does): the shell stays quiet
+    #[serde(default)]
+    pub silent: bool,
+    /// the icon the sender named (a theme icon name, or the path of a picture)
+    #[serde(default)]
+    pub icon: String,
+    /// the `desktop-entry` hint: the id of the sender's launcher, which has the icon
+    #[serde(default)]
+    pub desktop: String,
+    /// a file this notification is about (a screenshot): its picture is the icon, and it can be dragged out of the toast
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+}
+
+/// Messengers and mail programs play their own sound for a message and do not tell the notification service to keep quiet.
+fn plays_own_sound(app: &str) -> bool {
+    let a = app.to_lowercase();
+    ["telegram", "discord", "signal", "whatsapp", "slack", "element", "thunderbird", "skype", "viber", "teams", "zulip", "vesktop", "ayugram", "kotatogram", "materialgram"].iter().any(|n| a.contains(n))
 }
 
 pub enum NotifEvent {
@@ -47,18 +68,26 @@ struct Server {
 #[interface(name = "org.freedesktop.Notifications")]
 impl Server {
     fn get_capabilities(&self) -> Vec<String> {
-        ["body", "actions"].iter().map(|s| s.to_string()).collect()
+        ["body", "actions", "icon-static"].iter().map(|s| s.to_string()).collect()
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn notify(&self, app_name: String, replaces_id: u32, _app_icon: String, summary: String, body: String, actions: Vec<String>, hints: HashMap<String, Value<'_>>, expire_timeout: i32) -> u32 {
+    fn notify(&self, app_name: String, replaces_id: u32, app_icon: String, summary: String, body: String, actions: Vec<String>, hints: HashMap<String, Value<'_>>, expire_timeout: i32) -> u32 {
         let id = if replaces_id != 0 { replaces_id } else { self.next.fetch_add(1, Ordering::Relaxed) };
         let urgency = match hints.get("urgency") {
             Some(Value::U8(n)) => (*n).min(2),
             _ => 1,
         };
         let actions = actions.chunks_exact(2).map(|p| (p[0].clone(), p[1].clone())).collect();
-        let _ = self.tx.send(NotifEvent::Show(Notification { id, app: app_name, summary, body, actions, urgency, expire_ms: expire_timeout }));
+        let silent = matches!(hints.get("suppress-sound"), Some(Value::Bool(true))) || hints.contains_key("sound-file") || plays_own_sound(&app_name);
+        let hint = |k: &str| match hints.get(k) {
+            Some(Value::Str(s)) if !s.is_empty() => Some(s.to_string()),
+            _ => None,
+        };
+        // a picture sent with the message beats the application's icon
+        let icon = hint("image-path").or_else(|| hint("image_path")).unwrap_or(app_icon);
+        let desktop = hint("desktop-entry").unwrap_or_default();
+        let _ = self.tx.send(NotifEvent::Show(Notification { id, app: app_name, summary, body, actions, urgency, expire_ms: expire_timeout, silent, icon, desktop, file: None }));
         id
     }
 
@@ -119,12 +148,14 @@ pub struct Notifications {
     pub seen_at: u64,
     /// the history changed and is to be written
     dirty: Option<Instant>,
+    /// the toast with a file that the button is held on: a drag out of it, or a click that opens the file
+    pub press: Option<u32>,
 }
 
 impl Notifications {
     pub fn new() -> Notifications {
         let history = std::fs::read_to_string(history_path()).ok().and_then(|s| toml::from_str::<HistoryFile>(&s).ok()).map(|f| f.items).unwrap_or_default();
-        Notifications { conn: None, rx: None, toasts: Vec::new(), history, seen_at: unix_now(), dirty: None }
+        Notifications { conn: None, rx: None, toasts: Vec::new(), history, seen_at: unix_now(), dirty: None, press: None }
     }
 
     /// Keep a notification: a replacement of one that is there takes its place at the top.
@@ -151,6 +182,21 @@ impl Notifications {
     /// How many came since the centre was last opened.
     pub fn unread(&self) -> usize {
         self.history.iter().filter(|s| s.at > self.seen_at).count()
+    }
+
+    /// How many unread ones came from the app with this desktop id / name (the sender says its name as it likes:
+    /// "Telegram Desktop", "telegram-desktop", "org.telegram.desktop").
+    pub fn unread_for(&self, key: &str, name: &str) -> usize {
+        let norm = |t: &str| t.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+        let (key, name) = (norm(key.trim_end_matches(".desktop")), norm(name));
+        self.history
+            .iter()
+            .filter(|s| s.at > self.seen_at)
+            .filter(|s| {
+                let a = norm(&s.n.app);
+                a.len() >= 3 && (a == name || a == key || key.contains(&a) || (name.len() >= 3 && a.contains(&name)))
+            })
+            .count()
     }
 
     /// Write the history when it changed a moment ago (a burst of them is written once).
@@ -198,12 +244,91 @@ fn wrap(text: &str, width: f32, size: f32, measure: &dyn Fn(&str, f32, bool) -> 
     lines
 }
 
+/// A picture file named as an icon: an absolute path or a `file://` address.
+fn icon_path(icon: &str) -> Option<PathBuf> {
+    let p = icon.strip_prefix("file://").unwrap_or(icon);
+    p.starts_with('/').then(|| PathBuf::from(p))
+}
+
+/// The file as the file icons want it (its thumbnail is made from the picture).
+fn picture_entry(p: &Path) -> Option<fsops::Entry> {
+    let md = std::fs::metadata(p).ok().filter(|m| m.is_file())?;
+    let modified = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+    Some(fsops::Entry { name: p.file_name()?.to_string_lossy().to_string(), path: p.to_path_buf(), is_dir: false, size: md.len(), modified, hidden: false, kind: fsops::Kind::Image, app: None })
+}
+
+/// What stands for a notification that has no icon: a glyph and the two colours of its plate.
+fn fallback_glyph(n: &Notification) -> (&'static str, [f32; 3], [f32; 3]) {
+    let app = n.app.to_lowercase();
+    if n.urgency >= 2 {
+        return ("triangle-alert", [0.96, 0.36, 0.30], [0.80, 0.20, 0.20]);
+    }
+    let about = |words: &[&str]| words.iter().any(|w| app.contains(w) || n.summary.to_lowercase().contains(w));
+    if n.file.is_some() || about(&["screenshot"]) {
+        ("camera", [0.45, 0.45, 0.52], [0.30, 0.30, 0.38])
+    } else if about(&["mail", "thunderbird"]) {
+        ("mail", [0.30, 0.62, 0.98], [0.18, 0.44, 0.86])
+    } else if about(&["download", "update", "upgrade"]) {
+        ("download", [0.30, 0.78, 0.55], [0.18, 0.60, 0.40])
+    } else {
+        ("bell", [0.30, 0.52, 0.98], [0.20, 0.38, 0.85])
+    }
+}
+
 impl State {
+    /// The atlas cell of the icon a toast shows, asking for what is not loaded yet: the picture of its file, a picture
+    /// the sender named, the sender's launcher icon, or an icon of the theme by name. None: nothing (yet) - draw a glyph.
+    fn toast_icon(&mut self, n: &Notification) -> Option<u32> {
+        if let Some(path) = n.file.clone().or_else(|| icon_path(&n.icon)) {
+            if let Some(e) = picture_entry(&path) {
+                self.fileicons.request(&mut self.renderer, std::slice::from_ref(&e));
+                if let IconState::Cell(c) = self.fileicons.state(&self.renderer, &e, true) {
+                    return Some(c);
+                }
+            }
+            if n.file.is_some() {
+                return None;
+            }
+        }
+        let norm = |t: &str| t.trim_end_matches(".desktop").to_lowercase();
+        let (app, desktop, icon) = (norm(&n.app), norm(&n.desktop), norm(&n.icon));
+        let idx = self.apps.iter().position(|a| {
+            let id = norm(&a.id);
+            a.name.to_lowercase() == app || id == app || (!desktop.is_empty() && id == desktop) || (!icon.is_empty() && (id == icon || a.icon.to_lowercase() == icon))
+        });
+        let mut budget = 2u32;
+        if let Some(i) = idx {
+            self.ensure_icon_pub(i, &mut budget);
+            if let Some(c) = self.renderer.app_icon_get(&self.apps[i].id) {
+                return Some(c);
+            }
+        }
+        // an icon of the theme, by the name the sender gave
+        if !n.icon.is_empty() && icon_path(&n.icon).is_none() {
+            let key = format!("notif:{}", n.icon);
+            if let Some(c) = self.renderer.app_icon_get(&key) {
+                return Some(c);
+            }
+            if !self.icon_failed.contains(&key) && self.icons.get().is_some() {
+                let tile = self.renderer.icon_tile();
+                self.icon_loader.request(&key, &n.icon, tile);
+            }
+        }
+        None
+    }
+
+    /// Tell that a screenshot was taken: a toast with the picture, that can be dragged into a window or a click opens.
+    pub fn shot_toast(&mut self, summary: String, file: PathBuf) {
+        let name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let body = format!("{name}\n{}", memrium_de::i18n::tr("Drag the picture into a window to share it"));
+        self.show_toast(Notification { id: 700_001, app: "Screenshot".into(), summary, body, actions: Vec::new(), urgency: 1, expire_ms: 8000, silent: true, icon: String::new(), desktop: String::new(), file: Some(file) });
+    }
+
     /// Offer the notification service on the session bus. A desktop that already has one keeps it.
     pub fn start_notifications(&mut self) {
         let (tx, rx) = channel();
         let server = Server { tx, next: Arc::new(AtomicU32::new(1)) };
-        let built = Builder::session().and_then(|b| b.name("org.freedesktop.Notifications")).and_then(|b| b.serve_at(PATH, server)).and_then(|b| b.build());
+        let built = Builder::session().map(|b| b.allow_name_replacements(false).replace_existing_names(false)).and_then(|b| b.name("org.freedesktop.Notifications")).and_then(|b| b.serve_at(PATH, server)).and_then(|b| b.build());
         match built {
             Ok(conn) => {
                 eprintln!("notifications: serving org.freedesktop.Notifications");
@@ -259,17 +384,35 @@ impl State {
     }
 
     /// A click on a toast: do its default action, if any, and dismiss it. True when the click was on a toast.
-    pub fn toast_click(&mut self, p: [f32; 2]) -> bool {
+    pub fn toast_click(&mut self, p: [f32; 2], button: u32) -> bool {
         let Some(i) = self.toast_at(p) else { return false };
-        let (id, default) = {
+        let (id, default, file) = {
             let t = &self.notifications.toasts[i];
-            (t.n.id, t.n.actions.iter().any(|(k, _)| k == "default"))
+            (t.n.id, t.n.actions.iter().any(|(k, _)| k == "default"), t.n.file.clone())
         };
+        // a toast with a file: the left button takes hold of the file (a drag, or a click when it does not move)
+        if let (Some(file), true) = (file, button == crate::state::BTN_LEFT) {
+            self.file_drag = Some(crate::state::FileDrag { paths: vec![file], start: self.mouse, active: false });
+            self.notifications.press = Some(id);
+            return true;
+        }
         if default {
             self.emit_action(id, "default");
         }
         self.close_toast(i, 2);
         true
+    }
+
+    /// The button came up after a press on a toast with a file: a click opens the file, a drag has already carried it.
+    pub fn toast_release(&mut self, dragged: bool) {
+        let Some(id) = self.notifications.press.take() else { return };
+        let Some(i) = self.notifications.toasts.iter().position(|t| t.n.id == id) else { return };
+        if !dragged {
+            if let Some(file) = self.notifications.toasts[i].n.file.clone() {
+                fsops::open_external(&file, &self.socket);
+            }
+        }
+        self.close_toast(i, 2);
     }
 
     fn close_toast(&mut self, i: usize, reason: u32) {
@@ -307,7 +450,11 @@ impl State {
         if self.notifications.toasts.is_empty() {
             return;
         }
-        // expire
+        // expire: not while the pointer is on a toast or a file is being taken from it
+        if let Some(h) = self.toast_at(self.mouse) {
+            self.notifications.toasts[h].born = Instant::now();
+        }
+        let held = self.notifications.press;
         let now = Instant::now();
         let expired: Vec<usize> = self
             .notifications
@@ -320,7 +467,7 @@ impl State {
                     (m, _) if m > 0 => m as u128,
                     _ => (self.config.notifications.seconds.max(1.0) * 1000.0) as u128,
                 };
-                t.closing.is_none() && now.duration_since(t.born).as_millis() > ms
+                t.closing.is_none() && held != Some(t.n.id) && now.duration_since(t.born).as_millis() > ms
             })
             .map(|(i, _)| i)
             .collect();
@@ -374,17 +521,17 @@ impl State {
         let (app, summary, body) = (it.next().unwrap_or_default(), it.next().unwrap_or_default(), it.next().unwrap_or_default());
         let urgency = it.next().and_then(|u| u.parse().ok()).unwrap_or(1);
         let id = 800_000 + self.notifications.history.len() as u32;
-        self.take_in(Notification { id, app, summary, body, actions: Vec::new(), urgency, expire_ms: -1 });
+        self.take_in(Notification { id, app, summary, body, actions: Vec::new(), urgency, expire_ms: -1, silent: false, icon: String::new(), desktop: String::new(), file: None });
     }
 
     /// A notification of our own, to see how they look with the preferences as they are now.
     pub fn test_notification(&mut self) {
         let id = 900_000 + (self.start.elapsed().as_millis() % 1000) as u32;
-        self.show_toast(Notification { id, app: "Settings".into(), summary: "A test notification".into(), body: "This is how notifications look and where they appear.".into(), actions: Vec::new(), urgency: 1, expire_ms: -1 });
+        self.show_toast(Notification { id, app: "Settings".into(), summary: "A test notification".into(), body: "This is how notifications look and where they appear.".into(), actions: Vec::new(), urgency: 1, expire_ms: -1, silent: false, icon: String::new(), desktop: String::new(), file: None });
     }
 
     fn show_toast(&mut self, n: Notification) {
-        if n.urgency != 0 {
+        if n.urgency != 0 && !n.silent {
             self.ui_sound(memrium_de::sound::Sound::Notify);
         }
         // layout is measured once, here
@@ -449,26 +596,23 @@ impl State {
             }
             p.fade_by(k);
             panels.push(p);
-            // the application's icon, or a bell
-            let icon_c = [r[0] + 14.0 + 20.0, r[1] + 16.0 + 20.0];
-            let app = t.n.app.to_lowercase();
-            let idx = self.apps.iter().position(|a| a.name.to_lowercase() == app || a.id.trim_end_matches(".desktop").to_lowercase() == app);
-            let mut budget = 2u32;
-            if let Some(i) = idx {
-                self.ensure_icon_pub(i, &mut budget);
-            }
-            match idx.and_then(|i| self.renderer.app_icon_get(&self.apps[i].id)) {
+            // the picture of the file, the sender's icon, or a glyph for what it is about
+            let icon_c = [r[0] + 14.0 + 20.0, r[1] + 16.0 + 22.0];
+            let size = if t.n.file.is_some() { 44.0 } else { 40.0 };
+            match self.toast_icon(&t.n) {
+                Some(cell) if t.n.file.is_some() => panels.push(Panel::app_icon(icon_c[0], icon_c[1], size, cell, k)),
                 Some(cell) => {
                     let mut tmp = Vec::new();
-                    memrium_de::theme::push_app_icon(&self.theme, &mut tmp, icon_c[0], icon_c[1], 40.0, cell, (0.0, 0.0, 0.0));
+                    memrium_de::theme::push_app_icon(&self.theme, &mut tmp, icon_c[0], icon_c[1], size, cell, (0.0, 0.0, 0.0));
                     for mut q in tmp {
                         q.tint[3] *= k;
                         panels.push(q);
                     }
                 }
                 None => {
-                    panels.push(Panel::solid(icon_c[0], icon_c[1], 40.0, 40.0, if windows { 6.0 } else { 11.0 }, [0.30, 0.52, 0.98], [0.20, 0.38, 0.85]).flat().alpha(k));
-                    panels.push(Panel::glyph(icon_c[0], icon_c[1], 20.0, "bell", [1.0; 3], k));
+                    let (glyph, from, to) = fallback_glyph(&t.n);
+                    panels.push(Panel::solid(icon_c[0], icon_c[1], size, size, if windows { 6.0 } else { 11.0 }, from, to).flat().alpha(k));
+                    panels.push(Panel::glyph(icon_c[0], icon_c[1], 20.0, glyph, [1.0; 3], k));
                 }
             }
             let measure = |s: &str, size: f32, b: bool| self.renderer.text_width(s, size, b);
@@ -495,11 +639,11 @@ mod tests {
     use super::*;
 
     fn note(id: u32) -> Notification {
-        Notification { id, app: "a".into(), summary: format!("s{id}"), body: String::new(), actions: Vec::new(), urgency: 1, expire_ms: -1 }
+        Notification { id, app: "a".into(), summary: format!("s{id}"), body: String::new(), actions: Vec::new(), urgency: 1, expire_ms: -1, silent: false, icon: String::new(), desktop: String::new(), file: None }
     }
 
     fn empty() -> Notifications {
-        Notifications { conn: None, rx: None, toasts: Vec::new(), history: Vec::new(), seen_at: 0, dirty: None }
+        Notifications { conn: None, rx: None, toasts: Vec::new(), history: Vec::new(), seen_at: 0, dirty: None, press: None }
     }
 
     #[test]

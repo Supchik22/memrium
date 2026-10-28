@@ -5,14 +5,14 @@
 //! [[bars]]
 //! name = "taskbar"
 //! surface = "glass"
-//! center = ["start", { kind = "search-box", width = 190 }, { kind = "tasks", icon_size = 26, indicator = "underline" }]
+//! center = ["start", { kind = "search-box", width = 190 }, { kind = "dock", icon_size = 26, button_w = 44, magnify = false, indicator = "underline" }]
 //! right  = [{ kind = "tray", icons = ["wifi", "volume-2"] }, { kind = "clock", format = "%l:%M %p", format2 = "%m/%d/%Y" }]
 //! ```
 
 use crate::renderer::{Align, Label, Panel};
-use crate::scene::{DockIcon, DockItem};
+use chebrium::lucide;
 use chebrium::spring::Spring;
-use crate::widget::{glyph, BarClick, BarCtx, CcRole, DockHover, Drawn, Widget, WidgetSpec};
+use crate::widget::{glyph, pack_icon, tone, BarClick, BarCtx, CcRole, Drawn, Widget, WidgetSpec};
 
 fn inside(p: [f32; 2], r: [f32; 4]) -> bool {
     p[0] >= r[0] && p[0] <= r[0] + r[2] && p[1] >= r[1] && p[1] <= r[1] + r[3]
@@ -28,23 +28,82 @@ fn glow(c: &BarCtx) -> f32 {
 
 // ---------------------------------------------------------------------------------------- start
 
-/// The start button: the four-pane logo, or Aero's round orb. Opens the start menu.
+/// The start button: an icon of your choice (a glyph, or any icon of the icon pack in use) on its own, on a rounded
+/// plate, in a glass orb or under a flat Breeze highlight, with a text label if wanted (as in Plasma's launcher).
+/// Opens the start menu of its own choice, right where the button is.
 pub struct Start {
     orb: bool,
+    plate: bool,
+    breeze: bool,
+    /// the icon is left out (text only)
+    text_only: bool,
+    /// the menu it opens: "theme" (the theme's launcher) or a kind, where it sits, favourites as a grid
+    menu: String,
+    menu_align: String,
+    grid: bool,
     size: f32,
+    icon_size: f32,
+    glyph: String,
+    pack_icon: String,
+    themed: bool,
+    color: String,
+    plate_color: String,
+    hover_fx: String,
+    stay_lit: bool,
+    shine: bool,
+    label: String,
     action: String,
     hover: Spring,
 }
 
 impl Start {
     pub fn new(spec: &WidgetSpec) -> Self {
-        let orb = spec.s("style") == "orb";
-        Start { orb, size: spec.n("size"), action: spec.str("action").unwrap_or("start").to_string(), hover: hover_spring() }
+        let style = spec.s("style");
+        let display = spec.s("display");
+        let label = spec.s("label");
+        // (the label shows when asked for, or when there is one and nothing says otherwise)
+        let label = match display.as_str() {
+            "icon" => String::new(),
+            "icon_text" | "text" if label.is_empty() => "Applications".to_string(),
+            _ => label,
+        };
+        Start {
+            orb: style == "orb",
+            plate: style == "plate",
+            breeze: style == "breeze",
+            text_only: display == "text",
+            menu: spec.s("menu"),
+            menu_align: spec.s("menu_align"),
+            grid: spec.flag("grid"),
+            size: spec.n("size"),
+            icon_size: spec.n("icon_size"),
+            glyph: spec.s("glyph"),
+            pack_icon: spec.s("pack_icon"),
+            themed: spec.flag("themed"),
+            color: spec.s("color"),
+            plate_color: spec.s("plate_color"),
+            hover_fx: spec.s("hover"),
+            stay_lit: spec.flag("stay_lit"),
+            shine: spec.flag("shine"),
+            label,
+            action: spec.str("action").unwrap_or("start").to_string(),
+            hover: hover_spring(),
+        }
     }
 
-    fn rect(&self, r: [f32; 4]) -> [f32; 4] {
-        let (w, h) = (self.size, if self.orb { self.size } else { 40.0 });
-        [r[0] + (r[2] - w) / 2.0, r[1] + (r[3] - h) / 2.0, w, h]
+    /// Width of the icon part of the button (0 with text only).
+    fn icon_w(&self) -> f32 {
+        if self.text_only { 10.0 } else { self.size }
+    }
+
+    fn rect(&self, c: &BarCtx, r: [f32; 4]) -> [f32; 4] {
+        let h = if self.orb { self.size } else { self.size.min(r[3] - 4.0).max(16.0) };
+        let w = self.icon_w() + self.label_w(c);
+        [r[0] + 4.0, r[1] + (r[3] - h) / 2.0, w, h]
+    }
+
+    fn label_w(&self, c: &BarCtx) -> f32 {
+        if self.label.is_empty() { 0.0 } else { (c.measure)(&self.label, 13.0, true) + 6.0 }
     }
 }
 
@@ -52,40 +111,75 @@ impl Widget for Start {
     fn kind(&self) -> &'static str {
         "start"
     }
-    fn width(&self, _: &BarCtx) -> f32 {
-        self.size + 8.0
+    fn width(&self, c: &BarCtx) -> f32 {
+        self.icon_w() + self.label_w(c) + 8.0
     }
     fn parts(&self, c: &BarCtx) -> Vec<f32> {
         vec![self.width(c)]
     }
     fn update(&mut self, dt: f32, c: &BarCtx, r: [f32; 4]) {
-        self.hover.target = if inside(c.mouse, self.rect(r)) { 1.0 } else { 0.0 };
+        self.hover.target = if inside(c.mouse, self.rect(c, r)) { 1.0 } else { 0.0 };
         self.hover.update(dt);
     }
     fn draw(&self, c: &BarCtx, r: [f32; 4], _: Option<usize>, out: &mut Drawn) {
-        let b = self.rect(r);
-        let (cx, cy) = (b[0] + b[2] / 2.0, b[1] + b[3] / 2.0);
+        let b = self.rect(c, r);
         let sh = self.hover.x;
+        let lit = self.stay_lit && c.start_open;
+        let glow_on = self.hover_fx == "glow";
+        // the icon sits in the square at the left; a label follows it
+        let (cx, cy) = (b[0] + self.size / 2.0, b[1] + b[3] / 2.0);
+        let grow = if self.hover_fx == "grow" { 1.0 + 0.12 * sh } else { 1.0 };
+        let col = tone(&self.color, c);
+        let pc = tone(&self.plate_color, c);
+        let mut ink = col;
         if self.orb {
-            let d = b[2];
-            let boost = 0.12 * sh + if c.start_open { 0.15 } else { 0.0 };
-            out.panels.push(Panel::solid(cx, cy, d, d, d / 2.0, [0.02, 0.06, 0.16], [0.02, 0.06, 0.16]).flat().alpha(0.55));
-            out.panels.push(Panel::solid(cx, cy, d - 3.0, d - 3.0, (d - 3.0) / 2.0, [0.42 + boost, 0.72 + boost, 1.0], [0.06 + boost, 0.28 + boost, 0.66]).flat());
-            out.panels.push(Panel::solid(cx, cy - d * 0.20, d * 0.74, d * 0.42, d * 0.21, [1.0; 3], [1.0; 3]).flat().alpha(0.30));
-            for (dx, dy, col) in [(-4.5, -4.5, [0.98, 0.35, 0.22]), (4.5, -4.0, [0.45, 0.85, 0.30]), (-4.5, 4.5, [0.25, 0.60, 1.0]), (4.5, 5.0, [1.0, 0.82, 0.20])] {
-                out.panels.push(Panel::solid(cx + dx, cy + dy, 8.0, 8.0, 2.0, col, col).flat());
+            let d = self.size * grow;
+            let boost = if glow_on { 0.12 * sh } else { 0.0 } + if lit { 0.15 } else { 0.0 };
+            let (hi, lo) = ([pc[0] * 0.55 + 0.45, pc[1] * 0.55 + 0.45, pc[2] * 0.55 + 0.45], [pc[0] * 0.45, pc[1] * 0.45, pc[2] * 0.45]);
+            let up = |v: [f32; 3]| [(v[0] + boost).min(1.0), (v[1] + boost).min(1.0), (v[2] + boost).min(1.0)];
+            out.panels.push(Panel::solid(cx, cy, d, d, d / 2.0, [lo[0] * 0.3; 3], [lo[0] * 0.3; 3]).flat().alpha(0.55));
+            out.panels.push(Panel::solid(cx, cy, d - 3.0, d - 3.0, (d - 3.0) / 2.0, up(hi), up(lo)).flat());
+            if self.shine {
+                out.panels.push(Panel::solid(cx, cy - d * 0.20, d * 0.74, d * 0.42, d * 0.21, [1.0; 3], [1.0; 3]).flat().alpha(0.30));
             }
-        } else {
-            if sh > 0.01 || c.start_open {
-                out.panels.push(Panel::solid(cx, cy, b[2], b[3], 6.0, [1.0; 3], [1.0; 3]).flat().alpha(0.45 * sh + if c.start_open { 0.25 } else { 0.0 }));
+            if self.color == "accent" {
+                ink = [1.0; 3];
             }
-            for (dx, dy) in [(-5.0, -5.0), (5.0, -5.0), (-5.0, 5.0), (5.0, 5.0)] {
-                out.panels.push(Panel::solid(cx + dx, cy + dy, 9.0, 9.0, 1.6, c.theme.accent, c.theme.accent).flat());
+        } else if self.plate {
+            let strength = if glow_on { 0.25 * sh } else { 0.0 } + if lit { 0.30 } else { 0.0 };
+            out.panels.push(Panel::solid(cx, cy, self.size * grow, b[3] * grow, 9.0, pc, pc).flat().alpha(0.55 + strength * 0.4));
+            if self.color == "accent" {
+                ink = [1.0; 3];
             }
+        } else if self.breeze {
+            // Breeze: a faint plate under the pointer, the accent while the menu is open (over the icon and the label)
+            let (mx, my) = (b[0] + b[2] / 2.0, b[1] + b[3] / 2.0);
+            if sh > 0.01 && glow_on {
+                out.panels.push(Panel::solid(mx, my, b[2] + 4.0, b[3], 5.0, c.ink, c.ink).flat().alpha(0.10 * sh));
+            }
+            if lit {
+                out.panels.push(Panel::solid(mx, my, b[2] + 4.0, b[3], 5.0, c.theme.accent, c.theme.accent).flat().alpha(0.30));
+            }
+        } else if (glow_on && sh > 0.01) || lit {
+            out.panels.push(Panel::solid(cx, cy, self.size, b[3], 6.0, [1.0; 3], [1.0; 3]).flat().alpha(if glow_on { 0.45 * sh } else { 0.0 } + if lit { 0.25 } else { 0.0 }));
+        }
+        if !self.text_only {
+            let isz = self.icon_size * grow;
+            if !pack_icon(c, out, &self.pack_icon, cx, cy, isz, self.themed, 1.0) {
+                // (a glyph while the pack's icon loads, or when none is chosen)
+                let g = if lucide::ICONS.iter().any(|(n, _)| *n == self.glyph) { self.glyph.as_str() } else { "layout-grid" };
+                out.panels.push(Panel::glyph(cx, cy, isz, g, ink, 0.95));
+            }
+        }
+        if !self.label.is_empty() {
+            let lx = if self.text_only { b[0] + 5.0 } else { b[0] + self.size + 2.0 };
+            out.labels.push(Label::new(self.label.clone(), lx, cy + 4.8, 13.0, true, c.ink, 0.95, Align::Left));
         }
     }
     fn click(&mut self, _: &BarCtx, _: [f32; 4], _: usize, _: f32) -> Option<BarClick> {
-        Some(BarClick::Action(self.action.clone()))
+        // the start action carries the menu to open, where it sits and its favourites view
+        let action = if self.action == "start" { format!("start:{}:{}:{}", self.menu, self.menu_align, self.grid as u8) } else { self.action.clone() };
+        Some(BarClick::Action(action))
     }
 }
 
@@ -136,151 +230,6 @@ impl Widget for SearchBox {
     }
     fn click(&mut self, _: &BarCtx, _: [f32; 4], _: usize, _: f32) -> Option<BarClick> {
         Some(BarClick::Action(self.action.clone()))
-    }
-}
-
-// ---------------------------------------------------------------------------------------- tasks
-
-#[derive(Clone, Copy, PartialEq)]
-enum Indicator {
-    Underline,
-    Dot,
-    Glass,
-}
-
-struct Entry {
-    item: DockItem,
-    focused: bool,
-    hover: Spring,
-    press: Spring,
-}
-
-/// One button per Dock / running app, with a running indicator.
-pub struct Tasks {
-    icon_size: f32,
-    button_w: f32,
-    labels: bool,
-    previews: bool,
-    label_w: f32,
-    gap: f32,
-    indicator: Indicator,
-    entries: Vec<Entry>,
-    centers: Vec<(String, [f32; 2])>,
-}
-
-impl Tasks {
-    pub fn new(spec: &WidgetSpec) -> Self {
-        let indicator = match spec.s("indicator").as_str() {
-            "dot" => Indicator::Dot,
-            "glass" | "glass_button" => Indicator::Glass,
-            _ => Indicator::Underline,
-        };
-        Tasks {
-            icon_size: spec.n("icon_size"),
-            button_w: spec.n("button_w"),
-            labels: spec.flag("labels"),
-            previews: spec.flag("previews"),
-            label_w: spec.n("label_w"),
-            gap: spec.n("gap"),
-            indicator,
-            entries: Vec::new(),
-            centers: Vec::new(),
-        }
-    }
-
-    fn bw(&self) -> f32 {
-        if self.labels { self.label_w } else { self.button_w }
-    }
-
-    /// Rectangle of every button inside the widget rectangle `r`.
-    fn buttons(&self, r: [f32; 4]) -> Vec<[f32; 4]> {
-        let h = (r[3] - 8.0).min(self.icon_size + 18.0).max(8.0);
-        let cy = r[1] + r[3] / 2.0;
-        (0..self.entries.len()).map(|i| [r[0] + self.gap + i as f32 * (self.bw() + self.gap), cy - h / 2.0, self.bw(), h]).collect()
-    }
-}
-
-impl Widget for Tasks {
-    fn kind(&self) -> &'static str {
-        "tasks"
-    }
-    fn width(&self, _: &BarCtx) -> f32 {
-        let n = self.entries.len() as f32;
-        if n == 0.0 { 0.0 } else { n * self.bw() + (n + 1.0) * self.gap }
-    }
-    fn parts(&self, _: &BarCtx) -> Vec<f32> {
-        (0..self.entries.len()).map(|i| self.bw() + self.gap + if i == 0 { self.gap } else { 0.0 }).collect()
-    }
-    fn update(&mut self, dt: f32, c: &BarCtx, r: [f32; 4]) {
-        let rects = self.buttons(r);
-        for (e, b) in self.entries.iter_mut().zip(&rects) {
-            e.hover.target = if inside(c.mouse, *b) { 1.0 } else { 0.0 };
-            e.hover.update(dt);
-            e.press.target = 0.0;
-            e.press.update(dt);
-        }
-        self.centers = self.entries.iter().zip(&rects).map(|(e, b)| (e.item.key.clone(), [b[0] + b[2] / 2.0, b[1] + b[3] / 2.0])).collect();
-    }
-    fn draw(&self, c: &BarCtx, r: [f32; 4], _: Option<usize>, out: &mut Drawn) {
-        let dark = c.theme.dark;
-        for (e, b) in self.entries.iter().zip(self.buttons(r)) {
-            let (cx, cy) = (b[0] + b[2] / 2.0, b[1] + b[3] / 2.0);
-            let hov = e.hover.x;
-            match self.indicator {
-                Indicator::Glass => {
-                    if e.item.running || hov > 0.02 {
-                        let strength = (if e.item.running { 0.34 + if e.focused { 0.22 } else { 0.0 } } else { 0.0 } + 0.30 * hov).min(0.9);
-                        out.panels.push(Panel::solid(cx, cy, b[2] - 2.0, b[3], 4.0, [1.0; 3], [0.72, 0.84, 1.0]).flat().alpha(strength));
-                        out.panels.push(Panel::solid(cx, cy - b[3] * 0.22, b[2] - 4.0, b[3] * 0.5, 3.0, [1.0; 3], [1.0; 3]).flat().alpha(0.18 * strength.min(1.0)));
-                    }
-                }
-                Indicator::Underline | Indicator::Dot => {
-                    if hov > 0.02 || e.focused {
-                        let a = glow(c) * (hov * 0.8 + if e.focused { 0.45 } else { 0.0 }).min(1.0) * if dark { 1.0 } else { 1.1 };
-                        out.panels.push(Panel::solid(cx, cy, b[2], b[3], 6.0, [1.0; 3], [1.0; 3]).flat().alpha(a));
-                    }
-                    if e.item.running {
-                        let acc = if e.focused { c.theme.accent } else { [0.45, 0.47, 0.52] };
-                        let (iw, ih) = if self.indicator == Indicator::Underline { (if e.focused { 16.0 } else { 6.0 }, 3.0) } else { (5.0, 5.0) };
-                        out.panels.push(Panel::solid(cx, b[1] + b[3] - 4.0, iw, ih, ih / 2.0, acc, acc).flat());
-                    }
-                }
-            }
-            let sz = self.icon_size * (1.0 + 0.06 * hov) + e.press.x;
-            let ix = if self.labels { b[0] + 8.0 + sz / 2.0 } else { cx };
-            match &e.item.icon {
-                DockIcon::Procedural(id, top, bot) => out.panels.push(Panel::icon(ix, cy - 1.0, sz, *id, *top, *bot).shadow(0.18, 6.0, 2.0)),
-                DockIcon::App(cell) => crate::theme::push_app_icon(c.theme, &mut out.panels, ix, cy - 1.0, sz, *cell, (0.16, 6.0, 2.0)),
-            }
-            if self.labels {
-                out.labels.push(Label::new(e.item.name.clone(), b[0] + 8.0 + self.icon_size + 8.0, cy + 4.5, 12.5, false, c.ink, 0.95, Align::Left));
-            }
-        }
-    }
-    fn click(&mut self, _: &BarCtx, _: [f32; 4], part: usize, _: f32) -> Option<BarClick> {
-        let e = self.entries.get_mut(part)?;
-        e.press.kick(-6.0);
-        Some(BarClick::Dock(e.item.key.clone()))
-    }
-    fn set_dock(&mut self, items: &[DockItem], focused: Option<&str>) {
-        let mut old: Vec<Entry> = std::mem::take(&mut self.entries);
-        for it in items {
-            let is_focus = focused == Some(it.key.as_str());
-            if let Some(pos) = old.iter().position(|e| e.item.key == it.key) {
-                let mut e = old.remove(pos);
-                e.item = it.clone();
-                e.focused = is_focus;
-                self.entries.push(e);
-            } else {
-                self.entries.push(Entry { item: it.clone(), focused: is_focus, hover: hover_spring(), press: Spring::new(0.0, 400.0, 0.6) });
-            }
-        }
-    }
-    fn item_center(&self, key: &str) -> Option<[f32; 2]> {
-        self.centers.iter().find(|(k, _)| k == key).map(|(_, p)| *p)
-    }
-    fn item_at(&self, c: &BarCtx, r: [f32; 4]) -> Option<DockHover> {
-        self.entries.iter().zip(self.buttons(r)).find(|(_, b)| inside(c.mouse, *b)).map(|(e, b)| DockHover { key: e.item.key.clone(), rect: b, previews: self.previews })
     }
 }
 
@@ -339,7 +288,13 @@ impl Widget for Tray {
             } else if i < lead + c.tray.len() {
                 let item = &c.tray[i - lead];
                 let size = self.size + 3.0;
-                match item.cell {
+                // a white icon on a light bar (or a black one on a dark bar) is turned over so that it can be seen
+                let bar_is_light = (0.299 * c.ink[0] + 0.587 * c.ink[1] + 0.114 * c.ink[2]) < 0.5;
+                let cell = match item.inverse {
+                    Some((inv, icon_is_light)) if icon_is_light == bar_is_light => Some(inv),
+                    _ => item.cell,
+                };
+                match cell {
                     Some(cell) => out.panels.push(Panel::app_icon(x, cy, size, cell, 1.0)),
                     None => glyph(c, r, out, "app-window", x, self.size),
                 }

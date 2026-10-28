@@ -43,9 +43,15 @@ enum SpecRepr {
 impl From<SpecRepr> for WidgetSpec {
     fn from(r: SpecRepr) -> Self {
         match r {
+            SpecRepr::Name(kind) if kind == "tasks" => WidgetSpec::taskbar(),
             SpecRepr::Name(kind) => WidgetSpec { kind, opts: toml::Table::new() },
             SpecRepr::Full(mut opts) => {
-                let kind = opts.remove("kind").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+                let mut kind = opts.remove("kind").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+                // (the task buttons are the Dock widget with taskbar-like options now)
+                if kind == "tasks" {
+                    kind = "dock".into();
+                    opts = legacy_tasks(opts);
+                }
                 WidgetSpec { kind, opts }
             }
         }
@@ -76,9 +82,59 @@ impl<'de> Deserialize<'de> for WidgetSpec {
     }
 }
 
+/// The options of the old `tasks` widget as options of the Dock: what a taskbar button looks like is its own settings.
+fn legacy_tasks(user: toml::Table) -> toml::Table {
+    let mut t = toml::Table::new();
+    let mut put = |k: &str, v: toml::Value| {
+        t.insert(k.into(), v);
+    };
+    for (k, v) in [("icon_size", 26.0), ("button_w", 44.0), ("gap", 4.0), ("pad", 4.0), ("running_opacity", 0.0), ("focus_boost", 0.12), ("hover_opacity", 0.12)] {
+        put(k, v.into());
+    }
+    for k in ["magnify", "tooltips", "bounce", "separators"] {
+        put(k, false.into());
+    }
+    put("previews", true.into());
+    for k in ["running_bg", "hover_bg"] {
+        put(k, "button".into());
+    }
+    for k in ["running_color", "hover_color"] {
+        put(k, "ink".into());
+    }
+    put("indicator", "underline".into());
+    let mut user = user;
+    // the glass-button indicator became a glass key behind the button
+    if user.get("indicator").and_then(|v| v.as_str()).is_some_and(|i| i == "glass" || i == "glass_button") {
+        user.remove("indicator");
+        for (k, v) in [("running_bg", "key"), ("hover_bg", "key")] {
+            put(k, v.into());
+        }
+        for (k, v) in [("running_opacity", 0.34), ("focus_boost", 0.22), ("hover_opacity", 0.30)] {
+            put(k, v.into());
+        }
+        put("indicator", "none".into());
+        put("running_color", "white".into());
+        put("hover_color", "white".into());
+    }
+    if user.remove("highlight_running").and_then(|v| v.as_bool()) == Some(true) {
+        put("running_bg", "tint".into());
+        put("running_opacity", user.get("running_opacity").cloned().unwrap_or(0.25.into()));
+        put("focus_boost", 0.14.into());
+    }
+    for (k, v) in user {
+        t.insert(k, v);
+    }
+    t
+}
+
 impl WidgetSpec {
     pub fn new(kind: &str) -> Self {
         WidgetSpec { kind: kind.into(), opts: toml::Table::new() }
+    }
+
+    /// A Dock set up as taskbar buttons: flat, no magnification, a plate on hover and for the focused app.
+    pub fn taskbar() -> Self {
+        WidgetSpec { kind: "dock".into(), opts: legacy_tasks(toml::Table::new()) }
     }
 
     pub(crate) fn str(&self, key: &str) -> Option<&str> {
@@ -131,6 +187,21 @@ pub enum AutoHide {
     Smart,
 }
 
+/// How an auto-hiding bar leaves and comes back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HideAnim {
+    /// slides out past its edge of the screen
+    #[default]
+    Slide,
+    /// shrinks into its edge of the screen
+    Squeeze,
+    /// fades out where it is
+    Fade,
+    /// sinks down while fading
+    Drop,
+}
+
 /// One bar: where it is, what it looks like and which widgets it holds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -154,6 +225,10 @@ pub struct BarConfig {
     pub radius: f32,
     /// hides itself (see `AutoHide`); a bar that hides takes no space from windows
     pub autohide: AutoHide,
+    /// how it goes away and comes back when it hides itself
+    pub hide_anim: HideAnim,
+    /// speed of that animation (1 = normal)
+    pub hide_speed: f32,
     pub left: Vec<WidgetSpec>,
     pub center: Vec<WidgetSpec>,
     pub right: Vec<WidgetSpec>,
@@ -161,7 +236,7 @@ pub struct BarConfig {
 
 impl Default for BarConfig {
     fn default() -> Self {
-        BarConfig { name: "bar".into(), edge: Edge::Top, shape: BarShape::Strip, height: None, margin: 14.0, look: None, surface: BarSurface::Look, glass: None, inset: 0.0, radius: 0.0, autohide: AutoHide::Off, left: Vec::new(), center: Vec::new(), right: Vec::new() }
+        BarConfig { name: "bar".into(), edge: Edge::Top, shape: BarShape::Strip, height: None, margin: 14.0, look: None, surface: BarSurface::Look, glass: None, inset: 0.0, radius: 0.0, autohide: AutoHide::Off, hide_anim: HideAnim::Slide, hide_speed: 1.0, left: Vec::new(), center: Vec::new(), right: Vec::new() }
     }
 }
 
@@ -212,9 +287,8 @@ pub const CATALOG: &[(&str, &str)] = &[
     ("volume", "Volume"),
     ("search", "Search"),
     ("control-center", "Quick Settings"),
-    ("dock", "Dock (apps)"),
+    ("dock", "Dock / task buttons"),
     ("start", "Start button"),
-    ("tasks", "Task buttons"),
     ("search-box", "Search box"),
     ("tray", "Tray icons"),
     ("keyboard", "Keyboard layout"),
@@ -276,6 +350,8 @@ pub struct BarCtx<'a> {
     pub open: Option<BarHit>,
     /// the start menu is open (the start button stays lit)
     pub start_open: bool,
+    /// the cell of an icon of the icon pack in use in the app-icon atlas, by name (`pack_icon` asks for the ones missing)
+    pub icon: &'a dyn Fn(&str) -> Option<u32>,
     /// the current virtual desktop
     pub workspace: usize,
     /// frames of the windows on screen (this monitor's coordinates): a bar that hides when covered looks at them
@@ -390,6 +466,102 @@ pub(crate) fn glyph(c: &BarCtx, r: [f32; 4], out: &mut Drawn, name: &str, cx: f3
     out.panels.push(g);
 }
 
+/// Icon names widgets asked for and the atlas did not have; the shell loads them (`take_wanted_icons`).
+static WANTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn take_wanted_icons() -> Vec<String> {
+    WANTED.lock().map(|mut w| std::mem::take(&mut *w)).unwrap_or_default()
+}
+
+/// The atlas key of an icon of the pack in use, by name.
+pub fn pack_icon_key(name: &str) -> String {
+    format!("icon:{name}")
+}
+
+/// Draw an icon of the icon pack in use, by name; false while it is not loaded (or there is no such icon), so the
+/// caller can draw something else meanwhile. `themed` keeps the theme's icon look (plate, shape), else the picture alone.
+pub(crate) fn pack_icon(c: &BarCtx, out: &mut Drawn, name: &str, cx: f32, cy: f32, size: f32, themed: bool, opacity: f32) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let Some(cell) = (c.icon)(&pack_icon_key(name)) else {
+        if let Ok(mut w) = WANTED.lock() {
+            if !w.iter().any(|n| n == name) && w.len() < 64 {
+                w.push(name.to_string());
+            }
+        }
+        return false;
+    };
+    if themed {
+        crate::theme::push_app_icon(c.theme, &mut out.panels, cx, cy, size, cell, (0.16, 6.0, 2.0));
+    } else {
+        let mut ic = Panel::app_icon(cx, cy, size, cell, opacity);
+        ic.params[3] = 0.0;
+        out.panels.push(ic);
+    }
+    true
+}
+
+/// Named colours for the widgets' colour options. "ink" and "accent" follow the theme.
+pub const TONES: &[(&str, &str)] = &[
+    ("accent", "Accent"),
+    ("ink", "Text colour"),
+    ("white", "White"),
+    ("black", "Black"),
+    ("red", "Red"),
+    ("orange", "Orange"),
+    ("yellow", "Yellow"),
+    ("green", "Green"),
+    ("mint", "Mint"),
+    ("blue", "Blue"),
+    ("purple", "Purple"),
+    ("pink", "Pink"),
+];
+
+/// The colour of icon `i` of `n` along a rainbow (red to violet), `sat` 0..1: the "rainbow" option tints every icon
+/// of a Dock or taskbar with its own.
+pub(crate) fn rainbow(i: usize, n: usize, sat: f32) -> [f32; 3] {
+    let h = (i as f32 / n.max(1) as f32 * 0.83).fract() * 6.0;
+    let (c, x) = (sat, sat * (1.0 - (h % 2.0 - 1.0).abs()));
+    let m = 1.0 - sat;
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [r + m, g + m, b + m]
+}
+
+/// Tint the application icons among `panels` (those pushed since `from`) with `col`: the one-colour look, per icon.
+pub(crate) fn tint_icons(panels: &mut [Panel], col: [f32; 3]) {
+    for p in panels {
+        if p.params[1] == 7.0 {
+            p.fx[1] = 1.0;
+            p.color2 = [col[0], col[1], col[2], 1.0];
+        }
+    }
+}
+
+pub(crate) fn tone(name: &str, c: &BarCtx) -> [f32; 3] {
+    match name {
+        "ink" => c.ink,
+        "white" => [1.0; 3],
+        "black" => [0.04; 3],
+        "red" => [1.0, 0.27, 0.23],
+        "orange" => [1.0, 0.58, 0.04],
+        "yellow" => [1.0, 0.80, 0.04],
+        "green" => [0.19, 0.82, 0.35],
+        "mint" => [0.39, 0.82, 0.78],
+        "blue" => [0.04, 0.52, 1.0],
+        "purple" => [0.75, 0.35, 0.95],
+        "pink" => [1.0, 0.32, 0.55],
+        _ => c.theme.accent,
+    }
+}
+
 fn show_title(c: &BarCtx) -> bool {
     c.theme.menubar.show_title && !c.vertical
 }
@@ -397,6 +569,7 @@ fn show_title(c: &BarCtx) -> bool {
 /// The system logo; opens the system menu.
 struct Logo {
     icon: String,
+    pack_icon: String,
 }
 
 impl Widget for Logo {
@@ -416,7 +589,9 @@ impl Widget for Logo {
         if lit.is_some() {
             highlight(c, r, out, r[0] + 3.0, 34.0);
         }
-        glyph(c, r, out, &self.icon, r[0] + 16.0, 17.0);
+        if !pack_icon(c, out, &self.pack_icon, r[0] + 16.0, r[1] + r[3] / 2.0, 20.0, false, 1.0) {
+            glyph(c, r, out, &self.icon, r[0] + 16.0, 17.0);
+        }
     }
     fn click(&mut self, _: &BarCtx, _: [f32; 4], _: usize, x: f32) -> Option<BarClick> {
         Some(BarClick::Menu { name: "logo".into(), x })
@@ -888,7 +1063,7 @@ pub fn create(spec: &WidgetSpec) -> Option<Box<dyn Widget>> {
     };
     let ic = |kind: &'static str, default: &str, action: Option<String>| -> Box<dyn Widget> { Box::new(Icon { kind, icon: icon(default), custom: spec.str("icon").is_some(), size: spec.n("size"), action }) };
     Some(match spec.kind.as_str() {
-        "logo" => Box::new(Logo { icon: icon("layout-grid") }),
+        "logo" => Box::new(Logo { icon: icon("layout-grid"), pack_icon: spec.s("pack_icon") }),
         "title" => Box::new(Title),
         "app-menu" | "menus" => Box::new(AppMenu),
         "window-buttons" => Box::new(WindowButtons),
@@ -906,7 +1081,6 @@ pub fn create(spec: &WidgetSpec) -> Option<Box<dyn Widget>> {
         "control-center" | "cc" => Box::new(Pill),
         "dock" => Box::new(crate::dockwidget::DockWidget::with_spec(spec)),
         "start" => Box::new(crate::taskwidgets::Start::new(spec)),
-        "tasks" => Box::new(crate::taskwidgets::Tasks::new(spec)),
         "search-box" => Box::new(crate::taskwidgets::SearchBox::new(spec)),
         "tray" => Box::new(crate::taskwidgets::Tray::new(spec)),
         "notifications" | "bell" => Box::new(Bell { size: spec.n("size").max(14.0), action: Some(action.clone().unwrap_or_else(|| "notifications".into())) }),
@@ -980,6 +1154,12 @@ const ICONS: &[(&str, &str)] = &[
     ("power", "Power"),
     ("monitor", "Monitor"),
     ("app-window", "Window"),
+    ("zap", "Bolt"),
+    ("rocket", "Rocket"),
+    ("heart", "Heart"),
+    ("sparkles", "Sparkles"),
+    ("flame", "Flame"),
+    ("circle", "Circle"),
 ];
 const CMD_ICONS: &[(&str, &str)] = &[
     ("none", "None"),
@@ -995,9 +1175,21 @@ const CMD_ICONS: &[(&str, &str)] = &[
     ("monitor", "Monitor"),
     ("app-window", "Window"),
 ];
-const INDICATORS: &[(&str, &str)] = &[("underline", "Underline"), ("dot", "Dot"), ("glass", "Glass button")];
-const DOCK_INDICATORS: &[(&str, &str)] = &[("dot", "Dot"), ("line", "Line"), ("glow", "Glow"), ("none", "None")];
-const START_STYLES: &[(&str, &str)] = &[("logo", "Logo"), ("orb", "Orb")];
+const DOCK_INDICATORS: &[(&str, &str)] = &[("dot", "Dot"), ("line", "Line"), ("underline", "Underline"), ("glow", "Glow"), ("none", "None")];
+const START_STYLES: &[(&str, &str)] = &[("icon", "Icon"), ("plate", "Rounded plate"), ("orb", "Glass orb"), ("breeze", "Flat highlight (Breeze)")];
+const START_DISPLAY: &[(&str, &str)] = &[("auto", "Icon (and the label, when set)"), ("icon", "Icon only"), ("icon_text", "Icon and text"), ("text", "Text only")];
+const START_MENUS: &[(&str, &str)] = &[("theme", "The theme's launcher"), ("plasma", "Plasma menu"), ("fluent", "Start menu (Fluent)"), ("aero", "Start menu (Aero)"), ("launchpad", "Launchpad"), ("search", "Search (Figlet)")];
+const START_ALIGN: &[(&str, &str)] = &[("button", "At the button"), ("center", "Centred on the button"), ("screen", "Centre of the screen")];
+const START_PRESETS: &[(&str, &str)] = &[("custom", "Custom"), ("plasma", "Plasma (KDE)"), ("plasma-text", "Plasma with text"), ("fluent", "Windows 11"), ("aero", "Windows 7 orb"), ("launchpad", "Launchpad (macOS)"), ("activities", "Activities (GNOME)")];
+const BACKDROPS: &[(&str, &str)] = &[("none", "Off"), ("tint", "Colour square"), ("glass", "Glass slab"), ("pill", "Tall pill"), ("button", "Flat button"), ("key", "Glass key")];
+/// (Dock marks start out dark; "auto" keeps that)
+const MARK_TONES: &[(&str, &str)] = &[("auto", "Default"), ("accent", "Accent"), ("ink", "Text colour"), ("white", "White"), ("black", "Black"), ("red", "Red"), ("orange", "Orange"), ("yellow", "Yellow"), ("green", "Green"), ("mint", "Mint"), ("blue", "Blue"), ("purple", "Purple"), ("pink", "Pink")];
+const HOVER_FX: &[(&str, &str)] = &[("glow", "Glow"), ("grow", "Grow"), ("none", "None")];
+
+/// The text option that holds the name of an icon of the icon pack in use (Settings gives it a picker).
+const fn pack_icon_opt() -> Opt {
+    text("pack_icon", "Pack icon", "")
+}
 
 const fn num(key: &'static str, label: &'static str, min: f32, max: f32, def: f32) -> Opt {
     Opt { key, label, kind: OptKind::Num(min, max, def) }
@@ -1025,15 +1217,54 @@ const COMMON: [Opt; 5] = [
 /// The options a widget kind understands, for the settings page.
 pub fn options(kind: &str) -> Vec<Opt> {
     let mut v = kind_options(kind);
-    if !matches!(kind, "spacer" | "divider" | "separator" | "dock" | "tasks" | "app-menu" | "menus" | "window-buttons") {
+    if !matches!(kind, "spacer" | "divider" | "separator" | "dock" | "app-menu" | "menus" | "window-buttons") {
         v.extend(COMMON);
     }
     v
 }
 
+/// The Dock is one widget: with a button width and names it is a row of taskbar buttons, without them a Dock.
+fn dock_options() -> Vec<Opt> {
+    vec![
+        num("icon_size", "Icon size", 14.0, 96.0, 64.0),
+        num("button_w", "Button width (0: icon only)", 0.0, 120.0, 0.0),
+        flag("labels", "Show names", false),
+        num("label_w", "Name width", 80.0, 260.0, 150.0),
+        num("gap", "Gap", 0.0, 30.0, 14.0),
+        num("pad", "Padding at the ends", 0.0, 30.0, 14.0),
+        flag("magnify", "Magnify on hover", true),
+        num("magnify_amount", "Magnification", 0.1, 1.4, 0.62),
+        num("magnify_range", "Magnify reach", 50.0, 240.0, 105.0),
+        pick("indicator", "Running mark", DOCK_INDICATORS, 0),
+        flag("tooltips", "Name tooltips", true),
+        // (a window preview over a Dock icon is a Windows habit: the taskbar has it on, the Dock does not)
+        flag("previews", "Window previews", false),
+        flag("running_only", "Only running apps", false),
+        flag("separators", "Divider before extras", true),
+        flag("bounce", "Bounce on click", true),
+        flag("badges", "Notification badges", true),
+        flag("rainbow", "Rainbow tint, a colour per icon", false),
+        num("rainbow_sat", "Rainbow saturation", 0.2, 1.0, 0.75),
+        pick("running_bg", "Highlight open apps", BACKDROPS, 0),
+        pick("running_color", "Highlight colour", TONES, 0),
+        num("running_opacity", "Highlight strength", 0.0, 0.9, 0.28),
+        num("focus_boost", "Extra for the focused app", 0.0, 0.5, 0.0),
+        pick("hover_bg", "Highlight under pointer", BACKDROPS, 0),
+        pick("hover_color", "Pointer highlight colour", TONES, 1),
+        num("hover_opacity", "Pointer highlight strength", 0.0, 0.9, 0.30),
+        num("lift", "Lift on hover", 0.0, 24.0, 0.0),
+        num("dim_idle", "Fade apps that are closed", 0.0, 0.8, 0.0),
+        pick("mark_color", "Running mark colour", MARK_TONES, 0),
+        num("mark_size", "Running mark size", 3.0, 10.0, 5.0),
+        flag("mark_per_window", "One mark per window", false),
+        flag("mark_focus_long", "Longer mark for the focused app", false),
+    ]
+}
+
 fn kind_options(kind: &str) -> Vec<Opt> {
     match kind {
-        "logo" => vec![pick("icon", "Icon", ICONS, 0)],
+        "dock" => dock_options(),
+        "logo" => vec![pick("icon", "Icon", ICONS, 0), pack_icon_opt()],
         "clock" => vec![text("format", "Format", "%a %e %b %l:%M %P"), text("format2", "Second line", ""), pick("action", "On click", ACTIONS, 0)],
         "battery" => vec![num("size", "Icon size", 12.0, 28.0, 19.0), pick("action", "On click", ACTIONS, 0)],
         "wifi" | "bluetooth" | "volume" | "notifications" | "bell" => vec![num("size", "Icon size", 12.0, 28.0, 17.0), pick("action", "On click", ACTIONS, 0)],
@@ -1051,35 +1282,85 @@ fn kind_options(kind: &str) -> Vec<Opt> {
             text("run", "Or run a command", ""),
         ],
         "spacer" => vec![num("width", "Width", 0.0, 240.0, 12.0)],
-        "dock" => vec![
-            num("icon_size", "Icon size", 28.0, 96.0, 64.0),
-            num("gap", "Gap", 0.0, 30.0, 14.0),
-            flag("magnify", "Magnify on hover", true),
-            num("magnify_amount", "Magnification", 0.1, 1.4, 0.62),
-            num("magnify_range", "Magnify reach", 50.0, 240.0, 105.0),
-            pick("indicator", "Running mark", DOCK_INDICATORS, 0),
-            flag("tooltips", "Name tooltips", true),
-            // (a window preview over a Dock icon is a Windows habit: the taskbar has it on, the Dock does not)
-            flag("previews", "Window previews", false),
-            flag("running_only", "Only running apps", false),
-            flag("separators", "Divider before extras", true),
-            flag("bounce", "Bounce on click", true),
+        "start" => vec![
+            pick("preset", "Preset", START_PRESETS, 0),
+            pick("style", "Style", START_STYLES, 0),
+            pick("display", "Show", START_DISPLAY, 0),
+            text("label", "Text label", ""),
+            num("size", "Button size", 24.0, 64.0, 40.0),
+            pick("glyph", "Icon", ICONS, 0),
+            pack_icon_opt(),
+            num("icon_size", "Icon size", 12.0, 48.0, 22.0),
+            flag("themed", "Pack icon in the theme's look", false),
+            pick("color", "Icon colour", TONES, 0),
+            pick("plate_color", "Plate colour", TONES, 9),
+            flag("shine", "Gloss on the orb", true),
+            pick("hover", "On hover", HOVER_FX, 0),
+            flag("stay_lit", "Lit while the menu is open", true),
+            pick("menu", "Opens", START_MENUS, 0),
+            pick("menu_align", "Menu position", START_ALIGN, 0),
+            flag("grid", "Favorites as a grid (Plasma menu)", false),
         ],
-        "start" => vec![pick("style", "Style", START_STYLES, 0), num("size", "Size", 24.0, 64.0, 40.0)],
         "search-box" => vec![text("text", "Placeholder", "Search"), num("width", "Width", 80.0, 420.0, 190.0)],
-        "tasks" => vec![
-            num("icon_size", "Icon size", 14.0, 52.0, 26.0),
-            num("button_w", "Button width", 24.0, 120.0, 44.0),
-            flag("labels", "Show names", false),
-            flag("previews", "Window previews", true),
-            num("label_w", "Name width", 80.0, 260.0, 150.0),
-            pick("indicator", "Running mark", INDICATORS, 0),
-            num("gap", "Gap", 0.0, 16.0, 4.0),
-        ],
         "tray" => vec![flag("chevron", "More arrow", true), flag("wifi", "Wi-Fi", true), flag("volume", "Volume", true), flag("battery", "Battery", true), flag("bluetooth", "Bluetooth", false), num("size", "Icon size", 12.0, 24.0, 15.0), pick("action", "On click", ACTIONS, 6)],
         "show-desktop" => vec![num("width", "Width", 4.0, 40.0, 14.0)],
         _ => Vec::new(),
     }
+}
+
+/// Set a start button up like one of the well-known launchers: every look option of the button is replaced (what the
+/// button does on click and its extra actions stay).
+pub fn apply_start_preset(spec: &mut WidgetSpec, name: &str) {
+    if spec.kind != "start" || name == "custom" {
+        return;
+    }
+    for o in kind_options("start") {
+        if o.key != "preset" {
+            spec.opts.remove(o.key);
+        }
+    }
+    let s = |spec: &mut WidgetSpec, k: &str, v: &str| spec.set_str(k, v);
+    match name {
+        "plasma" | "plasma-text" => {
+            // (the Plasma icon of the icon pack, when it has one)
+            s(spec, "style", "breeze");
+            s(spec, "pack_icon", "start-here-kde-plasma");
+            spec.set_num("size", 36.0);
+            spec.set_num("icon_size", 24.0);
+            s(spec, "menu", "plasma");
+            s(spec, "menu_align", "button");
+            if name == "plasma-text" {
+                s(spec, "display", "icon_text");
+                s(spec, "label", "Applications");
+            } else {
+                s(spec, "display", "icon");
+            }
+        }
+        "fluent" => {
+            s(spec, "style", "icon");
+            s(spec, "menu", "fluent");
+            s(spec, "menu_align", "center");
+        }
+        "aero" => {
+            s(spec, "style", "orb");
+            s(spec, "color", "white");
+            spec.set_num("size", 40.0);
+            s(spec, "menu", "aero");
+            s(spec, "menu_align", "button");
+        }
+        "launchpad" => {
+            s(spec, "style", "icon");
+            s(spec, "menu", "launchpad");
+        }
+        "activities" => {
+            s(spec, "style", "breeze");
+            s(spec, "display", "text");
+            s(spec, "label", "Activities");
+            s(spec, "menu", "launchpad");
+        }
+        _ => {}
+    }
+    s(spec, "preset", name);
 }
 
 /// Typed reads with the default taken from the widget's option schema (`options`), so a default lives in one place.
@@ -1310,6 +1591,50 @@ impl Bar {
         }
     }
 
+    /// The squeeze, fade and drop of an auto-hiding bar, applied to what it drew (screen coordinates).
+    fn hide_effect(&self, c: &BarCtx, f: &Frame, out: &mut Drawn) {
+        let k = self.reveal.x;
+        if self.cfg.autohide == AutoHide::Off || k >= 0.999 || self.cfg.hide_anim == HideAnim::Slide {
+            return;
+        }
+        let k = k.clamp(0.0, 1.0);
+        let anim = self.cfg.hide_anim;
+        // the bar's middle on the edge it hides into, in screen coordinates
+        let mid = self.rect_to_screen(c.screen[0], f.rect);
+        let top = self.vedge() == Edge::Top;
+        let anchor = match self.cfg.edge {
+            Edge::Left => [0.0, mid[1] + mid[3] / 2.0],
+            Edge::Right => [c.screen[0], mid[1] + mid[3] / 2.0],
+            _ => [mid[0] + mid[2] / 2.0, if top { 0.0 } else { c.screen[1] }],
+        };
+        // Drop: down by up to the bar's height
+        let drop = if anim == HideAnim::Drop { (1.0 - k) * mid[3].max(mid[2]).min(80.0) } else { 0.0 };
+        let s = if anim == HideAnim::Squeeze { k } else { 1.0 };
+        let fade = if anim == HideAnim::Squeeze { k.sqrt() } else { k };
+        let at = |v: [f32; 2]| [anchor[0] + (v[0] - anchor[0]) * s, anchor[1] + (v[1] - anchor[1]) * s + drop];
+        for p in &mut out.panels {
+            let q = at([p.rect[0], p.rect[1]]);
+            p.rect = [q[0], q[1], p.rect[2] * s, p.rect[3] * s];
+            p.params[0] *= s;
+            if p.clip[2] > 0.0 {
+                let q = at([p.clip[0], p.clip[1]]);
+                p.clip = [q[0], q[1], p.clip[2] * s, p.clip[3] * s];
+            }
+            p.fade_by(fade);
+        }
+        for l in &mut out.labels {
+            let q = at([l.x, l.y]);
+            l.x = q[0];
+            l.y = q[1];
+            l.size *= s;
+            l.opacity *= fade;
+            if let Some(cl) = &mut l.clip {
+                let q = at([cl[0], cl[1]]);
+                *cl = [q[0], q[1], cl[2] * s, cl[3] * s];
+            }
+        }
+    }
+
     /// The context with this bar's ink and backdrop tint filled in (in the layout's space).
     fn ctx<'a>(&self, c: &BarCtx<'a>) -> BarCtx<'a> {
         let c = &self.vctx(c);
@@ -1341,15 +1666,22 @@ impl Bar {
 
     /// The layout as it is now, with every widget still on its way to its place shown part-way.
     fn frame(&self, c: &BarCtx) -> Frame {
+        self.frame_for(c, false)
+    }
+
+    /// `visual`: the frame as it is drawn. The other animations than the slide leave the bar where it is while they play, but
+    /// once it is mostly gone it is moved off the screen for hit tests, so an invisible bar catches no clicks.
+    fn frame_for(&self, c: &BarCtx, visual: bool) -> Frame {
         let mut f = self.frame_raw(c);
         for p in &mut f.placed {
             p.x += self.shift.get(p.widget).copied().unwrap_or(0.0);
         }
         // an auto-hiding bar slides out past its screen edge
-        if self.cfg.autohide != AutoHide::Off && self.reveal.x < 0.999 {
+        let slides = self.cfg.hide_anim == HideAnim::Slide || (!visual && self.reveal.x < 0.3);
+        if self.cfg.autohide != AutoHide::Off && self.reveal.x < 0.999 && slides {
             let up = self.widgets.iter().map(|(_, w)| w.overflow(c)).fold(0.0, f32::max);
             let dist = f.rect[3] + self.cfg.margin.max(self.cfg.inset) + up + 8.0;
-            let dy = (1.0 - self.reveal.x) * dist;
+            let dy = if self.cfg.hide_anim == HideAnim::Slide { (1.0 - self.reveal.x) * dist } else { dist };
             f.rect[1] += if self.vedge() == Edge::Top { -dy } else { dy };
         }
         f
@@ -1550,7 +1882,7 @@ impl Bar {
                 self.reveal.target = 0.0;
             }
         }
-        c.theme.animations.step("dock", &mut self.reveal, dt);
+        c.theme.animations.step("dock", &mut self.reveal, dt * self.cfg.hide_speed.clamp(0.2, 4.0));
     }
 
     pub fn hit(&self, c: &BarCtx, p: [f32; 2]) -> Option<BarHit> {
@@ -1589,7 +1921,7 @@ impl Bar {
     /// Backdrop and every widget.
     pub fn draw(&self, c: &BarCtx) -> (Vec<Panel>, Vec<Label>) {
         let c = self.ctx(c);
-        let f = self.frame(&c);
+        let f = self.frame_for(&c, true);
         let mut out = Drawn::default();
         match self.cfg.shape {
             BarShape::Strip if self.cfg.surface == BarSurface::Glass => {
@@ -1612,6 +1944,7 @@ impl Bar {
             self.widgets[pl.widget].1.draw(&c, r, lit, &mut out);
         }
         self.out_to_screen(&c, &f, &mut out);
+        self.hide_effect(&c, &f, &mut out);
         (out.panels, out.labels)
     }
 }
@@ -1746,6 +2079,26 @@ mod tests {
     }
 
     #[test]
+    fn a_start_preset_replaces_the_look_and_keeps_the_action() {
+        let mut spec = WidgetSpec::new("start");
+        spec.set_str("action", "launcher");
+        spec.set_str("style", "orb");
+        spec.set_num("size", 60.0);
+        apply_start_preset(&mut spec, "plasma-text");
+        assert_eq!(spec.s("style"), "breeze");
+        assert_eq!(spec.s("menu"), "plasma");
+        assert_eq!(spec.s("label"), "Applications");
+        assert_eq!(spec.n("size"), 36.0);
+        assert_eq!(spec.s("action"), "launcher");
+        // a preset forgets what the one before it set
+        apply_start_preset(&mut spec, "fluent");
+        assert_eq!(spec.s("label"), "");
+        assert_eq!(spec.s("menu_align"), "center");
+        apply_start_preset(&mut spec, "custom");
+        assert_eq!(spec.s("menu_align"), "center");
+    }
+
+    #[test]
     fn option_schema_is_consistent() {
         for (kind, _) in CATALOG {
             let spec = WidgetSpec::new(kind);
@@ -1768,7 +2121,7 @@ mod tests {
 
     #[test]
     fn options_survive_a_toml_round_trip() {
-        let mut spec = WidgetSpec::new("tasks");
+        let mut spec = WidgetSpec::taskbar();
         spec.set_num("icon_size", 31.0);
         spec.set_bool("labels", true);
         spec.set_str("indicator", "dot");

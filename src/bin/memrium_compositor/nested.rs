@@ -73,9 +73,35 @@ pub fn apply_test_hooks(state: &mut State, args: &mut Args, socket: &str) {
     if std::env::var_os("MEMRIUM_TEST_WIDGETS").is_some() {
         state.toggle_widgets();
     }
+    // test hook: desktop widgets of these kinds, `MEMRIUM_TEST_DESKWIDGET=visualizer,clock`
+    if let Ok(kinds) = std::env::var("MEMRIUM_TEST_DESKWIDGET") {
+        for k in kinds.split(if kinds.contains('|') { '|' } else { ',' }) {
+            // `kind@x,y` puts it there (then the widgets are told apart by `|`)
+            match k.split_once('@').and_then(|(kind, at)| at.split_once(',').map(|(x, y)| (kind, x.parse::<f32>().unwrap_or(0.0), y.parse::<f32>().unwrap_or(0.0)))) {
+                Some((kind, x, y)) => {
+                    state.config.desk_widgets.push(memrium_de::deskwidgets::DeskWidget { kind: kind.to_string(), x, y, ..Default::default() });
+                }
+                None => state.desk_add_widget(k),
+            }
+        }
+    }
     if std::env::var_os("MEMRIUM_TEST_DARK").is_some() {
         state.mouse = [state.size[0] * 0.8, state.size[1] * 0.9];
         state.bar_action("dark-mode");
+    }
+    // test hook: a hardware key, `MEMRIUM_TEST_MEDIAKEY=volume_up|volume_down|mute|bright_up|bright_down|play|next|prev`
+    if let Ok(k) = std::env::var("MEMRIUM_TEST_MEDIAKEY") {
+        let raw = match k.as_str() {
+            "volume_up" => 0x1008FF13,
+            "volume_down" => 0x1008FF11,
+            "mute" => 0x1008FF12,
+            "bright_up" => 0x1008FF02,
+            "bright_down" => 0x1008FF03,
+            "play" => 0x1008FF14,
+            "next" => 0x1008FF17,
+            _ => 0x1008FF16,
+        };
+        state.media_key(raw);
     }
     if let Ok(k) = std::env::var("MEMRIUM_TEST_FLYOUT") {
         let kind = if k == "brightness" { crate::flyout::FlyKind::Brightness } else { crate::flyout::FlyKind::Volume };
@@ -118,7 +144,7 @@ pub fn apply_test_hooks(state: &mut State, args: &mut Args, socket: &str) {
         Ok("window") => state.shot_req = Some(crate::state::ShotReq::Window),
         Ok("region") => {
             state.mouse = [900.0, 520.0];
-            state.shot_sel = Some(crate::state::ShotSel { start: Some([300.0, 200.0]) });
+            state.shot_sel = Some(crate::state::ShotSel { start: Some([300.0, 200.0]), record: false });
         }
         _ => {}
     }
@@ -135,6 +161,9 @@ pub fn apply_test_hooks(state: &mut State, args: &mut Args, socket: &str) {
     }
     if args.edit {
         state.scene.set_edit(true);
+        if let Some(t) = std::env::var("MEMRIUM_TEST_GALLERY_TAB").ok().and_then(|v| v.parse().ok()) {
+            state.scene.set_gallery_tab(t);
+        }
     }
     if let Some(cmd) = args.exec.take() {
         let spawned = std::process::Command::new("sh").arg("-c").arg(&cmd).env("WAYLAND_DISPLAY", &socket).env("XDG_SESSION_TYPE", "wayland").spawn();
@@ -216,7 +245,8 @@ impl ApplicationHandler for App {
         state.socket = socket.clone();
         state.default_wallpaper = Some(std::path::PathBuf::from(crate::wallpaper_path(&self.args)));
         if let Some(id) = &self.args.live {
-            state.theme.wallpaper = memrium_de::theme::WallpaperSpec { kind: memrium_de::theme::WallKind::Live, path: id.clone() };
+            let kind = if memrium_de::video::is_video(std::path::Path::new(id)) { memrium_de::theme::WallKind::Video } else { memrium_de::theme::WallKind::Live };
+        state.theme.wallpaper = memrium_de::theme::WallpaperSpec { kind, path: id.clone() };
         }
         state.init_wallpaper();
         apply_test_hooks(&mut state, &mut self.args, &socket);
@@ -224,6 +254,7 @@ impl ApplicationHandler for App {
         state.allow_skip = true;
         let calloop = calloop::EventLoop::try_new().expect("event loop");
         state.init_dmabuf();
+        state.init_syncobj(adapter.get_info().vendor);
         state.init_screencopy();
         state.start_notifications();
         state.tray.start();

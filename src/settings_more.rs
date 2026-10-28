@@ -170,6 +170,33 @@ pub(super) fn page_power(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw:
         }
         cy = top + 104.0 + 26.0;
     }
+    // the graphics cards of a hybrid laptop, and which one programs start on
+    let gpus = crate::gpu::detect();
+    if crate::gpu::hybrid(&gpus) {
+        let top = card(ui, x, cy, cw, "GRAPHICS", 62.0 + 46.0 + 30.0 + gpus.len() as f32 * 22.0);
+        let mut ty = top + 30.0;
+        for g in &gpus {
+            let state = match g.power.as_deref() {
+                Some("suspended") => "powered down",
+                Some("active") => "active",
+                _ => "",
+            };
+            let role = if g.integrated { "integrated" } else { "dedicated" };
+            ui.text_raw(x + 20.0, ty, &format!("{}  ({role}{}{state})", g.name, if state.is_empty() { "" } else { ", " }), 13.0, false, ui.ink, 0.85, Align::Left);
+            ty += 22.0;
+        }
+        let mode = crate::gpu::load_mode();
+        let mut sel = crate::gpu::Mode::ALL.iter().position(|m| *m == mode).unwrap_or(0);
+        let names: Vec<&str> = crate::gpu::Mode::ALL.iter().map(|m| m.label()).collect();
+        let mut f = Form::new(x + 16.0, ty + 24.0, cw - 32.0, 46.0);
+        ui.row(f.x, f.y, "Programs run on");
+        let w = (f.cw - 170.0).min(110.0 * names.len() as f32);
+        if ui.segmented([f.x + f.cw - w, f.y - 15.0, w, 30.0], &names, &mut sel) {
+            crate::gpu::save_mode(crate::gpu::Mode::ALL[sel]);
+        }
+        ui.text(x + 16.0, f.y + 28.0, crate::gpu::Mode::ALL[sel].describe(), 11.5, false, ui.ink, 0.55, Align::Left);
+        cy = top + 62.0 + 46.0 + 30.0 + gpus.len() as f32 * 22.0 + 26.0;
+    }
     // when the computer is not used
     let top = card(ui, x, cy, cw, "WHEN THE COMPUTER IS NOT USED", 196.0);
     let mut f = Form::new(x + 16.0, top + 34.0, cw - 32.0, 42.0);
@@ -202,7 +229,7 @@ pub(super) fn page_programs(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, 
 
     // one card per rule: opacity, frost, a light or dark look, a font
     const ROW: f32 = 42.0;
-    const RULE_H: f32 = 62.0 + 4.0 * ROW;
+    const RULE_H: f32 = 62.0 + 6.0 * ROW;
     let before: Vec<crate::apprules::Rule> = rules.rules().to_vec();
     let n = before.len();
     let top = card(ui, x, top + 150.0 + 26.0, cw, "RULES FOR ONE PROGRAM", 30.0 + 52.0 + n as f32 * RULE_H + 60.0 + 20.0 + PICK_ROWS as f32 * 34.0);
@@ -222,6 +249,8 @@ pub(super) fn page_programs(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, 
         r.opacity = if op >= 0.999 { None } else { Some((op * 100.0).round() / 100.0) };
         f.pick(ui, "Frost behind it", &mut r.frost, &[(None, "Auto"), (Some(true), "On"), (Some(false), "Off")]);
         f.pick(ui, "Look", &mut r.dark, &[(None, "Auto"), (Some(false), "Light"), (Some(true), "Dark")]);
+        f.pick(ui, "Window system", &mut r.x11, &[(None, "Auto"), (Some(true), "X11"), (Some(false), "Wayland")]);
+        f.pick(ui, "Graphics card", &mut r.gpu, &[(None, "Auto"), (Some(true), "Dedicated"), (Some(false), "Integrated")]);
         let mut font = r.font.clone().unwrap_or_default();
         if f.text(ui, "Font", &format!("rule-font-{i}"), &mut font, Some("Enter to apply")) {
             r.font = if font.trim().is_empty() { None } else { Some(font.trim().to_string()) };

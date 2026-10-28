@@ -63,6 +63,7 @@ pub enum Cmd {
 pub struct SysWatcher {
     shared: Arc<Mutex<SysInfo>>,
     tx: Sender<Cmd>,
+    watching: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SysWatcher {
@@ -70,8 +71,19 @@ impl SysWatcher {
         let shared = Arc::new(Mutex::new(SysInfo::default()));
         let (tx, rx) = channel();
         let s2 = shared.clone();
-        std::thread::Builder::new().name("sysctl".into()).spawn(move || worker(s2, rx)).ok();
-        SysWatcher { shared, tx }
+        let watching = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let w2 = watching.clone();
+        std::thread::Builder::new().name("sysctl".into()).spawn(move || worker(s2, rx, w2)).ok();
+        SysWatcher { shared, tx, watching }
+    }
+
+    /// A panel that shows the machine's state is open (Quick Settings, a flyout, Settings): it is looked at more often.
+    /// Opening one looks at once.
+    pub fn set_watching(&self, on: bool) {
+        let was = self.watching.swap(on, std::sync::atomic::Ordering::Relaxed);
+        if on && !was {
+            let _ = self.tx.send(Cmd::Refresh);
+        }
     }
 
     pub fn info(&self) -> SysInfo {
@@ -83,12 +95,16 @@ impl SysWatcher {
     }
 }
 
-/// How often the slow (process-spawning) readings are refreshed when nothing asked for them sooner. Sysfs readings
-/// are free and follow every wake-up.
+/// How often the slow (process-spawning) readings are refreshed when nothing asked for them sooner, while a panel that
+/// shows them is open, and while none is (the bar's icons then follow a little later: each look starts several programs,
+/// which costs battery). Sysfs readings are free and follow every wake-up.
 const SLOW: Duration = Duration::from_secs(8);
+const SLOW_UNWATCHED: Duration = Duration::from_secs(30);
 
-fn worker(shared: Arc<Mutex<SysInfo>>, rx: Receiver<Cmd>) {
+fn worker(shared: Arc<Mutex<SysInfo>>, rx: Receiver<Cmd>, watching: Arc<std::sync::atomic::AtomicBool>) {
     let mut last_slow = std::time::Instant::now() - SLOW;
+    // the profiles the machine offers do not change: asked for once
+    let mut profiles: Option<Vec<String>> = None;
     // the first look happens at once, so the panels never show "not available" for a few seconds at start-up
     let mut first = true;
     loop {
@@ -125,14 +141,25 @@ fn worker(shared: Arc<Mutex<SysInfo>>, rx: Receiver<Cmd>) {
         info.battery = read_battery();
         info.health = read_health();
         info.brightness = read_brightness();
-        if force || last_slow.elapsed() >= SLOW {
+        let slow = if watching.load(std::sync::atomic::Ordering::Relaxed) { SLOW } else { SLOW_UNWATCHED };
+        if force || last_slow.elapsed() >= slow {
             last_slow = std::time::Instant::now();
             if let Some((v, m)) = run_out("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]).and_then(|o| parse_volume(&o)) {
                 info.volume = Some(v);
                 info.muted = m;
             }
             info.profile = run_out("powerprofilesctl", &["get"]).map(|o| o.trim().to_string()).filter(|p| !p.is_empty());
-            info.profiles = if info.profile.is_some() { run_out("powerprofilesctl", &["list"]).map(|o| parse_profiles(&o)).unwrap_or_default() } else { Vec::new() };
+            info.profiles = match (&info.profile, &profiles) {
+                (None, _) => Vec::new(),
+                (Some(_), Some(p)) => p.clone(),
+                (Some(_), None) => {
+                    let p = run_out("powerprofilesctl", &["list"]).map(|o| parse_profiles(&o)).unwrap_or_default();
+                    if !p.is_empty() {
+                        profiles = Some(p.clone());
+                    }
+                    p
+                }
+            };
             info.wifi = read_wifi();
             info.bluetooth = read_bluetooth();
         }
@@ -218,7 +245,9 @@ fn read_wifi() -> Option<Wifi> {
         return None;
     }
     let enabled = run_out("nmcli", &["radio", "wifi"])?.trim() == "enabled";
-    let ssid = if enabled { run_out("nmcli", &["-t", "-f", "ACTIVE,SSID", "device", "wifi"]).and_then(|o| parse_active_ssid(&o)) } else { None };
+    // (`--rescan no`: listing the networks otherwise makes the card scan the air when its last scan is half a minute old,
+    // which costs power every time we look)
+    let ssid = if enabled { run_out("nmcli", &["-t", "-f", "ACTIVE,SSID", "device", "wifi", "list", "--rescan", "no"]).and_then(|o| parse_active_ssid(&o)) } else { None };
     Some(Wifi { enabled, ssid })
 }
 

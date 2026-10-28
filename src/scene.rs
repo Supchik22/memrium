@@ -180,6 +180,8 @@ pub struct DockItem {
     pub windows: Vec<DockWin>,
     /// the app is kept in the Dock (pinned), not there only because it runs
     pub pinned: bool,
+    /// unread notifications of the app (a red badge on the icon when above 0)
+    pub badge: u32,
 }
 
 /// One window of a Dock item.
@@ -216,7 +218,7 @@ fn default_dock() -> Vec<DockItem> {
         .iter()
         .zip(names)
         .enumerate()
-        .map(|(i, (&(id, top, bot), name))| DockItem { key: format!("demo{i}"), name: name.into(), icon: DockIcon::Procedural(id, top, bot), running: i == 0, separator_before: false, windows: Vec::new(), pinned: true })
+        .map(|(i, (&(id, top, bot), name))| DockItem { key: format!("demo{i}"), name: name.into(), icon: DockIcon::Procedural(id, top, bot), running: i == 0, separator_before: false, windows: Vec::new(), pinned: true, badge: 0 })
         .collect()
 }
 
@@ -559,6 +561,13 @@ impl Scene {
     pub fn set_edit(&mut self, on: bool) {
         if let Some(c) = &mut self.cc {
             c.set_edit(on);
+        }
+    }
+
+    /// Switch the gallery of the edit mode to its tab (0 controls, 1 desktop widgets).
+    pub fn set_gallery_tab(&mut self, tab: usize) {
+        if let Some(c) = &mut self.cc {
+            c.gallery_tab = tab.min(1);
         }
     }
 

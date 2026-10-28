@@ -54,7 +54,7 @@ impl AppMenuService {
 
     /// Offer the service on the session bus (programs then see that a menu bar is there).
     pub fn start(&mut self) {
-        let built = Builder::session().and_then(|b| b.name(BUS)).and_then(|b| b.serve_at(PATH, Service { menus: self.menus.clone() })).and_then(|b| b.build());
+        let built = Builder::session().map(|b| b.allow_name_replacements(false).replace_existing_names(false)).and_then(|b| b.name(BUS)).and_then(|b| b.serve_at(PATH, Service { menus: self.menus.clone() })).and_then(|b| b.build());
         match built {
             Ok(conn) => {
                 eprintln!("appmenu: serving {BUS}");

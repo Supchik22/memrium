@@ -11,7 +11,7 @@
 //! palette whole, and draws buttons, fields, switches, sliders, scrollbars and menus the shape the controls of the theme
 //! have. The colours match the Qt style's, so the three toolkits agree.
 
-use crate::theme::{config_dir, ControlLook, Theme};
+use crate::theme::{config_dir, ControlLook, DecoKind, Theme};
 use std::path::Path;
 
 type Rgb = [f32; 3];
@@ -173,13 +173,105 @@ notebook > header > tabs > tab:checked {{ background-color: {f}; }}
 
 /* header bars and the windows a program draws itself */
 headerbar, .titlebar {{ background-color: @headerbar_bg_color; background-image: none; box-shadow: inset 0 -1px alpha(@window_fg_color, 0.08); border: none; }}
+{controls}
 window.csd, decoration {{ border-radius: {win_r:.0}px; }}
 window.csd.maximized, window.csd.fullscreen, window.csd.tiled {{ border-radius: 0; }}
 "#,
+        controls = window_controls(theme.window.decoration),
         ah = hex(mix(accent, white, 0.12)),
         pop_r = (win_r * 0.6).clamp(6.0, 14.0).round()
     );
     out
+}
+
+/// The window buttons of a program's own header bar (libadwaita's `windowcontrols`, GTK 3's `titlebutton`) drawn the way
+/// the theme's windows draw theirs; `layout` below puts them on the matching side.
+fn window_controls(kind: DecoKind) -> String {
+    let both = |rule: &str| format!("windowcontrols button{rule}, headerbar button.titlebutton{rule}");
+    match kind {
+        DecoKind::Mac => format!(
+            "/* traffic lights: three round colour dots, glyphs only while the pointer is over them */\n{} {{ min-width: 13px; min-height: 13px; padding: 0; margin: 0 4px; border-radius: 999px; border: none; box-shadow: inset 0 0 0 1px alpha(black, 0.12); background-image: none; color: transparent; -gtk-icon-size: 8px; }}\n{} {{ background-color: #ff5f57; }}\n{} {{ background-color: #febc2e; }}\n{} {{ background-color: #28c840; }}\nwindowcontrols:hover button, headerbar:hover button.titlebutton {{ color: alpha(black, 0.55); }}\nwindowcontrols:backdrop button, headerbar:backdrop button.titlebutton {{ background-color: alpha(@window_fg_color, 0.18); }}\nwindowcontrols button image, headerbar button.titlebutton image {{ margin: 0; padding: 0; }}\nwindowcontrols, headerbar windowcontrols {{ margin: 0 6px; }}\nheaderbar, .titlebar {{ box-shadow: none; }}",
+            both(""), both(".close"), both(".minimize"), both(".maximize")
+        ),
+        DecoKind::Win11 => format!(
+            "/* Fluent: flat 46 px keys, the close key goes red */\n{} {{ min-width: 46px; min-height: 32px; padding: 0; margin: 0; border-radius: 0; background-image: none; background-color: transparent; box-shadow: none; }}\n{} {{ background-color: alpha(@window_fg_color, 0.08); }}\n{} {{ background-color: #c42b1c; color: white; }}",
+            both(""), both(":hover"), both(".close:hover")
+        ),
+        _ => String::new(),
+    }
+}
+
+/// `gtk-decoration-layout` for a theme: where a program's own header bar puts its buttons.
+fn layout(kind: DecoKind) -> Option<&'static str> {
+    match kind {
+        DecoKind::Mac => Some("close,minimize,maximize:"),
+        DecoKind::Win11 | DecoKind::Aero => Some(":minimize,maximize,close"),
+        DecoKind::Gnome => Some("appmenu:minimize,maximize,close"),
+        _ => None,
+    }
+}
+
+const LAYOUT_MARK: &str = "# memrium";
+
+/// Put the theme's button layout in GTK 3 and 4's `settings.ini`. A layout the user wrote themselves (no mark) stays.
+fn write_layout(kind: DecoKind) {
+    let Some(value) = layout(kind) else {
+        remove_layout();
+        return;
+    };
+    let home = crate::gtk::config_home();
+    for v in ["gtk-3.0", "gtk-4.0"] {
+        let file = home.join(v).join("settings.ini");
+        let old = std::fs::read_to_string(&file).unwrap_or_default();
+        let ours = format!("gtk-decoration-layout={value} {LAYOUT_MARK}");
+        let mut lines: Vec<String> = Vec::new();
+        let (mut done, mut foreign, mut in_settings) = (false, false, false);
+        for l in old.lines() {
+            let t = l.trim();
+            if t.starts_with('[') {
+                if in_settings && !done && !foreign {
+                    lines.push(ours.clone());
+                    done = true;
+                }
+                in_settings = t == "[Settings]";
+            }
+            if in_settings && t.starts_with("gtk-decoration-layout") {
+                if t.ends_with(LAYOUT_MARK) {
+                    lines.push(ours.clone());
+                    done = true;
+                    continue;
+                }
+                foreign = true;
+            }
+            lines.push(l.to_string());
+        }
+        if !done && !foreign {
+            if !in_settings {
+                lines.push("[Settings]".into());
+            }
+            lines.push(ours);
+        }
+        let text = lines.join("\n") + "\n";
+        if text != old {
+            if let Some(parent) = file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&file, text);
+        }
+    }
+}
+
+/// Take our layout line out of `settings.ini` again.
+fn remove_layout() {
+    let home = crate::gtk::config_home();
+    for v in ["gtk-3.0", "gtk-4.0"] {
+        let file = home.join(v).join("settings.ini");
+        let Ok(old) = std::fs::read_to_string(&file) else { continue };
+        if old.contains(LAYOUT_MARK) {
+            let kept: Vec<&str> = old.lines().filter(|l| !l.trim_end().ends_with(LAYOUT_MARK)).collect();
+            let _ = std::fs::write(&file, kept.join("\n") + "\n");
+        }
+    }
 }
 
 /// Write the stylesheet (only when it changed) and make sure GTK 3 and 4 import it.
@@ -188,6 +280,7 @@ pub fn export(theme: &Theme) {
         restore();
         return;
     }
+    write_layout(theme.window.decoration);
     let text = css(theme);
     let dir = config_dir();
     let path = dir.join("gtk-memrium.css");
@@ -206,6 +299,8 @@ pub fn export(theme: &Theme) {
 
 /// Take the import out of GTK 3 and 4's `gtk.css` (what they had before, without it).
 pub fn restore() {
+    remove_layout();
+    crate::cursor_theme::restore_gtk();
     let home = crate::gtk::config_home();
     for v in ["gtk-3.0", "gtk-4.0"] {
         let file = home.join(v).join("gtk.css");
@@ -258,6 +353,26 @@ mod tests {
         import_line(&f);
         import_line(&f);
         assert_eq!(std::fs::read_to_string(&f).unwrap(), format!("@import 'colors.css';\n{IMPORT}\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_button_layout_is_ours_to_remove_and_the_users_to_keep() {
+        let dir = std::env::temp_dir().join(format!("memrium-gtkcss-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let file = dir.join("gtk-4.0/settings.ini");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "[Settings]\ngtk-application-prefer-dark-theme=1\n").unwrap();
+        write_layout(DecoKind::Mac);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("gtk-decoration-layout=close,minimize,maximize: # memrium"), "{text}");
+        write_layout(DecoKind::Win11);
+        assert!(std::fs::read_to_string(&file).unwrap().contains(":minimize,maximize,close # memrium"));
+        remove_layout();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "[Settings]\ngtk-application-prefer-dark-theme=1\n");
+        std::fs::write(&file, "[Settings]\ngtk-decoration-layout=menu:close\n").unwrap();
+        write_layout(DecoKind::Mac);
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("memrium"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

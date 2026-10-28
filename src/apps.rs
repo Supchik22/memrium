@@ -173,13 +173,14 @@ pub fn scan() -> Vec<AppEntry> {
 
 /// The programs of the desktop that ship beside it and have no desktop file: (executable, id, name, kind of program,
 /// icon, search words, categories). Each is listed when its executable is there.
-const OWN: [(&str, &str, &str, &str, &str, &str, &[&str]); 7] = [
+const OWN: [(&str, &str, &str, &str, &str, &str, &[&str]); 8] = [
     ("memrium_calc", "memrium-calc", "Memrium Calculator", "Calculator", "accessories-calculator", "calc math sum arithmetic numbers", &["Utility", "Calculator"]),
     ("memrium_player", "memrium-player", "Memrium Player", "Media Player", "multimedia-video-player", "video audio music movie mpv film", &["AudioVideo", "Player"]),
     ("memrium_snake", "memrium-snake", "Memrium Snake", "Game", "applications-games", "snake game arcade retro nokia", &["Game", "ArcadeGame"]),
     ("memrium_archive", "memrium-archive", "Memrium Archive", "Archive Manager", "utilities-file-archiver", "zip tar gz unzip extract compress pack archive 7z rar xz zstd bz2", &["Utility", "Archiving", "Compression"]),
     ("memrium_convert", "memrium-convert", "Memrium Converter", "Image Converter", "applications-graphics", "convert picture image jpg jpeg png webp bmp gif tiff ico resize quality format", &["Graphics", "Utility"]),
     ("memrium_monitor", "memrium-monitor", "Memrium Monitor", "System Monitor", "utilities-system-monitor", "processes tasks cpu memory ram kill task manager top htop resources network", &["System", "Monitor"]),
+    ("memrium_icons", "memrium-icons", "Memrium Icons", "Icon Composer", "preferences-desktop-icons", "icon icons composer glass vector draw svg shapes editor inkscape design theme", &["Graphics", "Utility"]),
     ("memrium_view", "memrium-view", "Memrium Pictures", "Image Viewer", "image-viewer", "photo image picture gallery view png jpeg", &["Graphics", "Viewer"]),
 ];
 
@@ -287,13 +288,21 @@ pub fn launch_in(app: &AppEntry, socket: &str, dir: Option<&Path>) -> std::io::R
     // the program's own rule (app-rules.toml): a dark look, an accent, a font, the flag its engine takes
     let rules = crate::apprules::Rules::load();
     let exe = line.split_whitespace().next().and_then(|c| Path::new(c).file_name()).map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-    let (line, rule_env) = match rules.find(&[app.id.as_str(), app.wm_class.as_str(), exe.as_str()]) {
-        Some(rule) => with_launch(&line, rule.launch(&line)),
-        None => (line, Vec::new()),
-    };
+    let rule = rules.find(&[app.id.as_str(), app.wm_class.as_str(), exe.as_str()]);
+    let mut launch = rule.map(|r| r.launch(&line)).unwrap_or_default();
+    // the graphics card: the preset in Settings > Power & Battery, and the program's own rule
+    launch.env.extend(crate::gpu::launch_env(rule.and_then(|r| r.gpu)));
+    // one pointer for every program (a Flatpak does not inherit the environment: `with_launch` turns these into `--env=`)
+    launch.env.extend(crate::cursor_theme::env(&crate::theme::Config::load().input.cursor));
+    // the window system: GTK 3 programs cannot draw for a fractional scale on Wayland (soft), on X11 they can
+    if rule.and_then(|r| r.x11).unwrap_or_else(|| crate::apprules::gtk3_program(&[app.id.as_str(), app.wm_class.as_str(), exe.as_str()])) {
+        launch.env.push(("GDK_BACKEND".into(), "x11".into()));
+        launch.env.push(("QT_QPA_PLATFORM".into(), "xcb".into()));
+    }
+    let (line, rule_env) = with_launch(&line, launch);
     cmd.arg("-c").arg(format!("exec {line}"));
-    cmd.envs(rule_env);
     cmd.env("WAYLAND_DISPLAY", socket).env("XDG_SESSION_TYPE", "wayland").env("MOZ_ENABLE_WAYLAND", "1").env("QT_QPA_PLATFORM", "wayland;xcb").env("GDK_BACKEND", "wayland,x11");
+    cmd.envs(rule_env);
     // new session so closing the compositor does not take the apps with it
     cmd.process_group(0);
     if let Some(d) = dir {
@@ -340,6 +349,16 @@ pub fn find_for_app_id<'a>(apps: &'a [AppEntry], app_id: &str) -> Option<&'a App
         .or_else(|| apps.iter().find(|e| !e.wm_class.is_empty() && e.wm_class.to_lowercase() == a))
         .or_else(|| apps.iter().find(|e| e.id.to_lowercase().ends_with(&format!(".{a}"))))
         .or_else(|| apps.iter().find(|e| exe_name(e).as_deref() == Some(a.as_str())))
+        // Steam games run as `steam_app_<id>` while their launcher is `steam steam://rungameid/<id>`.
+        .or_else(|| {
+            let id = a.strip_prefix("steam_app_")?;
+            apps.iter().find(|e| e.exec.contains(&format!("rungameid/{id}")))
+        })
+        // Last resort: the window class is the first word of the app name ("Godot" -> "Godot Engine").
+        .or_else(|| {
+            let class = a.split('_').next().filter(|c| c.len() >= 3)?;
+            apps.iter().find(|e| e.name.split_whitespace().next().map(|w| w.to_lowercase()).as_deref() == Some(class))
+        })
 }
 
 /// Rank apps for a launcher query (case-insensitive; prefix beats substring beats keywords).
@@ -400,6 +419,8 @@ impl IconSlot {
 /// Index of icon files by name, built from the installed icon themes.
 pub struct IconIndex {
     files: HashMap<String, Vec<(u32, PathBuf)>>,
+    /// the names, sorted (for the icon picker), made when first asked for
+    names: std::sync::OnceLock<Vec<String>>,
     /// the folders of the themes, the one that counts most first: a file of an earlier theme beats any of a later one
     order: Vec<PathBuf>,
 }
@@ -572,7 +593,7 @@ impl IconIndex {
                 walk_filtered(&theme, 0, &mut files);
             }
         }
-        IconIndex { files, order }
+        IconIndex { files, order, names: Default::default() }
     }
 
     /// The small icons of actions and states ("actions", "status": document-open, edit-copy...) that menus show beside their
@@ -588,7 +609,7 @@ impl IconIndex {
                 walk_cats(&base.join(t), 0, false, &["actions", "status"], &mut files);
             }
         }
-        IconIndex { files, order: Vec::new() }
+        IconIndex { files, order: Vec::new(), names: Default::default() }
     }
 
     /// Folder and file-type icons ("places" / "mimetypes") from the installed icon themes.
@@ -603,7 +624,16 @@ impl IconIndex {
                 walk_mime(&base.join(t), 0, false, &mut files);
             }
         }
-        IconIndex { files, order: Vec::new() }
+        IconIndex { files, order: Vec::new(), names: Default::default() }
+    }
+
+    /// Every icon name of the index, sorted (the picker for a widget's icon lists them).
+    pub fn names(&self) -> &[String] {
+        self.names.get_or_init(|| {
+            let mut v: Vec<String> = self.files.keys().filter(|k| !k.starts_with('/') && !k.ends_with("-symbolic")).cloned().collect();
+            v.sort_unstable();
+            v
+        })
     }
 
     /// Best file for an icon name at roughly `px` pixels (an absolute path also works).
@@ -709,6 +739,11 @@ fn walk_mime(dir: &Path, depth: u32, wanted: bool, out: &mut HashMap<String, Vec
     }
 }
 
+/// Is the icon file from the plateless theme of a clear look of our icons (`iconrender::LIVE_SUFFIX`)?
+pub fn is_live_icon(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str().to_str().is_some_and(|n| n.starts_with(crate::iconrender::THEME_NAME) && n.ends_with(crate::iconrender::LIVE_SUFFIX)))
+}
+
 /// Decode a PNG or rasterise an SVG to `px` x `px`.
 pub fn load_icon_file(path: &Path, px: u32) -> Option<image::RgbaImage> {
     use resvg::{tiny_skia, usvg};
@@ -779,12 +814,12 @@ mod launch_tests {
     fn a_theme_that_comes_first_beats_the_svg_of_one_that_comes_later() {
         let mut files = HashMap::new();
         files.insert("app".to_string(), vec![(128, PathBuf::from("/t/own/128x128/apps/app.png")), (512, PathBuf::from("/t/pack/scalable/apps/app.svg"))]);
-        let index = IconIndex { files, order: vec![PathBuf::from("/t/own"), PathBuf::from("/t/pack")] };
+        let index = IconIndex { files, order: vec![PathBuf::from("/t/own"), PathBuf::from("/t/pack")], names: Default::default() };
         assert_eq!(index.find("app", 128), Some(PathBuf::from("/t/own/128x128/apps/app.png")), "the chosen theme wins");
         // with no order (the action and file-type indexes) the old rule stays: a vector picture beats a bitmap
         let mut files = HashMap::new();
         files.insert("app".to_string(), vec![(128, PathBuf::from("/a/app.png")), (512, PathBuf::from("/b/app.svg"))]);
-        let any = IconIndex { files, order: Vec::new() };
+        let any = IconIndex { files, order: Vec::new(), names: Default::default() };
         assert_eq!(any.find("app", 128), Some(PathBuf::from("/b/app.svg")));
     }
 }

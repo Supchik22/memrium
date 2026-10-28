@@ -750,6 +750,12 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     return vec4(r.rgb, 1.0);
 }
 
+// The scene as it is, where no shell panel is: `fs` with no panels gives the same, at a fraction of the cost.
+@fragment
+fn fs_copy(in: VOut) -> @location(0) vec4<f32> {
+    return vec4(sample_bg(in.px), 1.0);
+}
+
 // Genie (minimise to the Dock): maps a destination pixel back to the window pixel that lands there.
 // Lines near the bottom of the window reach the icon first; each line is squeezed towards the icon's width.
 // Returns (source x, source y, valid).

@@ -420,9 +420,9 @@ impl Desktop {
             MenuItem::new(RENAME, "Rename…").icon("pencil").key("F2").enabled(one),
         ];
         if in_trash {
-            v.push(MenuItem::new(DELETE_FOREVER, "Delete permanently").icon("trash-2"));
+            v.push(MenuItem::new(DELETE_FOREVER, "Delete permanently").icon("trash-2").danger());
         } else {
-            v.push(MenuItem::new(TRASH, "Move to Trash").icon("trash-2").key("Delete"));
+            v.push(MenuItem::new(TRASH, "Move to Trash").icon("trash-2").key("Delete").danger());
         }
         if let Some(m) = fsops::convert_menu(&self.selected_paths(), CONVERT_BASE) {
             v.push(m);
@@ -613,7 +613,7 @@ impl Desktop {
             SELECT_ALL => self.sel = self.entries.iter().map(|e| e.path.clone()).collect(),
             PROPERTIES => {
                 if let Some(e) = self.selected().first() {
-                    fm.note = format!("{} · {} · {} · modified {}", e.name, e.kind.label(), if e.is_dir { "folder".to_string() } else { fsops::human_size(e.size) }, fsops::format_time(e.modified));
+                    ev.push(FilesEvent::Own("memrium_props", vec![e.path.to_string_lossy().to_string()]));
                 }
             }
             D_SHOW => {

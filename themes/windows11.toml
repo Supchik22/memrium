@@ -29,9 +29,9 @@ shape = "strip"
 surface = "glass"
 height = 48.0
 center = [
-    { kind = "start", style = "logo" },
+    { kind = "start", style = "icon", glyph = "layout-grid", menu_align = "center" },
     { kind = "search-box", width = 190.0 },
-    { kind = "tasks", icon_size = 26.0, button_w = 44.0, indicator = "underline" },
+    { kind = "dock", magnify = false, tooltips = false, bounce = false, separators = false, previews = true, gap = 4.0, pad = 4.0, icon_size = 26.0, button_w = 44.0, indicator = "underline", running_bg = "button", running_color = "ink", running_opacity = 0.0, focus_boost = 0.12, hover_bg = "button", hover_color = "ink", hover_opacity = 0.12 },
 ]
 right = [
     { kind = "tray", icons = ["wifi", "volume-2", "battery-full"] },

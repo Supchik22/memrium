@@ -185,6 +185,9 @@ pub fn thumbnail(path: &Path) -> Option<image::RgbaImage> {
         let img = builtin(name, 256)?;
         return Some(image::imageops::resize(&img, 128, 128, image::imageops::FilterType::Triangle));
     }
+    if crate::video::is_video(path) {
+        return crate::video::thumbnail(path);
+    }
     let img = image::open(path).ok()?.thumbnail(512, 512).to_rgba8();
     Some(image::imageops::resize(&img, 128, 128, image::imageops::FilterType::Triangle))
 }

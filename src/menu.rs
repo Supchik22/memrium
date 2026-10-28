@@ -19,6 +19,8 @@ pub struct MenuItem {
     pub shortcut: String,
     pub enabled: bool,
     pub checked: bool,
+    /// a destructive entry: the highlight turns red over it
+    pub danger: bool,
     pub separator: bool,
     pub sub: Vec<MenuItem>,
     /// where a program's icon for the entry comes from, until the shell has made a picture of it (see `cell`)
@@ -63,6 +65,11 @@ impl MenuItem {
         self
     }
 
+    pub fn danger(mut self) -> Self {
+        self.danger = true;
+        self
+    }
+
     pub fn sub(mut self, items: Vec<MenuItem>) -> Self {
         self.sub = items;
         self
@@ -95,8 +102,8 @@ pub struct Menu {
     screen: [f32; 2],
     /// pop-in
     open_k: Spring,
-    /// the sliding highlight: x, y, w, h and opacity
-    hl: [Spring; 5],
+    /// the sliding highlight: x, y, w, h, opacity and how red it is (over a destructive entry)
+    hl: [Spring; 6],
     hl_init: bool,
     /// pop-in of each open submenu (level 0 has `open_k`)
     sub_k: Vec<Spring>,
@@ -123,7 +130,7 @@ impl Default for Menu {
             levels: Vec::new(),
             screen: [0.0; 2],
             open_k: Spring::new(0.0, 1100.0, 0.85),
-            hl: [sp(0.0), sp(0.0), sp(0.0), sp(0.0), Spring::new(0.0, 2400.0, 1.0)],
+            hl: [sp(0.0), sp(0.0), sp(0.0), sp(0.0), Spring::new(0.0, 2400.0, 1.0), Spring::new(0.0, 900.0, 1.0)],
             hl_init: false,
             sub_k: Vec::new(),
             sub_rect: Vec::new(),
@@ -398,6 +405,7 @@ impl Menu {
         let accent = theme.ui.highlight.unwrap_or(theme.accent);
         // the highlighted row decides where the sliding highlight goes
         let mut target = None;
+        let mut red = false;
         for lv in 0..self.levels.len() {
             let items = self.items_at(lv);
             for (ri, it) in items.iter().enumerate() {
@@ -405,9 +413,11 @@ impl Menu {
                 let on_path = self.path.get(lv) == Some(&ri);
                 if !it.separator && it.enabled && (self.hot == Some((lv, ri)) || on_path || (self.hot.is_none() && inside(self.mouse, r))) {
                     target = Some(r);
+                    red = it.danger;
                 }
             }
         }
+        self.hl[5].target = if red { 1.0 } else { 0.0 };
         match target {
             Some(r) => {
                 let vals = [r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, r[2], r[3]];
@@ -474,6 +484,8 @@ impl Menu {
         }
         let a = self.hl[4].x.clamp(0.0, 1.0);
         if a > 0.01 {
+            let (k, danger) = (self.hl[5].x.clamp(0.0, 1.0), [1.0, 0.27, 0.23]);
+            let accent = [0, 1, 2].map(|i| accent[i] + (danger[i] - accent[i]) * k);
             p.push(Panel::solid(self.hl[0].x, self.hl[1].x, self.hl[2].x, self.hl[3].x, 7.0, accent, accent).flat().alpha(0.92 * a));
         }
         let mut item_ranges = vec![(0usize, 0usize, 0usize, 0usize); self.levels.len()];

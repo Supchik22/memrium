@@ -88,24 +88,32 @@ pub struct TrayService {
     items: Arc<Mutex<Vec<String>>>,
     /// the reading thread of each item, to be told when it is gone
     alive: HashMap<String, Arc<AtomicBool>>,
+    /// how to wake the reading thread of an item when it signals a change (by its unique bus name and path)
+    kicks: Kicks,
 }
+
+/// The reading threads waiting for their item to change, by (unique bus name, object path).
+type Kicks = Arc<Mutex<HashMap<(String, String), Sender<()>>>>;
 
 impl TrayService {
     pub fn new() -> TrayService {
-        TrayService { conn: None, rx: None, tx: None, items: Arc::new(Mutex::new(Vec::new())), alive: HashMap::new() }
+        TrayService { conn: None, rx: None, tx: None, items: Arc::new(Mutex::new(Vec::new())), alive: HashMap::new(), kicks: Arc::default() }
     }
 
     /// Offer the watcher on the session bus. A desktop that already has one keeps it (and we have no tray).
     pub fn start(&mut self) {
         let (tx, rx) = channel();
         let watcher = Watcher { tx: tx.clone(), items: self.items.clone() };
-        let built = Builder::session().and_then(|b| b.name("org.kde.StatusNotifierWatcher")).and_then(|b| b.serve_at("/StatusNotifierWatcher", watcher)).and_then(|b| b.build());
+        let built = Builder::session().map(|b| b.allow_name_replacements(false).replace_existing_names(false)).and_then(|b| b.name("org.kde.StatusNotifierWatcher")).and_then(|b| b.serve_at("/StatusNotifierWatcher", watcher)).and_then(|b| b.build());
         match built {
             Ok(conn) => {
                 eprintln!("tray: serving org.kde.StatusNotifierWatcher");
                 // the bus tells when an application goes away
                 let (c2, t2, items) = (conn.clone(), tx.clone(), self.items.clone());
                 std::thread::Builder::new().name("tray-names".into()).spawn(move || watch_names(c2, t2, items)).ok();
+                // the items say when they change (a new icon, status, tooltip...): they are read again then
+                let (c3, kicks) = (conn.clone(), self.kicks.clone());
+                std::thread::Builder::new().name("tray-signals".into()).spawn(move || watch_signals(c3, kicks)).ok();
                 self.conn = Some(conn);
                 self.rx = Some(rx);
                 self.tx = Some(tx);
@@ -127,8 +135,8 @@ impl TrayService {
                 TrayEv::Add(id) => {
                     let alive = Arc::new(AtomicBool::new(true));
                     self.alive.insert(id.clone(), alive.clone());
-                    let (c, t, id) = (conn.clone(), tx.clone(), id.clone());
-                    std::thread::Builder::new().name("tray-item".into()).spawn(move || read_item(c, id, t, alive)).ok();
+                    let (c, t, id, kicks) = (conn.clone(), tx.clone(), id.clone(), self.kicks.clone());
+                    std::thread::Builder::new().name("tray-item".into()).spawn(move || read_item(c, id, t, alive, kicks)).ok();
                 }
                 TrayEv::Remove(id) => {
                     if let Some(a) = self.alive.remove(id) {
@@ -233,6 +241,7 @@ fn read_once(conn: &Connection, id: &str) -> Option<TrayIcon> {
         menu: all.get("Menu").and_then(|v| zbus::zvariant::OwnedObjectPath::try_from(v.try_clone().ok()?).ok()).map(|p| p.to_string()).filter(|p| p != "/").unwrap_or_default(),
         is_menu: all.get("ItemIsMenu").and_then(|v| bool::try_from(v.try_clone().ok()?).ok()).unwrap_or(false),
         cell: None,
+        inverse: None,
     };
     if icon.title.is_empty() {
         icon.title = string_of(&all, "Id");
@@ -248,8 +257,39 @@ fn read_once(conn: &Connection, id: &str) -> Option<TrayIcon> {
     Some(icon)
 }
 
-/// Read an item now and then, sending what changed; stop when it is gone (or never answered).
-fn read_item(conn: Connection, id: String, tx: Sender<TrayEv>, alive: Arc<AtomicBool>) {
+/// Wake the reading thread of an item whenever the item sends one of its signals (NewIcon, NewStatus, NewToolTip...).
+fn watch_signals(conn: Connection, kicks: Kicks) {
+    let Ok(rule) = zbus::MatchRule::builder().msg_type(zbus::message::Type::Signal).interface(ITEM).map(|b| b.build()) else { return };
+    let Ok(signals) = zbus::blocking::MessageIterator::for_match_rule(rule, &conn, Some(64)) else { return };
+    for msg in signals.flatten() {
+        let h = msg.header();
+        let (Some(sender), Some(path)) = (h.sender(), h.path()) else { continue };
+        if let Ok(k) = kicks.lock() {
+            if let Some(tx) = k.get(&(sender.to_string(), path.to_string())) {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
+/// Read an item, then again whenever it signals a change, sending what changed; stop when it is gone (or never answered).
+/// An item that never signals is still looked at now and then. (It used to be read every 1.5 s: that woke the shell and
+/// every program in the tray all the time, and read their pictures again and again.)
+fn read_item(conn: Connection, id: String, tx: Sender<TrayEv>, alive: Arc<AtomicBool>, kicks: Kicks) {
+    // the signals come from the unique name of the program, whatever name it registered with
+    let (bus, path) = split_id(&id);
+    let unique = if bus.starts_with(':') {
+        Some(bus.to_string())
+    } else {
+        zbus::blocking::fdo::DBusProxy::new(&conn).ok().and_then(|p| p.get_name_owner(zbus::names::BusName::try_from(bus).ok()?).ok()).map(|n| n.to_string())
+    };
+    let (kick_tx, kick_rx) = channel::<()>();
+    let key = unique.map(|u| (u, path.to_string()));
+    if let (Some(key), Ok(mut k)) = (&key, kicks.lock()) {
+        k.insert(key.clone(), kick_tx);
+    }
+    // with signals heard, the look now and then only catches an item that changes without saying so
+    let every = if key.is_some() { Duration::from_secs(20) } else { Duration::from_millis(1500) };
     let (mut last, mut failures) = (None::<TrayIcon>, 0);
     while alive.load(Ordering::Relaxed) {
         match read_once(&conn, &id) {
@@ -263,12 +303,20 @@ fn read_item(conn: Connection, id: String, tx: Sender<TrayEv>, alive: Arc<Atomic
             None => {
                 failures += 1;
                 if failures >= 4 {
-                    let _ = tx.send(TrayEv::Remove(id));
-                    return;
+                    let _ = tx.send(TrayEv::Remove(id.clone()));
+                    break;
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(1500));
+        // a failed read is tried again soon; otherwise wait for a signal (a burst of them is read once)
+        let wait = if failures > 0 { Duration::from_millis(1500) } else { every };
+        if kick_rx.recv_timeout(wait).is_ok() {
+            std::thread::sleep(Duration::from_millis(40));
+            while kick_rx.try_recv().is_ok() {}
+        }
+    }
+    if let (Some(key), Ok(mut k)) = (&key, kicks.lock()) {
+        k.remove(key);
     }
 }
 
@@ -321,5 +369,59 @@ mod tests {
         assert_eq!(shortcut_text(&combo(&["Alt", "F4"])), "Alt+F4");
         assert_eq!(shortcut_text(&combo(&["Meta", "Return"])), "Super+Return");
         assert_eq!(shortcut_text(&[]), "");
+    }
+
+    /// A tray item on the session bus whose icon name can be changed.
+    struct FakeItem {
+        icon: std::sync::Arc<std::sync::Mutex<String>>,
+    }
+
+    #[zbus::interface(name = "org.kde.StatusNotifierItem")]
+    impl FakeItem {
+        #[zbus(property)]
+        fn icon_name(&self) -> String {
+            self.icon.lock().unwrap().clone()
+        }
+        #[zbus(property)]
+        fn status(&self) -> String {
+            "Active".into()
+        }
+        #[zbus(signal)]
+        async fn new_icon(e: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
+    }
+
+    #[test]
+    fn an_item_is_read_again_when_it_signals_a_change_not_by_polling() {
+        use super::*;
+        // (needs a session bus; skipped without one)
+        let Ok(bus) = zbus::blocking::Connection::session() else { return };
+        let icon = Arc::new(Mutex::new("first".to_string()));
+        bus.object_server().at("/StatusNotifierItem", FakeItem { icon: icon.clone() }).unwrap();
+        let id = format!("{}/StatusNotifierItem", bus.unique_name().unwrap());
+        let shell = zbus::blocking::Connection::session().unwrap();
+        let (tx, rx) = channel();
+        let (alive, kicks): (_, Kicks) = (Arc::new(AtomicBool::new(true)), Arc::default());
+        let (c, k) = (shell.clone(), kicks.clone());
+        std::thread::spawn(move || watch_signals(c, k));
+        let (c, k, a, i) = (shell.clone(), kicks.clone(), alive.clone(), id.clone());
+        std::thread::spawn(move || read_item(c, i, tx, a, k));
+        let name = |ev: TrayEv| match ev {
+            TrayEv::Update(t) => t.icon_name,
+            _ => String::new(),
+        };
+        assert_eq!(name(rx.recv_timeout(Duration::from_secs(5)).unwrap()), "first");
+        // wait until the reader listens, then change the icon and say so
+        let started = std::time::Instant::now();
+        while kicks.lock().unwrap().is_empty() && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        *icon.lock().unwrap() = "second".into();
+        let at = std::time::Instant::now();
+        let iface = bus.object_server().interface::<_, FakeItem>("/StatusNotifierItem").unwrap();
+        zbus::block_on(FakeItem::new_icon(iface.signal_emitter())).unwrap();
+        assert_eq!(name(rx.recv_timeout(Duration::from_secs(5)).unwrap()), "second");
+        assert!(at.elapsed() < Duration::from_secs(2), "read on the signal, not on the slow look: {:?}", at.elapsed());
+        alive.store(false, Ordering::Relaxed);
     }
 }

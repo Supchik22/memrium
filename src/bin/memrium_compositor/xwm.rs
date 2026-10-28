@@ -28,6 +28,8 @@ use std::process::Stdio;
 impl State {
     /// Start XWayland; the window manager comes up when it reports ready. Failure only means no X11 support.
     pub fn start_xwayland(&mut self, handle: LoopHandle<'static, State>) {
+        // the dmabuf fence watches (`hold_until_drawn`) need the loop too, with or without an X server
+        self.loop_handle = Some(handle.clone());
         if std::env::var_os("MEMRIUM_NO_XWAYLAND").is_some() {
             return;
         }
@@ -185,7 +187,7 @@ impl State {
         let dpi = (96.0 * crate::role::x_scale()).round() as u32;
         let Ok((conn, screen)) = x11rb::rust_connection::RustConnection::connect(Some(&format!(":{n}"))) else { return };
         let root = conn.setup().roots[screen].root;
-        let text = format!("Xft.dpi:\t{dpi}\nXft.antialias:\t1\nXft.hinting:\t1\nXft.hintstyle:\thintslight\nXft.rgba:\tnone\n");
+        let text = format!("Xft.dpi:\t{dpi}\nXft.antialias:\t1\nXft.hinting:\t1\nXft.hintstyle:\thintslight\nXft.rgba:\tnone\n{}", memrium_de::cursor_theme::x_resources(&self.config.input.cursor));
         let _ = conn.change_property8(PropMode::REPLACE, root, AtomEnum::RESOURCE_MANAGER, AtomEnum::STRING, text.as_bytes());
         let _ = conn.flush();
     }
@@ -336,7 +338,7 @@ impl XwmHandler for State {
 
     fn fullscreen_request(&mut self, xwm: XwmId, window: X11Surface) {
         if let Some(i) = self.x11_index(&window) {
-            self.set_fullscreen(i, true);
+            self.fullscreen_now(i, true);
         }
     }
 

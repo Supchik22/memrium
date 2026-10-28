@@ -409,9 +409,16 @@ pub fn import(dir: &Path) -> Result<IconDoc, String> {
             None if fill.and_then(Value::as_str) == Some("system-light") => ([1.0, 1.0, 1.0], [0.90, 0.91, 0.94]),
             None => (lighter(0.22), darker(0.08)),
         };
+        // what the file leaves to the system stays that way: a light plate, or one colour made into a gradient
+        let kind = match fill.and_then(Value::as_str) {
+            Some("system-light") => FillKind::System,
+            _ if fill.is_some_and(|f| f.get("automatic-gradient").is_some()) => FillKind::Auto,
+            _ => FillKind::Gradient,
+        };
+        let (top, bottom) = if kind == FillKind::Auto { (c, c) } else { (top, bottom) };
         let base = Background {
             shape: Shape::Squircle,
-            fill: FillKind::Gradient,
+            fill: kind,
             top,
             bottom,
             glass: Glass { enabled: true, specular: 0.3, shadow: ShadowKind::Neutral, shadow_amount: 0.35, ..Glass::default() },
@@ -519,8 +526,8 @@ mod tests {
         assert!(out.contains("fill:url(#mem-gradient)") && out.contains("fill=\"none\""), "{out}");
         // red at the bottom and blue at the top
         let doc = crate::iconrender::import_svg("t", &out).unwrap();
-        let img = crate::iconrender::Renderer::new().render(&doc, Appearance::Default, 100);
-        let (top, bottom) = (img.get_pixel(50, 4), img.get_pixel(50, 96));
+        let img = { let mut r = crate::iconrender::Renderer::new(); r.tune.plate = Shape::None; r }.render(&doc, Appearance::Default, 100);
+        let (top, bottom) = (img.get_pixel(50, 8), img.get_pixel(50, 92));
         assert!(top[2] > 200 && top[0] < 60, "blue at the top: {top:?}");
         assert!(bottom[0] > 200 && bottom[2] < 60, "red at the bottom: {bottom:?}");
     }
@@ -530,7 +537,7 @@ mod tests {
         let svg = r##"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100"><rect width="100" height="100" fill="#ff0000"/></svg>"##;
         let out = on_canvas(svg, 1.0);
         let doc = crate::iconrender::import_svg("t", &out).unwrap();
-        let img = crate::iconrender::Renderer::new().render(&doc, Appearance::Default, 1024);
+        let img = { let mut r = crate::iconrender::Renderer::new(); r.tune.plate = Shape::None; r }.render(&doc, Appearance::Default, 1024);
         assert_eq!(img.get_pixel(512, 512)[3], 255, "the middle is drawn");
         assert_eq!(img.get_pixel(100, 100)[3], 0, "and the rest of the canvas is empty: it is 100 points, not 1024");
         let big = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"/>"##;
@@ -566,7 +573,7 @@ mod tests {
         assert_eq!(doc.nodes.len(), 4, "four groups");
         assert_eq!(doc.nodes[0].children().len(), 2, "the face and its bevel are at the back");
         assert_eq!(doc.nodes.last().unwrap().children().len(), 3, "the pin, the second hand and the index are in front");
-        let img = crate::iconrender::Renderer::new().render(&doc, Appearance::Default, 256);
+        let img = { let mut r = crate::iconrender::Renderer::new(); r.tune.plate = Shape::None; r }.render(&doc, Appearance::Default, 256);
         assert!(img.get_pixel(128, 128)[3] > 0);
     }
 }

@@ -22,6 +22,8 @@ const COLS: usize = 5;
 const SHOW_AFTER: f32 = 0.38;
 const SWITCH_AFTER: f32 = 0.06;
 const LINGER: f32 = 0.22;
+/// seconds carried files rest on a Dock item before its window comes up
+const DRAG_FOCUS_AFTER: f32 = 0.5;
 
 const M_NEW: u32 = 8001;
 const M_PIN: u32 = 8002;
@@ -139,6 +141,7 @@ impl State {
 
     /// Track what the pointer rests on: open the previews after a moment, switch between items, close them after it left.
     pub fn update_dock_preview(&mut self, dt: f32) {
+        self.update_dock_drag(dt);
         let an = self.theme.animations.clone();
         let busy = self.launcher_modal() || self.menu.open || self.grab.is_some() || self.panel_edit.is_some() || self.scene.edit_mode() || self.lock.is_some() || self.file_drag.is_some();
         let hov = if busy { None } else { self.dock_item_at() };
@@ -195,6 +198,32 @@ impl State {
         if let Some(p) = &self.preview {
             if self.dock_windows(&p.key).is_empty() {
                 self.preview = None;
+            }
+        }
+    }
+
+    /// Files carried over a Dock item rest there for a moment: the app's window comes up, so they can be dropped into
+    /// a program that is not the focused one.
+    fn update_dock_drag(&mut self, dt: f32) {
+        let carrying = self.file_drag.as_ref().is_some_and(|d| d.active);
+        let key = if carrying && self.lock.is_none() { self.dock_item_at().map(|h| h.key) } else { None };
+        let Some(key) = key else {
+            self.dock_drag = (String::new(), 0.0);
+            return;
+        };
+        if self.dock_drag.0 != key {
+            self.dock_drag = (key, 0.0);
+            return;
+        }
+        if self.dock_drag.1 < 0.0 {
+            return;
+        }
+        self.dock_drag.1 += dt;
+        if self.dock_drag.1 >= DRAG_FOCUS_AFTER {
+            self.dock_drag.1 = -1.0;
+            let wins = self.dock_windows(&self.dock_drag.0);
+            if let Some(w) = wins.iter().find(|w| !w.minimized).or(wins.first()) {
+                self.dock_focus_window(w.id);
             }
         }
     }

@@ -253,12 +253,16 @@ pub struct Files {
     scroll_prev: f32,
     track: [f32; 4],
     thumb: [f32; 2],
+    /// the scrollbar's thumb is being dragged: how far below its top the pointer took hold
+    thumb_drag: Option<f32>,
     /// what a click in the scroll track does (kept from the theme at draw time)
     click_style: crate::theme::ScrollClick,
     filter: String,
     filter_focus: bool,
     edit: Option<Edit>,
-    path_edit: Option<String>,
+    path_edit: Option<LineEdit>,
+    /// clipboard text on its way (read off the UI thread)
+    paste_rx: Option<std::sync::mpsc::Receiver<String>>,
     /// a server being connected to: its address and the answer (where its files are) when it comes
     mounting: Option<(String, std::sync::mpsc::Receiver<Result<PathBuf, String>>)>,
     mouse: [f32; 2],
@@ -302,6 +306,142 @@ fn intersect(a: [f32; 4], b: [f32; 4]) -> Option<[f32; 4]> {
 
 fn fits(r: [f32; 4], view: [f32; 4]) -> bool {
     r[1] >= view[1] - 0.5 && r[1] + r[3] <= view[1] + view[3] + 0.5
+}
+
+/// A single line being edited: the text, the caret and the other end of the selection (character indices).
+struct LineEdit {
+    text: String,
+    cur: usize,
+    anchor: Option<usize>,
+}
+
+impl LineEdit {
+    /// caret at the end
+    fn new(text: &str) -> LineEdit {
+        LineEdit { text: text.to_string(), cur: text.chars().count(), anchor: None }
+    }
+
+    /// everything selected: typing replaces it
+    fn selected(text: &str) -> LineEdit {
+        LineEdit { anchor: Some(0), ..LineEdit::new(text) }
+    }
+
+    fn span(&self) -> Option<(usize, usize)> {
+        self.anchor.map(|a| (a.min(self.cur), a.max(self.cur))).filter(|(a, b)| a != b)
+    }
+
+    fn byte(&self, i: usize) -> usize {
+        self.text.char_indices().nth(i).map_or(self.text.len(), |(b, _)| b)
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        self.span().map(|(a, b)| self.text[self.byte(a)..self.byte(b)].to_string())
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some((a, b)) = self.span() else {
+            self.anchor = None;
+            return false;
+        };
+        let (ba, bb) = (self.byte(a), self.byte(b));
+        self.text.replace_range(ba..bb, "");
+        self.cur = a;
+        self.anchor = None;
+        true
+    }
+
+    fn insert(&mut self, s: &str) {
+        self.delete_selection();
+        let at = self.byte(self.cur);
+        self.text.insert_str(at, s);
+        self.cur += s.chars().count();
+    }
+
+    fn key(&mut self, k: Key, mods: KeyMods) -> bool {
+        let len = self.text.chars().count();
+        self.cur = self.cur.min(len);
+        match k {
+            Key::Char(c) if mods.ctrl && !mods.alt => {
+                if c.eq_ignore_ascii_case(&'a') {
+                    self.anchor = Some(0);
+                    self.cur = len;
+                }
+            }
+            Key::Char(c) if !mods.alt && !c.is_control() => self.insert(c.encode_utf8(&mut [0; 4])),
+            Key::Backspace | Key::Delete => {
+                if !self.delete_selection() {
+                    if k == Key::Backspace && self.cur > 0 {
+                        // Ctrl takes a whole path part
+                        let chars: Vec<char> = self.text.chars().collect();
+                        let mut from = self.cur - 1;
+                        if mods.ctrl {
+                            while from > 0 && chars[from] == '/' {
+                                from -= 1;
+                            }
+                            while from > 0 && chars[from - 1] != '/' {
+                                from -= 1;
+                            }
+                        }
+                        let (a, b) = (self.byte(from), self.byte(self.cur));
+                        self.text.replace_range(a..b, "");
+                        self.cur = from;
+                    } else if k == Key::Delete && self.cur < len {
+                        let (a, b) = (self.byte(self.cur), self.byte(self.cur + 1));
+                        self.text.replace_range(a..b, "");
+                    }
+                }
+            }
+            Key::Left | Key::Right | Key::Home | Key::End => {
+                let to = match k {
+                    Key::Left => match self.span() {
+                        Some((a, _)) if !mods.shift => a,
+                        _ => self.cur.saturating_sub(1),
+                    },
+                    Key::Right => match self.span() {
+                        Some((_, b)) if !mods.shift => b,
+                        _ => (self.cur + 1).min(len),
+                    },
+                    Key::Home => 0,
+                    _ => len,
+                };
+                if mods.shift {
+                    self.anchor.get_or_insert(self.cur);
+                } else {
+                    self.anchor = None;
+                }
+                self.cur = to;
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// What was typed in the location field as a path: `~` is home, a relative path starts from the folder shown.
+fn expand_path(typed: &str, cwd: &Path) -> PathBuf {
+    let typed = typed.strip_prefix("file://").unwrap_or(typed);
+    if typed == "~" {
+        fsops::home()
+    } else if let Some(rest) = typed.strip_prefix("~/") {
+        fsops::home().join(rest)
+    } else if typed.is_empty() {
+        cwd.to_path_buf()
+    } else {
+        cwd.join(typed)
+    }
+}
+
+/// Put text on the Wayland clipboard (the compositor cannot own a selection itself, so wl-copy does).
+fn copy_text(text: &str) {
+    use std::io::Write;
+    if let Ok(mut c) = std::process::Command::new("wl-copy").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn() {
+        if let Some(mut i) = c.stdin.take() {
+            let _ = i.write_all(text.as_bytes());
+        }
+        std::thread::spawn(move || {
+            let _ = c.wait();
+        });
+    }
 }
 
 fn ellipsize(text: &str, size: f32, max_w: f32, measure: &dyn Fn(&str, f32, bool) -> f32) -> String {
@@ -364,11 +504,13 @@ impl Files {
             scroll_prev: 0.0,
             track: [0.0; 4],
             thumb: [0.0; 2],
+            thumb_drag: None,
             click_style: Default::default(),
             filter: String::new(),
             filter_focus: false,
             edit: None,
             path_edit: None,
+            paste_rx: None,
             mounting: None,
             mouse: [-1000.0; 2],
             hits: Vec::new(),
@@ -426,6 +568,16 @@ impl Files {
 
     pub fn set_mouse(&mut self, p: [f32; 2]) {
         self.mouse = p;
+        if let Some(grip) = self.thumb_drag {
+            let max = (self.content_h - self.track[3]).max(0.0);
+            let f = ((p[1] - grip - self.track[1]) / (self.track[3] - self.thumb[1]).max(1.0)).clamp(0.0, 1.0);
+            self.scroll = f * max;
+        }
+    }
+
+    /// The pointer button went up: a dragged scrollbar thumb is let go.
+    pub fn mouse_up(&mut self) {
+        self.thumb_drag = None;
     }
 
     /// Is a text field taking keyboard input?
@@ -579,7 +731,8 @@ impl Files {
 
     fn ensure_visible(&mut self, vi: usize) {
         if let Some(r) = self.rects.get(vi) {
-            let top = r[1] - self.content[1] - self.header_h();
+            // rects are on screen (already scrolled): bring the top back to list coordinates
+            let top = r[1] + self.scroll - self.content[1] - self.header_h();
             let h = self.content[3] - self.header_h();
             if top < self.scroll {
                 self.scroll = top - 4.0;
@@ -723,9 +876,9 @@ impl Files {
         v.push(MenuItem::sep());
         v.push(MenuItem::new(RENAME, "Rename…").icon("pencil").key("F2").enabled(one));
         if in_trash {
-            v.push(MenuItem::new(DELETE_FOREVER, "Delete permanently").icon("trash-2"));
+            v.push(MenuItem::new(DELETE_FOREVER, "Delete permanently").icon("trash-2").danger());
         } else {
-            v.push(MenuItem::new(TRASH, "Move to Trash").icon("trash-2").key("Delete"));
+            v.push(MenuItem::new(TRASH, "Move to Trash").icon("trash-2").key("Delete").danger());
         }
         if let Some(m) = fsops::convert_menu(&self.selected_paths(), CONVERT_BASE) {
             v.push(m);
@@ -851,7 +1004,7 @@ impl Files {
             }
             CONNECT_SERVER => {
                 // the location field, with the usual start of an address in it
-                self.path_edit = Some("smb://".into());
+                self.path_edit = Some(LineEdit::new("smb://"));
                 prefs_changed = false;
             }
             DISCONNECT => {
@@ -887,8 +1040,8 @@ impl Files {
                 prefs_changed = false;
             }
             PROPERTIES => {
-                if let Some(e) = self.selected_entries().first() {
-                    fm.note = format!("{} · {} · {} · modified {}", e.name, e.kind.label(), if e.is_dir { "folder".to_string() } else { fsops::human_size(e.size) }, fsops::format_time(e.modified));
+                if let Some(p) = self.selected_paths().first() {
+                    ev.push(FilesEvent::Own("memrium_props", vec![p.to_string_lossy().to_string()]));
                 }
                 prefs_changed = false;
             }
@@ -985,6 +1138,32 @@ impl Files {
 
     // ---------------------------------------------------------------- input
 
+    /// Ask for the clipboard text: wl-paste runs on its own thread (it talks to this very compositor, which must keep going).
+    fn start_paste(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(o) = std::process::Command::new("wl-paste").arg("-n").stderr(std::process::Stdio::null()).output() {
+                let _ = tx.send(String::from_utf8_lossy(&o.stdout).into_owned());
+            }
+        });
+        self.paste_rx = Some(rx);
+    }
+
+    fn poll_paste(&mut self) {
+        let Some(rx) = &self.paste_rx else { return };
+        match rx.try_recv() {
+            Ok(text) => {
+                self.paste_rx = None;
+                if let Some(t) = self.path_edit.as_mut() {
+                    let one_line: String = text.chars().map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c }).collect();
+                    t.insert(one_line.trim());
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(_) => self.paste_rx = None,
+        }
+    }
+
     pub fn mouse_down(&mut self, p: [f32; 2], right: bool, mods: KeyMods, fm: &mut Fm) -> Vec<FilesEvent> {
         let mut ev = Vec::new();
         // a click anywhere else ends text editing
@@ -994,9 +1173,8 @@ impl Files {
                 self.commit_edit(fm, &mut ev);
             }
         }
-        let was_path_edit = self.path_edit.is_some();
+        let prev_path_edit = self.path_edit.take();
         let was_filter = self.filter_focus;
-        self.path_edit = None;
         self.filter_focus = false;
 
         let hit = self.hits.iter().rev().find(|(r, _)| inside(p, *r)).map(|(_, h)| h.clone());
@@ -1014,8 +1192,8 @@ impl Files {
             Hit::Refresh if !right => self.reload(),
             Hit::Crumb(path) if !right => self.goto(path, true),
             Hit::PathField if !right => {
-                self.path_edit = Some(self.cwd.to_string_lossy().to_string());
-                let _ = was_path_edit;
+                // a click in a field already being edited keeps the text; otherwise the whole path is selected
+                self.path_edit = Some(prev_path_edit.unwrap_or_else(|| LineEdit::selected(&self.cwd.to_string_lossy())));
             }
             Hit::Search if !right => {
                 self.filter_focus = true;
@@ -1045,10 +1223,14 @@ impl Files {
             Hit::Track if !right => {
                 let [ty, th] = self.thumb;
                 let max = (self.content_h - self.track[3]).max(0.0);
-                if self.click_style == crate::theme::ScrollClick::Spot {
-                    // the thumb's middle goes to the click
+                if p[1] >= ty && p[1] <= ty + th {
+                    // on the thumb: it follows the pointer from here
+                    self.thumb_drag = Some(p[1] - ty);
+                } else if self.click_style == crate::theme::ScrollClick::Spot {
+                    // the thumb's middle goes to the click, and follows the pointer from there
                     let f = ((p[1] - self.track[1] - th / 2.0) / (self.track[3] - th).max(1.0)).clamp(0.0, 1.0);
                     self.scroll = f * max;
+                    self.thumb_drag = Some(th / 2.0);
                 } else if p[1] < ty {
                     self.scroll = (self.scroll - self.track[3]).max(0.0);
                 } else if p[1] > ty + th {
@@ -1115,7 +1297,8 @@ impl Files {
 
     pub fn scroll(&mut self, dy: f64) {
         let max = (self.content_h - (self.content[3] - self.header_h())).max(0.0);
-        self.scroll = (self.scroll - dy as f32 * 0.6).clamp(0.0, max);
+        // the same pace as the Settings pages: a wheel click moves a few rows
+        self.scroll = (self.scroll + dy as f32 * 2.5).clamp(0.0, max);
     }
 
     /// Keyboard input. Returns true when the key was used.
@@ -1136,25 +1319,38 @@ impl Files {
         }
         if let Some(t) = self.path_edit.as_mut() {
             match k {
-                Key::Char(c) if !mods.ctrl && !mods.alt => t.push(c),
-                Key::Backspace => {
-                    t.pop();
+                Key::Char('v') if mods.ctrl && !mods.alt => self.start_paste(),
+                Key::Char('c') | Key::Char('x') if mods.ctrl && !mods.alt => {
+                    if let Some(sel) = t.selected_text() {
+                        copy_text(&sel);
+                        if k == Key::Char('x') {
+                            t.delete_selection();
+                        }
+                    }
                 }
                 Key::Enter => {
-                    let typed = self.path_edit.take().unwrap_or_default();
+                    let typed = self.path_edit.take().map(|t| t.text).unwrap_or_default();
+                    let typed = typed.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
                     if let Some(url) = fsops::server_url(&typed) {
                         self.connect(url);
                         return (true, ev);
                     }
-                    let path = PathBuf::from(typed);
+                    let path = expand_path(&typed, &self.cwd);
                     if path.is_dir() {
                         self.goto(path, true);
+                    } else if path.is_file() {
+                        match path.parent() {
+                            Some(dir) => self.goto(dir.to_path_buf(), true),
+                            None => fm.note = format!("No such folder: {}", path.display()),
+                        }
                     } else {
                         fm.note = format!("No such folder: {}", path.display());
                     }
                 }
                 Key::Esc => self.path_edit = None,
-                _ => {}
+                _ => {
+                    t.key(k, mods);
+                }
             }
             return (true, ev);
         }
@@ -1262,7 +1458,7 @@ impl Files {
                 'h' => self.command(cmd::HIDDEN, fm, &mut ev),
                 'n' if mods.shift => self.command(cmd::NEW_FOLDER, fm, &mut ev),
                 'f' => self.filter_focus = true,
-                'l' => self.path_edit = Some(self.cwd.to_string_lossy().to_string()),
+                'l' => self.path_edit = Some(LineEdit::selected(&self.cwd.to_string_lossy())),
                 _ => return (false, ev),
             },
             Key::Char(c) if !mods.alt && !c.is_control() => {
@@ -1290,6 +1486,7 @@ impl Files {
             return (p, l);
         }
         self.poll_mount();
+        self.poll_paste();
         // follow changes made outside (and by our own operations)
         if cx.fm.gen != self.seen_gen {
             self.seen_gen = cx.fm.gen;
@@ -1396,9 +1593,27 @@ impl Files {
         let path_r = [path_x, y + 9.0, search_r[0] - path_x - 10.0, 30.0];
         fill!(path_r, 9.0, ink, if self.path_edit.is_some() { 0.14 } else { 0.07 });
         if let Some(t) = &self.path_edit {
-            let caret = if (cx.time * 2.0) as i32 % 2 == 0 { "|" } else { "" };
-            let s = ellipsize(&format!("{t}{caret}"), 13.0, path_r[2] - 24.0, meas);
-            data!(path_r[0] + 12.0, path_r[1] + 15.0, s, 13.0, false, ink, 0.95, Align::Left);
+            let avail = path_r[2] - 24.0;
+            let chars: Vec<char> = t.text.chars().collect();
+            let cur = t.cur.min(chars.len());
+            // slide the window right until the caret fits: the end of what is typed always stays visible
+            let mut start = 0;
+            while start < cur && meas(&chars[start..cur].iter().collect::<String>(), 13.0, false) > avail - 14.0 {
+                start += 1;
+            }
+            let lead = if start > 0 { "…" } else { "" };
+            let shown: String = chars[start..].iter().collect();
+            let before = |n: usize| meas(&format!("{lead}{}", chars[start..n.max(start)].iter().collect::<String>()), 13.0, false);
+            let x0 = path_r[0] + 12.0;
+            if let Some((a, b)) = t.span() {
+                let (xa, xb) = (x0 + before(a), x0 + before(b));
+                fill!([xa, path_r[1] + 6.0, (xb - xa).max(1.0), path_r[3] - 12.0], 3.0, accent, 0.4);
+            }
+            let s = ellipsize(&format!("{lead}{shown}"), 13.0, avail, meas);
+            data!(x0, path_r[1] + 15.0, s, 13.0, false, ink, 0.95, Align::Left);
+            if (cx.time * 2.0) as i32 % 2 == 0 {
+                fill!([x0 + before(cur), path_r[1] + 7.0, 1.5, path_r[3] - 14.0], 0.0, ink, 0.9);
+            }
             fill!([path_r[0], path_r[1] + path_r[3] - 2.0, path_r[2], 2.0], 1.0, accent, 0.9);
         } else if prefs.path_style == PathStyle::Address {
             let s = ellipsize(&self.cwd.to_string_lossy(), 13.0, path_r[2] - 24.0, meas);
@@ -1628,7 +1843,13 @@ impl Files {
                 ViewMode::Icons => {
                     let (icx, icy) = (r[0] + r[2] / 2.0, r[1] + 10.0 + prefs.icon_size / 2.0);
                     match (cx.icon)(e, true) {
-                        IconState::Cell(c) => p.push(Panel::app_icon(icx, icy, prefs.icon_size * 0.92, c, a)),
+                        IconState::Cell(c) => {
+                            p.push(Panel::app_icon(icx, icy, prefs.icon_size * 0.92, c, a));
+                            // the cell may be the file type's icon: the picture's own thumbnail is still to be asked for
+                            if e.kind == Kind::Image || e.is_dir {
+                                wanted.push(e.clone());
+                            }
+                        }
                         st => {
                             if st == IconState::Pending {
                                 wanted.push(e.clone());
@@ -1717,9 +1938,10 @@ impl Files {
                 _ => 1.0,
             };
             if show > 0.0 {
-                fill!([items_view[0] + items_view[2] - 7.0, ty, 4.0, th], 2.0, ink, 0.28 * show);
+                let hot = inside(mouse, [items_view[0] + items_view[2] - 20.0, items_view[1], 20.0, items_view[3]]) || self.thumb_drag.is_some();
+                fill!([items_view[0] + items_view[2] - 14.0, ty, 10.0, th], 5.0, ink, if hot { 0.45 } else { 0.32 } * show);
             }
-            self.track = [items_view[0] + items_view[2] - 14.0, items_view[1], 14.0, items_view[3]];
+            self.track = [items_view[0] + items_view[2] - 20.0, items_view[1], 20.0, items_view[3]];
             self.thumb = [ty, th];
             self.hits.push((self.track, Hit::Track));
         } else {

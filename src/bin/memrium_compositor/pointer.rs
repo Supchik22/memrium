@@ -79,6 +79,9 @@ impl State {
             None => Shape::Default,
         };
         if shape != self.cursor_shape {
+            if std::env::var_os("MEMRIUM_DEBUG_POINTER").is_some() {
+                eprintln!("pointer: cursor {:?} -> {:?} (client picture: {})", self.cursor_shape, shape, self.client_cursor_img.is_some());
+            }
             self.cursor_shape = shape;
             self.cursor_gen = self.cursor_gen.wrapping_add(1);
         }

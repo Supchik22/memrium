@@ -51,6 +51,9 @@ pub struct Launcher {
     pub grid: bool,
     /// the kind of launcher this opening asked for (the search, with a Launchpad in the theme), instead of the theme's
     pub forced: Option<LauncherKind>,
+    /// where a start menu sits along its bar, and whether the Plasma menu shows favourites as a grid (asked by the start button)
+    pub align: MenuAlign,
+    pub fav_grid: bool,
     page: Spring,
     page_to: Cell<usize>,
     pages: Cell<usize>,
@@ -74,6 +77,28 @@ pub struct Launcher {
     dragging: bool,
     /// the pointer went down while the Launchpad was up (a press that opened it, coming up over it, is not a click on it)
     down: bool,
+}
+
+/// Where a start menu sits along its bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MenuAlign {
+    /// its edge on the start button's edge (the menu opens where the button is)
+    #[default]
+    Button,
+    /// centred on the start button
+    Center,
+    /// centred on the screen
+    Screen,
+}
+
+impl MenuAlign {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "center" => MenuAlign::Center,
+            "screen" => MenuAlign::Screen,
+            _ => MenuAlign::Button,
+        }
+    }
 }
 
 /// What a Launchpad rectangle stands for.
@@ -123,6 +148,8 @@ impl Default for Launcher {
             power_rect: Cell::new([0.0; 4]),
             grid: false,
             forced: None,
+            align: MenuAlign::Button,
+            fav_grid: false,
             page: Spring::new(0.0, 190.0, 0.92),
             page_to: Cell::new(0),
             pages: Cell::new(1),
@@ -167,6 +194,8 @@ pub struct DrawCtx<'a> {
     pub theme: &'a Theme,
     /// the bar the start menu sits on: its edge and rectangle (None = the bottom of the screen)
     pub bar: Option<(Edge, [f32; 4])>,
+    /// the start button's rectangle: a start menu opens where it is
+    pub anchor: Option<[f32; 4]>,
     pub icon_cell: &'a dyn Fn(&AppEntry) -> Option<u32>,
 }
 
@@ -206,6 +235,16 @@ impl Launcher {
         self.toggle();
     }
 
+    /// Open (or close) the menu the start button asks for: its kind (`None`: the theme's), where it sits and its favourites view.
+    pub fn open_from_start(&mut self, kind: Option<LauncherKind>, align: MenuAlign, grid: bool) {
+        let was_open = self.open;
+        self.toggle_as(kind);
+        if !was_open {
+            self.align = align;
+            self.fav_grid = grid;
+        }
+    }
+
     /// Open the search over the commands of the front program's menu (`program`: its name, for the hint).
     pub fn open_menu_search(&mut self, program: &str, cmds: Vec<crate::figlet::MenuCmd>) {
         if self.open {
@@ -224,6 +263,9 @@ impl Launcher {
             self.close();
         } else {
             self.open = true;
+            // (a key opens the menu at the button; the start button asks for more after this)
+            self.align = MenuAlign::Button;
+            self.fav_grid = false;
             self.menu_mode = false;
             self.menu_cmds.clear();
             self.query.clear();
@@ -624,6 +666,7 @@ impl Launcher {
             LauncherKind::Figlet => self.draw_spotlight(ctx),
             LauncherKind::StartMenuWin11 => self.draw_win11(ctx),
             LauncherKind::StartMenuWin7 => self.draw_win7(ctx),
+            LauncherKind::Plasma => self.draw_plasma(ctx),
             LauncherKind::Launchpad => self.draw_launchpad(ctx),
         };
         // one fade for the whole launcher: glass, fills, glyphs and text all follow the open animation
@@ -754,23 +797,48 @@ impl Launcher {
         }
     }
 
+    /// Top left corner of a start menu `w` x `h` with `gap` to its bar: it opens away from the bar, where the start
+    /// button is (or centred, as asked); on a bar at the side of the screen it opens beside it.
+    fn place(&self, ctx: &DrawCtx, w: f32, h: f32, gap: f32) -> (f32, f32) {
+        let m = 8.0;
+        let [sw, sh] = ctx.screen;
+        let clamp = |v: f32, len: f32, total: f32| v.max(m).min((total - len - m).max(m));
+        match ctx.bar {
+            Some((edge @ (Edge::Left | Edge::Right), r)) => {
+                let x = if edge == Edge::Left { r[0] + r[2] + gap } else { r[0] - gap - w };
+                let y = match (self.align, ctx.anchor) {
+                    (MenuAlign::Screen, _) | (_, None) => (sh - h) / 2.0,
+                    (MenuAlign::Center, Some(a)) => a[1] + a[3] / 2.0 - h / 2.0,
+                    // the menu grows from the button towards the middle of the screen
+                    (MenuAlign::Button, Some(a)) => if a[1] + a[3] / 2.0 > sh / 2.0 { a[1] + a[3] - h } else { a[1] },
+                };
+                (clamp(x, w, sw), clamp(y, h, sh))
+            }
+            _ => {
+                let (edge, bar_y) = Self::bar_side(ctx);
+                let y = if edge == Edge::Top { bar_y + gap } else { bar_y - gap - h };
+                let x = match (self.align, ctx.anchor) {
+                    (MenuAlign::Screen, _) | (_, None) => (sw - w) / 2.0,
+                    (MenuAlign::Center, Some(a)) => a[0] + a[2] / 2.0 - w / 2.0,
+                    (MenuAlign::Button, Some(a)) => a[0],
+                };
+                (clamp(x, w, sw), y)
+            }
+        }
+    }
+
     fn draw_win11(&self, ctx: &DrawCtx) -> (Vec<Panel>, Vec<Label>) {
         const W: f32 = 640.0;
         const H: f32 = 690.0;
         let theme = ctx.theme;
         let ink: [f32; 3] = if theme.dark { [0.96, 0.97, 1.0] } else { [0.10, 0.12, 0.17] };
         let faint = if theme.dark { [1.0, 1.0, 1.0, 0.10] } else { [1.0, 1.0, 1.0, 0.62] };
-        let (screen, list) = (ctx.screen, ctx.apps);
+        let list = ctx.apps;
         let mut p = Vec::new();
         let mut l = Vec::new();
 
         let k = (0.96 + 0.04 * self.k.x).clamp(0.9, 1.04);
-        let bottom_gap = 12.0;
-        let (edge, bar_y) = Self::bar_side(ctx);
-        let (x, y) = match edge {
-            Edge::Bottom | Edge::Left | Edge::Right => ((screen[0] - W) / 2.0, bar_y - bottom_gap - H),
-            Edge::Top => ((screen[0] - W) / 2.0, bar_y + bottom_gap),
-        };
+        let (x, y) = self.place(ctx, W, H, 12.0);
         let pivot = [x + W / 2.0, y + H];
         let map = |px: f32, py: f32| [pivot[0] + (px - pivot[0]) * k, pivot[1] + (py - pivot[1]) * k];
         self.menu_rect.set([x, y, W, H]);
@@ -884,6 +952,146 @@ impl Launcher {
         hover_bg(&mut p, pw);
         let pc = map(pw[0] + 20.0, pw[1] + 20.0);
         p.push(Panel::glyph(pc[0], pc[1], 18.0 * k, "power", ink, 0.85));
+        (p, l)
+    }
+
+    // ------------------------------------------------------------ Plasma
+
+    /// The Plasma "Kickoff" look: who is logged in and a search field on top, favourites as a list (or a grid), and the
+    /// leave button at the bottom. Search results replace the favourites.
+    fn draw_plasma(&self, ctx: &DrawCtx) -> (Vec<Panel>, Vec<Label>) {
+        const W: f32 = 600.0;
+        const H: f32 = 640.0;
+        let theme = ctx.theme;
+        let ink: [f32; 3] = if theme.dark { [0.96, 0.97, 1.0] } else { [0.10, 0.12, 0.17] };
+        let faint = if theme.dark { [1.0, 1.0, 1.0, 0.10] } else { [1.0, 1.0, 1.0, 0.62] };
+        let list = ctx.apps;
+        let mut p = Vec::new();
+        let mut l = Vec::new();
+
+        let k = (0.96 + 0.04 * self.k.x).clamp(0.9, 1.04);
+        let (x, y) = self.place(ctx, W, H, 8.0);
+        let (edge, _) = Self::bar_side(ctx);
+        // it grows out of the bar it sits on
+        let pivot = [x + W / 2.0, if edge == Edge::Top { y } else { y + H }];
+        let map = |px: f32, py: f32| [pivot[0] + (px - pivot[0]) * k, pivot[1] + (py - pivot[1]) * k];
+        self.menu_rect.set([x, y, W, H]);
+
+        let c = map(x + W / 2.0, y + H / 2.0);
+        let mut panel = theme.glass.panel(c[0], c[1], W * k, H * k, 10.0 * k);
+        panel.fx[0] = panel.fx[0].max(24.0);
+        p.push(panel);
+
+        let grid_icon = |p: &mut Vec<Panel>, app: &AppEntry, cx: f32, cy: f32, size: f32| {
+            let ic = map(cx, cy);
+            push_icon(p, ctx, app, ic, size * k, size * 0.2 * k);
+        };
+        let hover_bg = |p: &mut Vec<Panel>, r: [f32; 4]| {
+            if inside(self.mouse, r) {
+                let c = map(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+                p.push(Panel::solid(c[0], c[1], r[2] * k, r[3] * k, 5.0 * k, [1.0; 3], [1.0; 3]).flat().alpha(if theme.dark { 0.12 } else { 0.55 }));
+            }
+        };
+
+        // header: the user, and the search field
+        let av = map(x + 44.0, y + 42.0);
+        p.push(Panel::solid(av[0], av[1], 44.0 * k, 44.0 * k, 22.0 * k, theme.accent, theme.accent).flat());
+        p.push(Panel::glyph(av[0], av[1], 24.0 * k, "user", [1.0; 3], 0.95));
+        let un = map(x + 74.0, y + 47.0);
+        l.push(Label::new(sysinfo::user_name(), un[0], un[1], 15.0, true, ink, 0.95, Align::Left));
+        let sf = [x + W - 24.0 - 250.0, y + 22.0, 250.0, 38.0];
+        let sc = map(sf[0] + sf[2] / 2.0, sf[1] + sf[3] / 2.0);
+        p.push(Panel::solid(sc[0], sc[1], sf[2] * k, sf[3] * k, 6.0 * k, [faint[0], faint[1], faint[2]], [faint[0], faint[1], faint[2]]).flat().alpha(faint[3]));
+        let sg = map(sf[0] + 20.0, sf[1] + sf[3] / 2.0);
+        p.push(Panel::glyph(sg[0], sg[1], 15.0 * k, "search", ink, 0.65));
+        let st = map(sf[0] + 38.0, sf[1] + sf[3] / 2.0 + 5.0);
+        if self.query.is_empty() {
+            l.push(Label::new("Search…", st[0], st[1], 13.5, false, ink, 0.55, Align::Left));
+        } else {
+            l.push(Label::new(trunc(&self.query, 24), st[0], st[1], 13.5, false, ink, 0.95, Align::Left));
+            if (self.t * 1.6).fract() < 0.6 {
+                let cx = sf[0] + 38.0 + self.query.chars().count().min(24) as f32 * 7.2 + 2.0;
+                let cc = map(cx, sf[1] + sf[3] / 2.0);
+                p.push(Panel::solid(cc[0], cc[1], 1.5 * k, 18.0 * k, 0.7, ink, ink).flat().alpha(0.8));
+            }
+        }
+        let hl = map(x + W / 2.0, y + 82.0);
+        p.push(Panel::solid(hl[0], hl[1], (W - 32.0) * k, 1.0, 0.5, ink, ink).flat().alpha(0.10));
+
+        // body
+        let body_top = y + 94.0;
+        let body_bottom = y + H - 70.0;
+        if self.query.is_empty() {
+            let h = map(x + 28.0, body_top + 8.0);
+            l.push(Label::new("Favorites", h[0], h[1], 12.5, true, theme.accent, 0.95, Align::Left));
+            let favs: Vec<usize> = if ctx.pinned.is_empty() { (0..list.len()).take(16).collect() } else { ctx.pinned.iter().copied().take(16).collect() };
+            if self.fav_grid {
+                let cols = 5usize;
+                let cw = (W - 48.0) / cols as f32;
+                for (i, &ai) in favs.iter().enumerate() {
+                    let (col, row) = ((i % cols) as f32, (i / cols) as f32);
+                    let r = [x + 24.0 + col * cw, body_top + 22.0 + row * 100.0, cw, 94.0];
+                    if r[1] + r[3] > body_bottom {
+                        break;
+                    }
+                    self.hits.borrow_mut().push((r, ai));
+                    hover_bg(&mut p, r);
+                    grid_icon(&mut p, &list[ai], r[0] + cw / 2.0, r[1] + 34.0, 44.0);
+                    let t = map(r[0] + cw / 2.0, r[1] + 76.0);
+                    l.push(Label::new(trunc(&list[ai].name, 14), t[0], t[1], 11.5, false, ink, 0.95, Align::Center));
+                }
+            } else {
+                let rows = (((body_bottom - body_top - 24.0) / 50.0) as usize).max(1);
+                for (i, &ai) in favs.iter().take(rows).enumerate() {
+                    let r = [x + 16.0, body_top + 24.0 + i as f32 * 50.0, W - 32.0, 48.0];
+                    self.hits.borrow_mut().push((r, ai));
+                    hover_bg(&mut p, r);
+                    grid_icon(&mut p, &list[ai], r[0] + 28.0, r[1] + 24.0, 32.0);
+                    let n = map(r[0] + 58.0, r[1] + 21.0);
+                    l.push(Label::new(trunc(&list[ai].name, 40), n[0], n[1], 13.5, false, ink, 0.97, Align::Left));
+                    if !list[ai].generic_name.is_empty() {
+                        let g = map(r[0] + 58.0, r[1] + 38.0);
+                        l.push(Label::new(trunc(&list[ai].generic_name, 48), g[0], g[1], 11.0, false, ink, 0.55, Align::Left));
+                    }
+                }
+            }
+        } else {
+            let h = map(x + 28.0, body_top + 8.0);
+            l.push(Label::new("Results", h[0], h[1], 12.5, true, theme.accent, 0.95, Align::Left));
+            if self.results.is_empty() {
+                let t = map(x + W / 2.0, body_top + 80.0);
+                l.push(Label::new("No matches", t[0], t[1], 13.0, false, ink, 0.55, Align::Center));
+            }
+            let rows = (((body_bottom - body_top - 24.0) / 50.0) as usize).max(1);
+            for (row, &ai) in self.results.iter().take(rows).enumerate() {
+                let r = [x + 16.0, body_top + 24.0 + row as f32 * 50.0, W - 32.0, 48.0];
+                self.hits.borrow_mut().push((r, ai));
+                if row == self.sel {
+                    let c = map(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+                    p.push(Panel::solid(c[0], c[1], r[2] * k, r[3] * k, 5.0 * k, theme.accent, theme.accent).flat().alpha(0.22));
+                } else {
+                    hover_bg(&mut p, r);
+                }
+                grid_icon(&mut p, &list[ai], r[0] + 28.0, r[1] + 24.0, 32.0);
+                let n = map(r[0] + 58.0, r[1] + 21.0);
+                l.push(Label::new(trunc(&list[ai].name, 40), n[0], n[1], 13.5, false, ink, 0.97, Align::Left));
+                let sub = if list[ai].generic_name.is_empty() { "Application".to_string() } else { list[ai].generic_name.clone() };
+                let g = map(r[0] + 58.0, r[1] + 38.0);
+                l.push(Label::new(trunc(&sub, 48), g[0], g[1], 11.0, false, ink, 0.55, Align::Left));
+            }
+        }
+
+        // footer: leave
+        let fy = y + H - 62.0;
+        let fl = map(x + W / 2.0, fy);
+        p.push(Panel::solid(fl[0], fl[1], (W - 32.0) * k, 1.0, 0.5, ink, ink).flat().alpha(0.10));
+        let pw = [x + W - 24.0 - 96.0, fy + 10.0, 96.0, 40.0];
+        self.power_rect.set(pw);
+        hover_bg(&mut p, pw);
+        let pc = map(pw[0] + 22.0, pw[1] + 20.0);
+        p.push(Panel::glyph(pc[0], pc[1], 17.0 * k, "power", ink, 0.85));
+        let pt = map(pw[0] + 40.0, pw[1] + 25.0);
+        l.push(Label::new("Leave", pt[0], pt[1], 13.0, false, ink, 0.9, Align::Left));
         (p, l)
     }
 
@@ -1136,12 +1344,7 @@ impl Launcher {
         let mut p = Vec::new();
         let mut l = Vec::new();
         let k = (0.96 + 0.04 * self.k.x).clamp(0.9, 1.04);
-        let x = 4.0;
-        let (edge, bar_y) = Self::bar_side(ctx);
-        let y = match edge {
-            Edge::Bottom | Edge::Left | Edge::Right => bar_y - 2.0 - H,
-            Edge::Top => bar_y + 2.0,
-        };
+        let (x, y) = self.place(ctx, W, H, 2.0);
         let pivot = [x, y + H];
         let map = |px: f32, py: f32| [pivot[0] + (px - pivot[0]) * k, pivot[1] + (py - pivot[1]) * k];
         self.menu_rect.set([x, y, W, H]);

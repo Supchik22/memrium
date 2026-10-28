@@ -1,6 +1,7 @@
 //! Headless backend: the whole shell drawn offscreen, no window and no display needed. For screenshots in tests
 //! (`--headless --shot out.png --after-ms 3000`), also when the desktop the nested window would need is not
-//! on screen. Size: `MEMRIUM_HEADLESS_SIZE=1600x900`, scale: `MEMRIUM_HEADLESS_SCALE=1`.
+//! on screen. Size: `MEMRIUM_HEADLESS_SIZE=1600x900`, scale: `MEMRIUM_HEADLESS_SCALE=1`, `MEMRIUM_GPU=low|high`: the
+//! integrated GPU (as the session picks it) or the discrete one.
 
 use crate::nested::{apply_test_hooks, capture};
 use crate::state::{ClientState, State};
@@ -16,7 +17,7 @@ pub fn run(mut args: Args) {
     let (w, h) = ((size.0 as f32 * scale) as u32, (size.1 as f32 * scale) as u32);
 
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).expect("no GPU adapter");
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: match std::env::var("MEMRIUM_GPU").as_deref() { Ok("low") => wgpu::PowerPreference::LowPower, Ok("high") => wgpu::PowerPreference::HighPerformance, _ => wgpu::PowerPreference::None }, ..Default::default() })).expect("no GPU adapter");
     eprintln!("adapter: {}", adapter.get_info().name);
     let (device, queue) = memrium_de::renderer::create_device(&adapter, &wgpu::DeviceDescriptor { required_features: if std::env::var_os("MEMRIUM_BENCH").is_some() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() }, ..Default::default() }).expect("GPU device");
     let format = wgpu::TextureFormat::Bgra8Unorm;
@@ -35,7 +36,8 @@ pub fn run(mut args: Args) {
     state.socket = socket.clone();
     state.default_wallpaper = Some(std::path::PathBuf::from(crate::wallpaper_path(&args)));
     if let Some(id) = &args.live {
-        state.theme.wallpaper = memrium_de::theme::WallpaperSpec { kind: memrium_de::theme::WallKind::Live, path: id.clone() };
+        let kind = if memrium_de::video::is_video(std::path::Path::new(id)) { memrium_de::theme::WallKind::Video } else { memrium_de::theme::WallKind::Live };
+        state.theme.wallpaper = memrium_de::theme::WallpaperSpec { kind, path: id.clone() };
     }
     state.init_wallpaper();
     apply_test_hooks(&mut state, &mut args, &socket);
@@ -43,6 +45,7 @@ pub fn run(mut args: Args) {
     state.persistent_target = true;
     let mut calloop: calloop::EventLoop<'static, State> = calloop::EventLoop::try_new().expect("event loop");
     state.init_dmabuf();
+    state.init_syncobj(adapter.get_info().vendor);
     state.init_screencopy();
     state.start_notifications();
     state.tray.start();
@@ -74,12 +77,14 @@ pub fn run(mut args: Args) {
     let action: Option<(u128, String)> = std::env::var("MEMRIUM_TEST_ACTION").ok().map(|a| (std::env::var("MEMRIUM_TEST_ACTION_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(500), a));
     let mut action_done = false;
     // test hook: scripted pointer input, `MEMRIUM_TEST_INPUT="2000:move 520,300;2100:down;2200:move 640,300;2300:up"`
-    // (milliseconds since the start; desk N | swipe begin|dx|end | move x,y | down | up | rdown | rup | scroll dy | key enter|esc|backspace|delete|f2 | text abc)
+    // (milliseconds since the start; desk N | swipe begin|dx|end | move x,y | rel dx,dy | down | up | rdown | rup | scroll dy | key enter|esc|backspace|delete|f2 | text abc |
+    // snap file.png)
     let mut script: Vec<(u128, String)> = std::env::var("MEMRIUM_TEST_INPUT")
         .ok()
         .map(|v| v.split(';').filter_map(|step| step.trim().split_once(':').and_then(|(t, c)| Some((t.trim().parse().ok()?, c.trim().to_string())))).collect())
         .unwrap_or_default();
     script.sort_by_key(|s| s.0);
+    let mut snap: Option<String> = None;
     script.reverse();
     // test hook: MEMRIUM_BENCH=1 times every frame that is drawn (CPU and GPU) and prints the figures at the end
     let bench = std::env::var_os("MEMRIUM_BENCH").is_some();
@@ -88,9 +93,26 @@ pub fn run(mut args: Args) {
     let mut cpus: Vec<f32> = Vec::new();
     // how much of the screen each benched frame redrew (kpx)
     let mut redrawn: Vec<f32> = Vec::new();
-    let mut gpus: Vec<(f32, f32)> = Vec::new();
+    let mut gpus: Vec<(f32, f32, f32)> = Vec::new();
+    // demo recording (see record.rs): a virtual clock, one picture pair per frame
+    let mut rec = crate::record::Recorder::from_env();
+    let mut vt_ms: u128 = 0;
+    // `glide x,y,ms`: the pointer travels there smoothly (from, to, started at, takes)
+    let mut glide: Option<([f32; 2], [f32; 2], u128, u128)> = None;
+    if rec.is_some() {
+        state.allow_skip = false;
+    }
     loop {
-        while script.last().is_some_and(|(at, _)| state.start.elapsed().as_millis() >= *at) {
+        let now_ms = if rec.is_some() { vt_ms } else { state.start.elapsed().as_millis() };
+        // where a program that holds the pointer wants it (as the session does it)
+        if let Some(w) = state.warp_to.take() {
+            if state.pointer_locked() {
+                state.mouse = w;
+            } else {
+                state.pointer_motion(w[0], w[1]);
+            }
+        }
+        while script.last().is_some_and(|(at, _)| now_ms >= *at) {
             let (_, cmd) = script.pop().unwrap();
             let mut it = cmd.split_whitespace();
             match it.next() {
@@ -99,8 +121,38 @@ pub fn run(mut args: Args) {
                         state.pointer_motion(x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0));
                     }
                 }
-                Some("down") => state.pointer_button(0x110, true),
-                Some("up") => state.pointer_button(0x110, false),
+                Some("down") => {
+                    state.flush_relative();
+                    state.pointer_button(0x110, true);
+                    if let Some(r) = &mut rec {
+                        r.down = true;
+                        r.clicked = true;
+                    }
+                }
+                Some("up") => {
+                    state.pointer_button(0x110, false);
+                    if let Some(r) = &mut rec {
+                        r.down = false;
+                    }
+                }
+                // `glide 900,500,800`: move the pointer there over that many milliseconds
+                Some("glide") => {
+                    let to = it.next().and_then(|c| c.split_once(',')).map(|(x, y)| [x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0)]).unwrap_or(state.mouse);
+                    let ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(600u128).max(1);
+                    glide = Some((state.mouse, to, now_ms, ms));
+                }
+                // `focus 960,540` / `focus off`: the recording camera looks there instead of at the pointer
+                Some("focus") => {
+                    if let Some(r) = &mut rec {
+                        r.focus = it.next().and_then(|c| c.split_once(',')).map(|(x, y)| [x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0)]);
+                    }
+                }
+                // `zoom 2.2`: the recording camera holds this zoom (0 = follows the pointer by itself)
+                Some("zoom") => {
+                    if let Some(r) = &mut rec {
+                        r.zoom_override = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                    }
+                }
                 Some("rdown") => state.pointer_button(0x111, true),
                 Some("rup") => state.pointer_button(0x111, false),
                 Some("key") => {
@@ -130,11 +182,19 @@ pub fn run(mut args: Args) {
                         Some("right") => K::Right,
                         Some("up") => K::Up,
                         Some("down") => K::Down,
+                        Some("comma") => K::comma,
+                        Some("tab") => K::Tab,
+                        Some("f4") => K::F4,
+                        Some("print") => K::Print,
+                        Some(c) if c.chars().count() == 1 => K::from_char(c.chars().next().unwrap()),
                         other => {
                             eprintln!("test input: unknown key {other:?}");
                             continue;
                         }
                     };
+                    if let Some(r) = &mut rec {
+                        r.keys = Some(spec.to_string());
+                    }
                     state.test_chord(mods, sym);
                 }
                 // `text abc`: the letters one after the other (no spaces: the steps are split at spaces)
@@ -169,31 +229,49 @@ pub fn run(mut args: Args) {
                     Some(v) => state.ws_swipe_move(v.parse().unwrap_or(0.0), 0.016),
                     None => {}
                 },
+                // `evdev 99 down|up`: a real key event by its evdev code (99 is Print), for keys that act on release or on holding
+                Some("evdev") => {
+                    let code = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    state.key(code, it.next() == Some("down"));
+                }
                 Some("notify") => state.test_notify(it.next().unwrap_or("")),
                 Some("scroll") => state.pointer_axis(0.0, it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0)),
+                // `snap a.png`: save the screen as it is now (several pictures in one run)
+                Some("snap") => snap = it.next().map(str::to_string),
+                // `rel 3,0`: the mouse itself moved by that much (logical px), as the session hands it on
+                Some("rel") => {
+                    if let Some((dx, dy)) = it.next().and_then(|c| c.split_once(',')) {
+                        let (dx, dy): (f32, f32) = (dx.parse().unwrap_or(0.0), dy.parse().unwrap_or(0.0));
+                        state.pointer_relative(dx as f64, dy as f64);
+                        if !state.pointer_locked() {
+                            state.pointer_motion(state.mouse[0] + dx, state.mouse[1] + dy);
+                        }
+                    }
+                }
                 _ => eprintln!("test input: unknown step {cmd:?}"),
             }
         }
+        state.flush_relative();
         if let (Some(at), false) = (files_at, files_opened) {
-            if state.start.elapsed().as_millis() > at {
+            if now_ms > at {
                 state.open_shell(crate::state::Sw::Files);
                 files_opened = true;
             }
         }
         if let (Some(at), false) = (settings_at, settings_opened) {
-            if state.start.elapsed().as_millis() > at {
+            if now_ms > at {
                 state.open_shell(crate::state::Sw::Settings);
                 settings_opened = true;
             }
         }
         if let (Some(at), false) = (launcher_at, launcher_opened) {
-            if state.start.elapsed().as_millis() > at {
+            if now_ms > at {
                 state.launcher.toggle();
                 launcher_opened = true;
             }
         }
         if let (Some((at, name)), false) = (&action, action_done) {
-            if state.start.elapsed().as_millis() > *at {
+            if now_ms > *at {
                 state.bar_action(name);
                 action_done = true;
             }
@@ -204,8 +282,16 @@ pub fn run(mut args: Args) {
         }
         let _ = display.dispatch_clients(&mut state);
         let _ = display.flush_clients();
+        if let Some((from, to, t0, dur)) = glide {
+            let k = ((now_ms.saturating_sub(t0)) as f32 / dur as f32).clamp(0.0, 1.0);
+            let e = if k < 0.5 { 4.0 * k * k * k } else { 1.0 - (-2.0 * k + 2.0).powi(3) / 2.0 };
+            state.pointer_motion(from[0] + (to[0] - from[0]) * e, from[1] + (to[1] - from[1]) * e);
+            if k >= 1.0 {
+                glide = None;
+            }
+        }
         let now = Instant::now();
-        state.update((now - last).as_secs_f32());
+        state.update(rec.as_ref().map_or((now - last).as_secs_f32(), |r| r.dt()));
         last = now;
         let view = target.create_view(&Default::default());
         let t0 = Instant::now();
@@ -224,7 +310,27 @@ pub fn run(mut args: Args) {
         }
         state.send_frame_callbacks();
         let _ = display.flush_clients();
-        if state.start.elapsed().as_millis() > after {
+        if let Some(r) = &mut rec {
+            // the icon index and the programs need real time to get ready: the virtual clock starts after the warm-up
+            let warm: u128 = std::env::var("MEMRIUM_RECORD_WARMUP").ok().and_then(|v| v.parse::<f32>().ok()).map_or(0, |v| (v * 1000.0) as u128);
+            if state.start.elapsed().as_millis() < warm {
+                std::thread::sleep(Duration::from_millis(16));
+                continue;
+            }
+            let px = capture(&mut state, &target, w, h, format);
+            r.push(px, w, h, scale, state.mouse);
+            vt_ms += (1000.0 / r.fps) as u128;
+            if r.done() {
+                eprintln!("recorded {} frames", (r.secs * r.fps) as u32);
+                return;
+            }
+            continue;
+        }
+        if let Some(p) = snap.take() {
+            let px = capture(&mut state, &target, w, h, format);
+            let _ = image::save_buffer(&p, &px, w, h, image::ColorType::Rgba8);
+        }
+        if rec.is_none() && now_ms > after {
             let px = capture(&mut state, &target, w, h, format);
             image::save_buffer(&path, &px, w, h, image::ColorType::Rgba8).unwrap();
             eprintln!("saved {path} ({} windows)", state.wins.len());
@@ -235,7 +341,7 @@ pub fn run(mut args: Args) {
                 let avg = t.iter().sum::<f32>() / t.len() as f32;
                 if !gpus.is_empty() {
                     let g = &gpus[warm.min(gpus.len() - 1)..];
-                    eprintln!("bench: GPU window pass avg {:.2} ms, shell pass avg {:.2} ms", g.iter().map(|x| x.0).sum::<f32>() / g.len() as f32, g.iter().map(|x| x.1).sum::<f32>() / g.len() as f32);
+                    eprintln!("bench: GPU window pass avg {:.2} ms, shell pass avg {:.2} ms, whole frame avg {:.2} ms", g.iter().map(|x| x.0).sum::<f32>() / g.len() as f32, g.iter().map(|x| x.1).sum::<f32>() / g.len() as f32, g.iter().map(|x| x.2).sum::<f32>() / g.len() as f32);
                 }
                 eprintln!("bench: CPU (building the frame) avg {:.2} ms", cpus[warm..].iter().sum::<f32>() / cpus[warm..].len() as f32);
                 eprintln!("bench: {} frames drawn, avg {:.2} ms, median {:.2}, p95 {:.2}, max {:.2}", t.len(), avg, t[t.len() / 2], t[t.len() * 95 / 100], t[t.len() - 1]);

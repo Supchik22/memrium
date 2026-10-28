@@ -47,6 +47,9 @@ pub struct TrayIcon {
     pub is_menu: bool,
     /// the icon atlas cell the compositor made for it
     pub cell: Option<u32>,
+    /// a plain white (or black) icon also has its opposite here, for a bar it would vanish on: the cell, and whether the
+    /// icon itself is the light one
+    pub inverse: Option<(u32, bool)>,
 }
 
 /// `(bus name, object path)` of an item id.
@@ -87,6 +90,47 @@ pub fn best_pixmap(list: Vec<(i32, i32, Vec<u8>)>) -> Option<Pix> {
 }
 
 /// A menu label of the `dbusmenu` kind: `_File` marks a mnemonic, `__` is a real underscore.
+/// Is this picture of one plain tone, light (`Some(true)`) or dark (`Some(false)`)? Such an icon is made for one kind of
+/// bar and is lost on the other. `rgba` is straight RGBA.
+pub fn plain_tone(rgba: &[u8]) -> Option<bool> {
+    let (mut weight, mut lum, mut chroma) = (0.0f32, 0.0f32, 0.0f32);
+    for p in rgba.chunks_exact(4) {
+        let a = p[3] as f32 / 255.0;
+        if a < 0.1 {
+            continue;
+        }
+        let (r, g, b) = (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0);
+        lum += (0.299 * r + 0.587 * g + 0.114 * b) * a;
+        chroma += (r.max(g).max(b) - r.min(g).min(b)) * a;
+        weight += a;
+    }
+    if weight < 4.0 {
+        return None;
+    }
+    let (lum, chroma) = (lum / weight, chroma / weight);
+    if chroma > 0.12 {
+        return None;
+    }
+    if lum > 0.8 {
+        Some(true)
+    } else if lum < 0.2 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The picture with its colours turned over (white becomes black); transparency stays.
+pub fn inverted(rgba: &[u8]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    for p in out.chunks_exact_mut(4) {
+        p[0] = 255 - p[0];
+        p[1] = 255 - p[1];
+        p[2] = 255 - p[2];
+    }
+    out
+}
+
 pub fn clean_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut it = s.chars().peekable();
@@ -127,6 +171,19 @@ mod tests {
         // 512 is not taken when 64 will do
         let sized = |n: i32| (n, 1, vec![0u8; n as usize * 4]);
         assert_eq!(best_pixmap(vec![sized(512), sized(64), sized(16)]).unwrap().w, 64);
+    }
+
+    #[test]
+    fn a_plain_white_icon_is_known_and_turned_over() {
+        let white: Vec<u8> = (0..64).flat_map(|_| [250u8, 250, 250, 255]).collect();
+        assert_eq!(plain_tone(&white), Some(true));
+        let inv = inverted(&white);
+        assert_eq!(plain_tone(&inv), Some(false));
+        assert_eq!(&inv[..4], &[5, 5, 5, 255]);
+        let coloured: Vec<u8> = (0..64).flat_map(|_| [250u8, 40, 40, 255]).collect();
+        assert_eq!(plain_tone(&coloured), None);
+        // an empty picture says nothing
+        assert_eq!(plain_tone(&[0u8; 256]), None);
     }
 
     #[test]

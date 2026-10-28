@@ -31,7 +31,9 @@ impl State {
                     changed = true;
                 }
                 TrayEv::Update(mut icon) => {
-                    icon.cell = self.tray_cell(&icon);
+                    let (cell, inverse) = self.tray_cell(&icon);
+                    icon.cell = cell;
+                    icon.inverse = inverse;
                     // the picture is in the atlas now: not carried around any more
                     if icon.cell.is_some() {
                         icon.pixmap = None;
@@ -52,7 +54,9 @@ impl State {
             for n in 0..self.tray_items.len() {
                 if self.tray_items[n].cell.is_none() {
                     let icon = self.tray_items[n].clone();
-                    self.tray_items[n].cell = self.tray_cell(&icon);
+                    let (cell, inverse) = self.tray_cell(&icon);
+                    self.tray_items[n].cell = cell;
+                    self.tray_items[n].inverse = inverse;
                     if self.tray_items[n].cell.is_some() {
                         self.tray_items[n].pixmap = None;
                         changed = true;
@@ -67,7 +71,7 @@ impl State {
     }
 
     /// Make the atlas picture of an icon: its theme icon (or file), else the picture it sent.
-    fn tray_cell(&mut self, icon: &TrayIcon) -> Option<u32> {
+    fn tray_cell(&mut self, icon: &TrayIcon) -> (Option<u32>, Option<(u32, bool)>) {
         let key = format!("tray:{}", icon.id);
         let by_name = || -> Option<image::RgbaImage> {
             if icon.icon_name.is_empty() {
@@ -89,8 +93,14 @@ impl State {
             }
             self.icons.get()?.load(&icon.icon_name, 128)
         };
-        let img = by_name().or_else(|| icon.pixmap.as_ref().and_then(|p| image::RgbaImage::from_raw(p.w, p.h, p.rgba.clone())))?;
-        self.renderer.set_image_cell(&key, &img)
+        let Some(img) = by_name().or_else(|| icon.pixmap.as_ref().and_then(|p| image::RgbaImage::from_raw(p.w, p.h, p.rgba.clone()))) else { return (None, None) };
+        let cell = self.renderer.set_image_cell(&key, &img);
+        // a plain white icon is lost on a light bar (and a black one on a dark bar): keep the opposite too
+        let inverse = memrium_de::tray::plain_tone(img.as_raw()).and_then(|light| {
+            let flipped = image::RgbaImage::from_raw(img.width(), img.height(), memrium_de::tray::inverted(img.as_raw()))?;
+            self.renderer.set_image_cell(&format!("{key}:inverse"), &flipped).map(|c| (c, light))
+        });
+        (cell, inverse)
     }
 
     /// A click on an icon: `button` 0 left, 1 right, 2 middle.

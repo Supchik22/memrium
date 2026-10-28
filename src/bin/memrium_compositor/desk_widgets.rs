@@ -217,6 +217,7 @@ impl State {
             let last = self.config.desk_widgets.len() - 1;
             self.config.desk_widgets.swap(i, last);
             self.desk_drag = Some((last, [p[0] - self.config.desk_widgets[last].x, p[1] - self.config.desk_widgets[last].y]));
+            self.desk_drag_from = [self.config.desk_widgets[last].x, self.config.desk_widgets[last].y];
         } else {
             return false;
         }
@@ -230,6 +231,12 @@ impl State {
         let mut items = Vec::new();
         if d.kind == "glassclock" {
             let styles = deskwidgets::CLOCK_STYLES.iter().enumerate().map(|(k, name)| MenuItem::new(STYLE_BASE + k as u32, *name).checked(d.style as usize == k)).collect();
+            items.push(MenuItem::new(0, "Style").icon("sliders-horizontal").sub(styles));
+            items.push(MenuItem::new(BIGGER, "Bigger").icon("plus"));
+            items.push(MenuItem::new(SMALLER, "Smaller").icon("minus"));
+        }
+        if d.kind == "visualizer" {
+            let styles = deskwidgets::VIZ_STYLES.iter().enumerate().map(|(k, name)| MenuItem::new(STYLE_BASE + k as u32, *name).checked(d.style as usize == k)).collect();
             items.push(MenuItem::new(0, "Style").icon("sliders-horizontal").sub(styles));
             items.push(MenuItem::new(BIGGER, "Bigger").icon("plus"));
             items.push(MenuItem::new(SMALLER, "Smaller").icon("minus"));
@@ -248,15 +255,23 @@ impl State {
 
     pub fn desk_widget_motion(&mut self, p: [f32; 2]) {
         let Some((i, off)) = self.desk_drag else { return };
-        let world = self.world;
-        if let Some(d) = self.config.desk_widgets.get_mut(i) {
-            let s = deskwidgets::size(&d.kind);
-            d.x = (p[0] - off[0]).clamp(world[0], (world[2] - s[0]).max(world[0]));
-            d.y = (p[1] - off[1]).clamp(world[1], (world[3] - s[1]).max(world[1]));
+        if i >= self.config.desk_widgets.len() {
+            return;
         }
+        let m = self.keyboard.modifier_state();
+        let mode = deskwidgets::Snap::from_keys(m.ctrl, m.shift, m.alt);
+        let [_, _, w, h] = self.desk_rect(&self.config.desk_widgets[i]);
+        let others: Vec<[f32; 4]> = self.config.desk_widgets.iter().enumerate().filter(|(k, _)| *k != i).map(|(_, d)| self.desk_rect(d)).collect();
+        let (pos, guides) = deskwidgets::snap(mode, [p[0] - off[0], p[1] - off[1]], [w, h], &others, self.world, self.desk_drag_from);
+        let d = &mut self.config.desk_widgets[i];
+        d.x = pos[0];
+        d.y = pos[1];
+        self.desk_guides = guides;
+        self.desk_snap = mode;
     }
 
     pub fn desk_widget_release(&mut self) {
+        self.desk_guides.clear();
         if self.desk_drag.take().is_some() {
             self.cfg_dirty = Some(std::time::Instant::now());
         }
@@ -388,6 +403,30 @@ impl State {
         a.angle = (a.angle + a.omega * dt).rem_euclid(std::f32::consts::TAU);
     }
 
+    /// Listen to the sound while a visualizer widget is on the desktop (the wallpaper may already be listening).
+    pub fn update_visualizer(&mut self) {
+        let wanted = self.config.desk_widgets.iter().any(|d| d.kind == "visualizer");
+        if !wanted {
+            self.viz_tap = None;
+        } else if self.audio_tap.is_none() && self.viz_tap.is_none() {
+            self.viz_tap = memrium_de::audiotap::AudioTap::start();
+        } else if self.audio_tap.is_some() {
+            self.viz_tap = None;
+        }
+    }
+
+    /// The bars of the visualizer widget, 32 of them from low to high pitch (0..1).
+    fn viz_bars(&self) -> [f32; 32] {
+        let mut out = [0.0; 32];
+        if let Some(t) = self.audio_tap.as_ref().or(self.viz_tap.as_ref()) {
+            let s = t.spectrum();
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = (s.bands[2 * i] + s.bands[2 * i + 1]) / 2.0;
+            }
+        }
+        out
+    }
+
     /// Panels and labels of every desktop widget.
     pub fn desk_widget_panels(&mut self) -> (Vec<Panel>, Vec<Label>) {
         let (mut panels, mut labels) = (Vec::new(), Vec::new());
@@ -429,6 +468,7 @@ impl State {
                 }
                 continue;
             }
+            let viz = if d.kind == "visualizer" { Some(self.viz_bars()) } else { None };
             let mut p = self.theme.glass.panel(x + w / 2.0, y + h / 2.0, w, h, if windows { 10.0 } else { 24.0 }).tinted(tint);
             p.fx[0] = p.fx[0].max(24.0);
             if windows {
@@ -442,6 +482,36 @@ impl State {
             }
             let (lx, rx) = (x + 20.0, x + w - 20.0);
             match d.kind.as_str() {
+                "visualizer" => {
+                    let bars = viz.unwrap_or([0.0; 32]);
+                    let k = d.scale.clamp(0.5, 2.5);
+                    let (area_w, area_h) = (w - 40.0 * k, h - 36.0 * k);
+                    let (x0, floor) = (x + 20.0 * k, y + h - 18.0 * k);
+                    let step = area_w / 32.0;
+                    for (i, v) in bars.iter().enumerate() {
+                        let cx = x0 + step * (i as f32 + 0.5);
+                        let col = |a: f32| [accent[0] + (1.0 - accent[0]) * a, accent[1] + (1.0 - accent[1]) * a, accent[2] + (1.0 - accent[2]) * a];
+                        let bw = (step * 0.62).max(2.0);
+                        match d.style {
+                            // bars from the floor
+                            0 => {
+                                let bh = (area_h * v).max(bw);
+                                panels.push(Panel::solid(cx, floor - bh / 2.0, bw, bh, bw / 2.0, col(0.45 * v), col(0.0)).flat());
+                            }
+                            // mirrored around the middle
+                            1 => {
+                                let bh = (area_h * v).max(bw);
+                                panels.push(Panel::solid(cx, y + h / 2.0, bw, bh, bw / 2.0, col(0.45 * v), col(0.1)).flat());
+                            }
+                            // one dot per bar riding at the level, with a faint trail
+                            _ => {
+                                let dy = floor - area_h * v;
+                                panels.push(Panel::solid(cx, (dy + floor) / 2.0, bw * 0.35, (floor - dy).max(1.0), bw * 0.17, accent, accent).flat().alpha(0.25));
+                                panels.push(Panel::solid(cx, dy, bw, bw, bw / 2.0, col(0.5 * v), col(0.5 * v)).flat());
+                            }
+                        }
+                    }
+                }
                 "clock" => {
                     labels.push(Label::new(hhmm(&t, d.h24), lx, y + 70.0, 52.0, true, ink, 1.0, Align::Left));
                     if d.date {
@@ -600,6 +670,24 @@ impl State {
                 }
                 panels.push(Panel::glass(x + 14.0, y + 14.0, 22.0, 22.0, 11.0).tinted([0.30, 0.33, 0.42, 0.78]).shadow(0.25, 6.0, 2.0));
                 panels.push(Panel::glyph(x + 14.0, y + 14.0, 13.0, "minus", [1.0; 3], 1.0));
+            }
+        }
+        // while a widget is dragged: the lines it is pulled onto, and which way of pulling the keys have chosen
+        if let Some((i, _)) = self.desk_drag {
+            for g in &self.desk_guides {
+                let (cx, cy, gw, gh) = if g.vertical { (g.at, (g.a + g.b) / 2.0, 1.0, g.b - g.a) } else { ((g.a + g.b) / 2.0, g.at, g.b - g.a, 1.0) };
+                panels.push(Panel::solid(cx, cy, gw.max(1.0), gh.max(1.0), 0.5, [1.0, 0.25, 0.55], [1.0, 0.25, 0.55]).flat().alpha(0.9));
+            }
+            if let Some(d) = self.config.desk_widgets.get(i) {
+                let [x, y, w, _] = self.desk_rect(d);
+                let text = format!("{} · {}", tr(self.desk_snap.label()), match self.desk_snap {
+                    deskwidgets::Snap::Smart => "Ctrl grid · Shift line · Ctrl+Shift gap · Alt free",
+                    _ => "release the key for Align",
+                });
+                let cw = (text.chars().count() as f32 * 6.4 + 24.0).min(w.max(320.0));
+                let cy = (y - 20.0).max(self.world[1] + 14.0);
+                panels.push(self.theme.glass.panel(x + cw / 2.0, cy, cw, 24.0, 12.0).tinted([0.08, 0.09, 0.12, 0.72]));
+                labels.push(Label::new(text, x + 12.0, cy + 4.5, 11.5, true, [1.0; 3], 0.95, Align::Left));
             }
         }
         (panels, labels)

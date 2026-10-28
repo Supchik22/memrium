@@ -134,6 +134,14 @@ impl Role {
 
     /// A window that asks for one size only (its smallest and its biggest are the same): it is not resized, maximised
     /// or made fullscreen.
+    /// The program asked for fullscreen before its window was shown (the state waits in the configure we will send).
+    pub fn asked_fullscreen(&self) -> bool {
+        match self {
+            Role::Xdg(t) => t.with_pending_state(|s| s.states.contains(xdg_toplevel::State::Fullscreen)),
+            Role::X11(x) => x.is_fullscreen(),
+        }
+    }
+
     pub fn fixed_size(&self) -> bool {
         match self {
             Role::Xdg(t) => smithay::wayland::compositor::with_states(t.wl_surface(), |st| {

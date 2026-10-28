@@ -48,8 +48,10 @@ impl State {
         );
         let _ = output.create_global::<State>(dh);
         let mode = OutMode { size: (size_px.0 as i32, size_px.1 as i32).into(), refresh: 60_000 };
-        output.change_current_state(Some(mode), Some(Transform::Normal), Some(Scale::Integer(out_scale)), Some((0, 0).into()));
+        // wl_output still says the whole number (old programs draw as before); xdg-output tells the true logical size
+        output.change_current_state(Some(mode), Some(Transform::Normal), Some(Scale::Custom { advertised_integer: out_scale, fractional: scale as f64 }), Some((0, 0).into()));
         output.set_preferred(mode);
+        dh.create_global::<State, smithay::reexports::wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1, _>(3, XdgOutputGlobal);
 
         let mut seat_state = SeatState::<State>::new();
         let mut seat = seat_state.new_wl_seat(dh, "seat0");
@@ -67,7 +69,7 @@ impl State {
         // the programs follow the shell's look: leave it where they can read it (changes are written when they happen)
         memrium_de::theme::export_appearance(&theme, &config.language);
         let apps = memrium_de::apps::scan();
-        memrium_de::apps::set_icon_theme(&theme.icons.theme_name(theme.dark));
+        memrium_de::apps::set_icon_theme(&theme.icons.shell_theme_name(theme.dark));
         // icon themes are big: index them off-thread
         let icons: std::sync::Arc<memrium_de::apps::IconSlot> = Default::default();
         {
@@ -119,6 +121,7 @@ impl State {
             ghosts: Vec::new(),
             z: Vec::new(),
             stack_clock: 0,
+            shell_focus_seen: None,
             files: memrium_de::files::Files::new(config.files.clone()),
             fm: Default::default(),
             menu: Default::default(),
@@ -130,6 +133,7 @@ impl State {
             fileicons: crate::fileicons::IconCache::new(),
             desktop: memrium_de::desktop::Desktop::new(config.desktop.clone()),
             file_drag: None,
+            file_dnd: Vec::new(),
             input_dirty: false,
             presets: memrium_de::theme::available_themes(),
             walls: Vec::new(),
@@ -165,6 +169,7 @@ impl State {
             busy_wins: 0,
             preview: None,
             dock_wait: (String::new(), 0.0),
+            dock_drag: (String::new(), 0.0),
             dock_linger: 0.0,
             dock_menu: None,
             tray: crate::tray_service::TrayService::new(),
@@ -192,6 +197,11 @@ impl State {
             damage: Default::default(),
             shot_sel: None,
             shot_req: None,
+            recording: None,
+            rec_done: None,
+            shot_edit: None,
+            shot_hold: None,
+            capture_alone: false,
             capturing: false,
             shot_notice: None,
             shot_flash: 0.0,
@@ -213,6 +223,10 @@ impl State {
             notifications: crate::notify::Notifications::new(),
             flyout: None,
             card: None,
+            dbg_rel: 0,
+            dbg_lock: (false, 0),
+            warp_to: None,
+            x_focus_origin: None,
             manual_block: false,
             reveal: None,
             flyout_last_tick: std::time::Instant::now(),
@@ -224,10 +238,18 @@ impl State {
             media: None,
             album: Default::default(),
             wall_ready: false,
+            ime_popups: Vec::new(),
+            video: None,
+            audio_tap: None,
+            viz_tap: None,
+            video_first: false,
             bar_mon: std::cell::Cell::new(0),
             bar_hover_mon: 0,
             bar_menu_mon: 0,
             desk_drag: None,
+            desk_drag_from: [0.0; 2],
+            desk_guides: Vec::new(),
+            desk_snap: memrium_de::deskwidgets::Snap::Smart,
             desk_target: None,
             world: [0.0, 0.0, lw, lh],
             mons: vec![[0.0, 0.0, lw, lh]],
@@ -249,8 +271,12 @@ impl State {
             protocols: crate::protocols::Protocols::new(dh),
             export_env: false,
             screencopies: Vec::new(),
+            ext: crate::ext_capture::ExtCapture::new(dh),
             dmabuf_state: smithay::wayland::dmabuf::DmabufState::new(),
             dmabuf_global: None,
+            syncobj_state: None,
+            defer_release: false,
+            retired: Vec::new(),
             dmabuf_tex: HashMap::new(),
             dmabuf_logged: 0,
         }
@@ -276,8 +302,64 @@ impl CompositorHandler for State {
         &client.get_data::<smithay::xwayland::XWaylandClientData>().expect("unknown client type").compositor_state
     }
 
+    fn new_surface(&mut self, surface: &WlSurface) {
+        smithay::wayland::compositor::add_pre_commit_hook::<State, _>(surface, |state, _, surface| state.hold_until_drawn(surface));
+    }
+
     fn commit(&mut self, surface: &WlSurface) {
         self.on_commit(surface);
+    }
+}
+
+impl State {
+    /// Keep a commit back until its buffer is drawn: the explicit-sync acquire point when the client gives one (Xwayland
+    /// with the NVIDIA driver), else the dmabuf's implicit fence. Otherwise a frame may sample a picture that is still being
+    /// drawn, or an old one (the view of a game jumps back and forth). Meanwhile the last finished picture stays on screen.
+    /// `MEMRIUM_SKIP=fence` turns it off.
+    fn hold_until_drawn(&mut self, surface: &WlSurface) {
+        use smithay::wayland::compositor::{with_states, BufferAssignment, SurfaceAttributes};
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("MEMRIUM_SKIP").is_ok_and(|v| v.contains("fence"))) {
+            return;
+        }
+        let Some(handle) = self.loop_handle.clone() else { return };
+        // explicit sync: the point the client says the buffer is drawn at
+        let acquire = with_states(surface, |s| s.cached_state.get::<smithay::wayland::drm_syncobj::DrmSyncobjCachedState>().pending().acquire_point.clone());
+        if let Some(point) = acquire {
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                eprintln!("syncobj: a client uses explicit sync");
+            }
+            if let Ok((blocker, source)) = point.generate_blocker() {
+                if let Some(client) = surface.client() {
+                    let watched = handle.insert_source(source, move |_, _, state: &mut State| {
+                        let dh = state.dh.clone();
+                        state.client_compositor_state(&client).blocker_cleared(state, &dh);
+                        Ok(())
+                    });
+                    if watched.is_ok() {
+                        smithay::wayland::compositor::add_blocker(surface, blocker);
+                    }
+                }
+            }
+            return;
+        }
+        let dmabuf = with_states(surface, |s| match s.cached_state.get::<SurfaceAttributes>().pending().buffer.as_ref() {
+            Some(BufferAssignment::NewBuffer(b)) => smithay::wayland::dmabuf::get_dmabuf(b).ok().cloned(),
+            _ => None,
+        });
+        let Some(dmabuf) = dmabuf else { return };
+        // already finished: nothing to wait for
+        let Ok((blocker, source)) = dmabuf.generate_blocker(smithay::reexports::calloop::Interest::READ) else { return };
+        let Some(client) = surface.client() else { return };
+        let watched = handle.insert_source(source, move |_, _, state: &mut State| {
+            let dh = state.dh.clone();
+            state.client_compositor_state(&client).blocker_cleared(state, &dh);
+            Ok(())
+        });
+        if watched.is_ok() {
+            smithay::wayland::compositor::add_blocker(surface, blocker);
+        }
     }
 }
 
@@ -355,10 +437,16 @@ impl XdgShellHandler for State {
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, _serial: Serial) {
+        if !self.pointer_holds(surface.wl_surface()) {
+            return;
+        }
         self.begin_client_move(surface.wl_surface());
     }
 
     fn resize_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, _serial: Serial, edges: xdg_toplevel::ResizeEdge) {
+        if !self.pointer_holds(surface.wl_surface()) {
+            return;
+        }
         self.begin_client_resize(surface.wl_surface(), edges);
     }
 
@@ -380,7 +468,7 @@ impl XdgShellHandler for State {
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<wl_output::WlOutput>) {
         match self.win_index(surface.wl_surface()) {
-            Some(i) => self.set_fullscreen(i, true),
+            Some(i) => self.fullscreen_now(i, true),
             None => {
                 // asked before the window is mapped: the first configure carries the state
                 surface.with_pending_state(|s| {
@@ -524,8 +612,45 @@ impl DataDeviceHandler for State {
 }
 
 impl ClientDndGrabHandler for State {}
-impl ServerDndGrabHandler for State {}
+impl ServerDndGrabHandler for State {
+    /// A program took the dropped files: it asks for them as a `text/uri-list`.
+    fn send(&mut self, mime_type: String, fd: std::os::fd::OwnedFd, _seat: Seat<Self>) {
+        use std::io::Write;
+        if mime_type != "text/uri-list" {
+            return;
+        }
+        let mut list = String::new();
+        for p in &self.file_dnd {
+            list.push_str(&crate::state::file_uri(p));
+            list.push_str("\r\n");
+        }
+        let _ = std::fs::File::from(fd).write_all(list.as_bytes());
+    }
+}
 impl OutputHandler for State {}
+
+/// The xdg-output global, shown to every client but Xwayland. A program learns the desktop's logical size from it (SDL: a
+/// fullscreen game is made the size of the screen, not 1.25 times larger). Xwayland would lay the X screen out in those
+/// logical pixels too, while our X11 windows live in device pixels (KWin tells Xwayland other numbers for the same reason).
+pub struct XdgOutputGlobal;
+
+impl smithay::reexports::wayland_server::GlobalDispatch<smithay::reexports::wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1, XdgOutputGlobal> for State {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: smithay::reexports::wayland_server::New<smithay::reexports::wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1>,
+        _global_data: &XdgOutputGlobal,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        // the requests are smithay's (`delegate_output!`)
+        data_init.init(resource, ());
+    }
+
+    fn can_view(client: Client, _global_data: &XdgOutputGlobal) -> bool {
+        client.get_data::<smithay::xwayland::XWaylandClientData>().is_none()
+    }
+}
 
 delegate_compositor!(State);
 delegate_shm!(State);
@@ -577,3 +702,10 @@ impl smithay::wayland::dmabuf::DmabufHandler for State {
     }
 }
 smithay::delegate_dmabuf!(State);
+smithay::delegate_drm_syncobj!(State);
+
+impl smithay::wayland::drm_syncobj::DrmSyncobjHandler for State {
+    fn drm_syncobj_state(&mut self) -> Option<&mut smithay::wayland::drm_syncobj::DrmSyncobjState> {
+        self.syncobj_state.as_mut()
+    }
+}

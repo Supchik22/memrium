@@ -11,6 +11,8 @@
 //! dark = true            # start it in a dark look
 //! accent = [0.2, 0.8, 0.5]
 //! font = "Inter"
+//! x11 = true             # run it through XWayland: sharp at a fractional scale for GTK 3 programs, which cannot draw for 125%
+//! gpu = true             # run it on the dedicated GPU (see gpu.rs; Settings > Power & Battery has the presets)
 //! ```
 //!
 //! The compositor applies `opacity` and `frost` to the window's picture; `dark`, `accent` and `font` go to the program
@@ -30,6 +32,10 @@ pub struct Rule {
     pub dark: Option<bool>,
     pub accent: Option<[f32; 3]>,
     pub font: Option<String>,
+    /// true: start it on the dedicated GPU of a hybrid laptop; false: keep it on the integrated one
+    pub gpu: Option<bool>,
+    /// true: start it on X11 (XWayland); false: on Wayland; none: Wayland, except the GTK 3 programs of [`gtk3_program`]
+    pub x11: Option<bool>,
 }
 
 /// What to add to the way a program is started.
@@ -63,6 +69,13 @@ impl Rule {
         }
         l
     }
+}
+
+/// Programs known to be built on GTK 3 (or older): on Wayland they draw at whole scales only, so at 125% the compositor
+/// stretches a 100% picture and it comes out soft. On X11 they are sharp (the desktop sets Xft.dpi).
+pub fn gtk3_program(names: &[&str]) -> bool {
+    const KNOWN: [&str; 6] = ["inkscape", "gimp", "audacity", "darktable", "pavucontrol", "meld"];
+    names.iter().map(|n| n.to_lowercase()).any(|n| KNOWN.iter().any(|k| n == *k || n.ends_with(&format!(".{k}")) || n.starts_with(&format!("org.{k}.")) || n.contains(&format!(".{k}."))))
 }
 
 /// Chromium, Chrome, Electron programs and the like: they take the same flags.
@@ -124,6 +137,8 @@ impl Rules {
                 dark: tab.get("dark").and_then(|v| v.as_bool()),
                 accent: tab.get("accent").and_then(floats3),
                 font: tab.get("font").and_then(|v| v.as_str()).map(String::from),
+                gpu: tab.get("gpu").and_then(|v| v.as_bool()),
+                x11: tab.get("x11").and_then(|v| v.as_bool()),
             });
         }
         Rules { rules, stamp: None }
@@ -175,6 +190,12 @@ impl Rules {
             }
             if let Some(f) = &r.font {
                 out += &format!("font = \"{}\"\n", q(f));
+            }
+            if let Some(v) = r.gpu {
+                out += &format!("gpu = {v}\n");
+            }
+            if let Some(v) = r.x11 {
+                out += &format!("x11 = {v}\n");
             }
         }
         out
@@ -253,5 +274,32 @@ mod tests {
         let c = r.find(&["prism"]).unwrap().launch("flatpak run com.google.Chrome");
         assert!(c.args.contains(&"--force-dark-mode".to_string()));
         assert!(!is_chromium("firefox") && !is_chromium("prismlauncher") && is_chromium("/usr/bin/chromium %U"));
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+
+    #[test]
+    fn gpu_rule_round_trips() {
+        let mut rules = Rules::parse("[steam]\ngpu = true\n");
+        assert_eq!(rules.find(&["steam"]).unwrap().gpu, Some(true));
+        assert_eq!(Rules::parse(&rules.to_toml()).find(&["steam"]).unwrap().gpu, Some(true));
+        rules.rules_mut()[0].gpu = Some(false);
+        assert_eq!(Rules::parse(&rules.to_toml()).find(&["steam"]).unwrap().gpu, Some(false));
+    }
+}
+
+#[cfg(test)]
+mod x11_tests {
+    use super::*;
+
+    #[test]
+    fn known_gtk3_programs() {
+        assert!(gtk3_program(&["org.inkscape.Inkscape", "", "inkscape"]));
+        assert!(gtk3_program(&["", "Gimp", ""]));
+        assert!(!gtk3_program(&["org.kde.kate", "", "kate"]));
+        assert!(!gtk3_program(&["firefox", "", "firefox"]));
     }
 }

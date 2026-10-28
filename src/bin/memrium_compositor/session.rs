@@ -538,9 +538,12 @@ pub fn run(args: Args) {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: if std::env::var("MEMRIUM_GPU").as_deref() == Ok("high") { wgpu::PowerPreference::HighPerformance } else { wgpu::PowerPreference::LowPower }, ..Default::default() })).expect("no GPU adapter");
     eprintln!("adapter: {}", adapter.get_info().name);
-    let (device, queue) = memrium_de::renderer::create_device(&adapter, &wgpu::DeviceDescriptor::default()).expect("GPU device");
+    let (device, queue) = memrium_de::renderer::create_device(&adapter, &wgpu::DeviceDescriptor { required_features: if std::env::var_os("MEMRIUM_STATS").is_some() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() }, ..Default::default() }).expect("GPU device");
     let format = wgpu::TextureFormat::Bgra8Unorm; // byte order B,G,R,A = DRM XRGB8888
-    let renderer = Renderer::new(device.clone(), queue.clone(), format, w, h, scale, crate::load_wallpaper(&args));
+    let mut renderer = Renderer::new(device.clone(), queue.clone(), format, w, h, scale, crate::load_wallpaper(&args));
+    if std::env::var_os("MEMRIUM_STATS").is_some() {
+        renderer.enable_gpu_timer();
+    }
     let (mut target, mut staging, mut padded) = make_canvas(&device, format, w, h);
     go_zero_copy(&mut screens.outs, &device, &queue);
 
@@ -554,11 +557,15 @@ pub fn run(args: Args) {
     std::env::set_var("XDG_SESSION_TYPE", "wayland");
     std::env::set_var("XDG_CURRENT_DESKTOP", "Memrium");
     let mut state = State::new(&dh, renderer, (w, h), scale);
+    state.export_cursor_theme();
     state.monitor_infos = found.iter().map(|f| f.info.clone()).collect();
     state.apply_layout(&screens.placed, scale);
     // timers and the X server's sockets (XWayland) run on a calloop that is dispatched from this loop
     let mut calloop: calloop::EventLoop<'static, State> = calloop::EventLoop::try_new().expect("event loop");
     state.init_dmabuf();
+    state.init_syncobj(adapter.get_info().vendor);
+    // our frames run on the GPU after the loop has moved on: buffers go back to clients once the frames that read them are done
+    state.defer_release = true;
     state.init_screencopy();
     state.start_notifications();
     state.tray.start();
@@ -605,8 +612,21 @@ pub fn run(args: Args) {
     // a frame already drawn and read back into `staging`, waiting for the flip in flight to finish so it can be copied into
     // the back buffer: the GPU works on the next frame while the display waits for its vblank
     let mut ahead: Option<Ahead> = None;
+    // a frame whose copy into the scan-out images the GPU is still doing (`waiter` says when it is done; the flip waits
+    // for it, input does not): the request number (None: the copy was waited for on the spot), when the copy began, and the
+    // client buffers that go back once it is done
+    let mut copying: Option<(Ahead, Option<u64>, Instant, Vec<crate::state::Held>)> = None;
+    let waiter = GpuWaiter::new(&device);
     let no_ahead = std::env::var_os("MEMRIUM_NO_AHEAD").is_some();
     let mut idle = false;
+    // frames in a row that came out the same as the one before: the longer the desktop stays still, the less often it is
+    // looked at (see `idle_wait`)
+    let mut idle_streak = 0u32;
+    // the kernel's device events: a monitor plugged in or out is heard here instead of asking every GPU every few seconds
+    // (asking wakes a sleeping dedicated GPU of a hybrid laptop); without it, the old asking every 3 s
+    let hotplug = HotplugWatch::open();
+    // a DRM event heard and not yet acted on (it waits while a flip is in flight)
+    let mut hotplug_seen = false;
     let mut swipe_last = Instant::now();
     let mut last_probe = Instant::now();
     // `MEMRIUM_STATS=1`: how long the frames take, written to the log every five seconds
@@ -622,7 +642,7 @@ pub fn run(args: Args) {
             let seat_fd = seat.borrow_mut().get_fd().map(|f| f.as_raw_fd()).ok();
             let wl_fd = display.backend().poll_fd().as_raw_fd();
             let calloop_fd = std::os::fd::AsFd::as_fd(&calloop).as_raw_fd();
-            let mut raw: Vec<Option<RawFd>> = vec![Some(wl_fd), Some(libinput.as_raw_fd()), Some(listener.as_raw_fd()), seat_fd, Some(calloop_fd)];
+            let mut raw: Vec<Option<RawFd>> = vec![Some(wl_fd), Some(libinput.as_raw_fd()), Some(listener.as_raw_fd()), seat_fd, Some(calloop_fd), hotplug.as_ref().map(|h| h.fd()), waiter.as_ref().map(|w| w.fd())];
             // one fd per DRM device, for the vblank events
             let mut seen_gpu = Vec::new();
             for o in &screens.outs {
@@ -633,13 +653,18 @@ pub fn run(args: Args) {
             }
             let mut fds: Vec<libc::pollfd> = raw.into_iter().flatten().map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
             // not waiting for a flip (or inactive) means there is a frame to draw right now
-            // idle (the last frame was identical): wake ~30 times a second for the clock and slow clients; input and
-            // client commits wake the poll at once
-            let timeout: i32 = if flip_pending || !active { 100 } else if idle { 33 } else { 0 };
+            // idle (the last frame was identical): wake now and then for the clock, the widgets and what other threads
+            // bring (less often the longer nothing changes); input and client commits wake the poll at once
+            let timeout: i32 = if flip_pending || copying.is_some() || !active { 100 } else if idle { idle_wait(idle_streak, state.screen_off).min(if state.recording.is_some() { 8 } else { i32::MAX }) } else { 0 };
             // SAFETY: `fds` is a valid array of `fds.len()` pollfd structs
             unsafe {
                 libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout);
             }
+        }
+
+        // nothing of ours in flight on the GPU (every frame so far was waited for): replaced buffers go back at once
+        if copying.is_none() && ahead.is_none() && !state.retired.is_empty() {
+            state.take_retired().into_iter().for_each(crate::state::Held::done);
         }
 
         // seat: VT switches
@@ -657,6 +682,10 @@ pub fn run(args: Args) {
                 }
                 dumb_prev = None;
                 drop_ahead(&mut ahead, &staging);
+                if let Some((.., held)) = copying.take() {
+                    let _ = device.poll(wgpu::PollType::Wait);
+                    held.into_iter().for_each(crate::state::Held::done);
+                }
                 state.invalidate();
                 idle = false;
             } else {
@@ -670,13 +699,26 @@ pub fn run(args: Args) {
 
         // input
         let _ = libinput.dispatch();
+        let mut had_input = false;
         if state.input_dirty {
             state.input_dirty = false;
+            state.export_cursor_theme();
             for d in &mut devices {
                 apply_input(d, &state.config.input, &kde_text);
             }
         }
+        if let Some(w) = state.warp_to.take() {
+            cursor = state.clamp_to_monitors(w);
+            if state.pointer_locked() {
+                // only remembered while the lock holds: a motion sent now would make Xwayland see the pointer jump and
+                // feed the game a huge delta, which it warps back again (the view spins)
+                state.mouse = cursor;
+            } else {
+                state.pointer_motion(cursor[0], cursor[1]);
+            }
+        }
         for ev in &mut libinput {
+            had_input = true;
             match ev {
                 InputEvent::Device(DeviceEvent::Added(a)) => {
                     let mut d = a.device();
@@ -704,6 +746,8 @@ pub fn run(args: Args) {
                 }
                 InputEvent::Pointer(PointerEvent::Button(b)) => {
                     use input::event::pointer::PointerEventTrait;
+                    // the aim moves first, then the shot
+                    state.flush_relative();
                     let _ = b.time();
                     state.pointer_button(input::event::pointer::PointerButtonEvent::button(&b), input::event::pointer::PointerButtonEvent::button_state(&b) == ButtonState::Pressed);
                 }
@@ -735,6 +779,7 @@ pub fn run(args: Args) {
                 _ => {}
             }
         }
+        state.flush_relative();
         if active {
             // the picture changes with the shape (and turns, for the busy ring)
             let step = if state.cursor_shape.animated() { ((state.start.elapsed().as_secs_f32() * 1.1).fract() * 14.0) as u32 } else { 0 };
@@ -804,10 +849,22 @@ pub fn run(args: Args) {
             break;
         }
 
+        // something to react to soon (a hover that waits for its tooltip): look at the desktop at the quick rate again
+        if had_input {
+            idle_streak = 0;
+        }
+
         // monitors plugged in or out, or the Displays settings applied: set the desktop up again
         let any_pending = screens.outs.iter().any(|o| o.flip_pending);
-        let probe_due = last_probe.elapsed().as_secs() >= 3;
-        if active && !any_pending && (state.displays_dirty || probe_due) {
+        let probe_due = match &hotplug {
+            Some(h) => {
+                hotplug_seen |= h.drm_changed();
+                hotplug_seen
+            }
+            None => last_probe.elapsed().as_secs() >= 3,
+        };
+        if active && !any_pending && copying.is_none() && (state.displays_dirty || probe_due) {
+            hotplug_seen = false;
             let forced = std::mem::take(&mut state.displays_dirty);
             last_probe = Instant::now();
             let now_found = scan_monitors(&gpus, forced);
@@ -876,46 +933,76 @@ pub fn run(args: Args) {
                     Some(a) => ahead = Some(a),
                     None => {
                         idle = true;
+                        idle_streak = idle_streak.saturating_add(1);
                         state.send_frame_callbacks();
                         continue;
                     }
                 }
             }
-            if !screens.outs.iter().any(|o| o.flip_pending) {
+            if !screens.outs.iter().any(|o| o.flip_pending) && copying.is_none() {
                 if let Some(a) = ahead.take() {
                     let (cw, ch) = screens.canvas;
-                    scan_out(&staging, &target, &state.renderer, &a, cw, ch, padded, &mut screens.outs, &mut stages);
-                    if stats_on {
-                        let ms = a.started.elapsed().as_secs_f32() * 1000.0;
-                        st_n += 1;
-                        st_sum += ms;
-                        st_max = st_max.max(ms);
-                        if st_since.elapsed().as_secs() >= 5 {
-                            let n = st_n.max(1) as f32;
-                            eprintln!("stats: {} frames in {:.1}s ({:.0} fps), render+copy avg {:.1} ms, max {:.1} ms | build {:.1} + gpu {:.1} + copy {:.1} ms, redrawn {:.0} kpx", st_n, st_since.elapsed().as_secs_f32(), st_n as f32 / st_since.elapsed().as_secs_f32(), st_sum / n, st_max, stages[0] / n, stages[1] / n, stages[2] / n, stages[3] / n);
-                            eprintln!("stats: {}", state.scale_report());
-                            (st_n, st_sum, st_max, st_since) = (0, 0.0, 0.0, Instant::now());
-                            stages = [0.0; 4];
+                    let began = Instant::now();
+                    let sub = scan_out(&staging, &target, &state.renderer, &a, cw, ch, padded, &mut screens.outs);
+                    // the picture must be complete before the display is told to show it: waited for off the loop, so the
+                    // input that comes meanwhile reaches the programs at once (a game no longer gets the mouse in lumps)
+                    let ask = match (sub, &waiter) {
+                        (Some(i), Some(w)) => Some(w.start(i)),
+                        (Some(i), None) => {
+                            let _ = state.renderer.device().poll(wgpu::PollType::wait_for(i));
+                            None
                         }
+                        (None, _) => None,
+                    };
+                    copying = Some((a, ask, began, state.take_retired()));
+                }
+            }
+            let copied = match &copying {
+                Some((_, Some(n), ..)) => waiter.as_ref().is_none_or(|w| w.finished(*n)),
+                Some((_, None, ..)) => true,
+                None => false,
+            };
+            if copied {
+                let (a, _, began, held) = copying.take().unwrap();
+                held.into_iter().for_each(crate::state::Held::done);
+                if stats_on {
+                    let ms = a.started.elapsed().as_secs_f32() * 1000.0;
+                    stages[0] += a.built;
+                    stages[1] += a.gpu;
+                    stages[2] += began.elapsed().as_secs_f32() * 1000.0;
+                    stages[3] += a.cur.map_or((screens.canvas.0 * screens.canvas.1) as f32, |c| (c.2 * c.3) as f32) / 1000.0;
+                    st_n += 1;
+                    st_sum += ms;
+                    st_max = st_max.max(ms);
+                    if st_since.elapsed().as_secs() >= 5 {
+                        let n = st_n.max(1) as f32;
+                        eprintln!("stats: {} frames in {:.1}s ({:.0} fps), render+copy avg {:.1} ms, max {:.1} ms | build {:.1} + gpu {:.1} + copy {:.1} ms, redrawn {:.0} kpx", st_n, st_since.elapsed().as_secs_f32(), st_n as f32 / st_since.elapsed().as_secs_f32(), st_sum / n, st_max, stages[0] / n, stages[1] / n, stages[2] / n, stages[3] / n);
+                        if let Some((win, shell, all)) = state.renderer.gpu_times() {
+                            eprintln!("stats: gpu passes of the last frame: windows {win:.1} ms, shell {shell:.1} ms, whole frame {all:.1} ms");
+                        }
+                        eprintln!("stats: {}", state.scale_report());
+                        (st_n, st_sum, st_max, st_since) = (0, 0.0, 0.0, Instant::now());
+                        stages = [0.0; 4];
                     }
-                    idle = false;
-                    for o in &mut screens.outs {
-                        let fb = o.fb(1 - o.front);
-                        match o.card.page_flip(o.crtc, fb, PageFlipFlags::EVENT, None) {
-                            Ok(()) => {
-                                o.flip_pending = true;
-                                flip_failures = 0;
+                }
+                idle = false;
+                idle_streak = 0;
+                for o in &mut screens.outs {
+                    let fb = o.fb(1 - o.front);
+                    match o.card.page_flip(o.crtc, fb, PageFlipFlags::EVENT, None) {
+                        Ok(()) => {
+                            o.flip_pending = true;
+                            flip_failures = 0;
+                        }
+                        Err(e) => {
+                            // usually we are not the DRM master (VT switch in progress): log once, retry the modeset gently
+                            if flip_failures == 0 {
+                                eprintln!("page_flip: {e} (retrying)");
                             }
-                            Err(e) => {
-                                // usually we are not the DRM master (VT switch in progress): log once, retry the modeset gently
-                                if flip_failures == 0 {
-                                    eprintln!("page_flip: {e} (retrying)");
-                                }
-                                flip_failures += 1;
-                                let _ = o.card.acquire_master_lock();
-                                let _ = o.card.set_crtc(o.crtc, Some(o.fb(o.front)), (0, 0), &[o.conn], Some(o.mode));
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                            }
+                            flip_failures += 1;
+                            let _ = o.card.acquire_master_lock();
+                            let _ = o.card.set_crtc(o.crtc, Some(o.fb(o.front)), (0, 0), &[o.conn], Some(o.mode));
+                            std::thread::sleep(std::time::Duration::from_millis(50));
                         }
                     }
                 }
@@ -924,6 +1011,127 @@ pub fn run(args: Args) {
     }
     state.restore_session_env();
     eprintln!("session ended");
+}
+
+/// How long to sleep (ms) when the desktop has not changed for `streak` frames: the quick rate first (an animation that is
+/// about to start, a tooltip that waits for the pointer to rest), then slower, never past the next whole second (a clock
+/// with seconds still ticks on time). With the screen off there is nothing to show at all.
+fn idle_wait(streak: u32, screen_off: bool) -> i32 {
+    if screen_off {
+        return 1000;
+    }
+    let wait = match streak {
+        0..=2 => 33,
+        3 => 50,
+        4 => 100,
+        _ => 200,
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let to_second = 1000 - now.subsec_millis() as i32 + 2;
+    wait.min(to_second)
+}
+
+/// The kernel's device events (a netlink socket of uevents): a DRM device changed when a monitor is plugged in or out.
+struct HotplugWatch(std::os::fd::OwnedFd);
+
+impl HotplugWatch {
+    fn open() -> Option<HotplugWatch> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: plain socket calls; the fd is owned right after it is made
+        unsafe {
+            let fd = libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, libc::NETLINK_KOBJECT_UEVENT);
+            if fd < 0 {
+                return None;
+            }
+            let owned = std::os::fd::OwnedFd::from_raw_fd(fd);
+            let mut addr: libc::sockaddr_nl = std::mem::zeroed();
+            addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+            // group 1: the kernel's own events (any user may listen)
+            addr.nl_groups = 1;
+            if libc::bind(fd, &addr as *const libc::sockaddr_nl as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t) != 0 {
+                return None;
+            }
+            Some(HotplugWatch(owned))
+        }
+    }
+
+    fn fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+
+    /// Read every event that came; true when one of them was about a DRM device.
+    fn drm_changed(&self) -> bool {
+        let mut changed = false;
+        let mut buf = [0u8; 8192];
+        loop {
+            // SAFETY: reading into a buffer of its own length from a socket we own
+            let n = unsafe { libc::recv(self.fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
+            if n <= 0 {
+                return changed;
+            }
+            // "change@/devices/.../drm/card0\0ACTION=change\0...\0SUBSYSTEM=drm\0HOTPLUG=1\0..."
+            changed |= buf[..n as usize].split(|&b| b == 0).any(|f| f == b"SUBSYSTEM=drm");
+        }
+    }
+}
+
+/// Waits for the GPU off the main loop: the loop hands over the work that must finish before a flip and goes on reading
+/// input and serving clients; the eventfd wakes it when the work is done.
+struct GpuWaiter {
+    ask: std::sync::mpsc::Sender<(u64, wgpu::SubmissionIndex)>,
+    /// the number of the last request that has finished
+    done: Arc<std::sync::atomic::AtomicU64>,
+    asked: Cell<u64>,
+    fd: OwnedFd,
+}
+
+impl GpuWaiter {
+    fn new(device: &wgpu::Device) -> Option<GpuWaiter> {
+        use std::os::fd::FromRawFd;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // SAFETY: a plain eventfd, owned right after it is made
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let wake = fd.try_clone().ok()?;
+        let done = Arc::new(AtomicU64::new(0));
+        let (ask, asks) = std::sync::mpsc::channel::<(u64, wgpu::SubmissionIndex)>();
+        let (device, finished) = (device.clone(), done.clone());
+        std::thread::Builder::new()
+            .name("gpu wait".into())
+            .spawn(move || {
+                while let Ok((n, sub)) = asks.recv() {
+                    let _ = device.poll(wgpu::PollType::wait_for(sub));
+                    finished.store(n, Ordering::Release);
+                    let one = 1u64;
+                    // SAFETY: writing 8 bytes from a u64 to an eventfd we hold
+                    unsafe { libc::write(wake.as_raw_fd(), &one as *const u64 as *const libc::c_void, 8) };
+                }
+            })
+            .ok()?;
+        Some(GpuWaiter { ask, done, asked: Cell::new(0), fd })
+    }
+
+    fn fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    /// Start waiting for this submission; the request's number for `finished`.
+    fn start(&self, sub: wgpu::SubmissionIndex) -> u64 {
+        let n = self.asked.get() + 1;
+        self.asked.set(n);
+        let _ = self.ask.send((n, sub));
+        n
+    }
+
+    fn finished(&self, n: u64) -> bool {
+        let mut buf = 0u64;
+        // SAFETY: reading 8 bytes into a u64 from a non-blocking eventfd we own (clears its count)
+        unsafe { libc::read(self.fd(), &mut buf as *mut u64 as *mut libc::c_void, 8) };
+        self.done.load(std::sync::atomic::Ordering::Acquire) >= n
+    }
 }
 
 /// Switch the display on or off through the connector's DPMS property (what `xset dpms force off` does).
@@ -998,9 +1206,9 @@ fn render_ahead(state: &mut State, target: &wgpu::Texture, staging: &wgpu::Buffe
     Some(Ahead { cur, need, started: t_start, mapped: readback, built: (t_built - t_start).as_secs_f32() * 1000.0, gpu: (t_gpu - t_built).as_secs_f32() * 1000.0 })
 }
 
-/// Give every monitor its part of the frame in its back buffer (which the last flip has freed).
-fn scan_out(staging: &wgpu::Buffer, target: &wgpu::Texture, renderer: &Renderer, a: &Ahead, w: u32, h: u32, padded: usize, outs: &mut [Output], stages: &mut [f32; 4]) {
-    let t_copy = Instant::now();
+/// Give every monitor its part of the frame in its back buffer (which the last flip has freed). Returns the GPU's part
+/// of the work when there is one (copies into scan-out images): the frame may be shown once it has finished.
+fn scan_out(staging: &wgpu::Buffer, target: &wgpu::Texture, renderer: &Renderer, a: &Ahead, w: u32, h: u32, padded: usize, outs: &mut [Output]) -> Option<wgpu::SubmissionIndex> {
     let (nx, ny, nw, nh) = a.need.unwrap_or((0, 0, w, h));
     let mut enc = renderer.device().create_command_encoder(&Default::default());
     let mut gpu_copies = false;
@@ -1049,13 +1257,22 @@ fn scan_out(staging: &wgpu::Buffer, target: &wgpu::Texture, renderer: &Renderer,
     if a.mapped {
         staging.unmap();
     }
-    if gpu_copies {
-        renderer.queue().submit([enc.finish()]);
-        // the picture must be complete before the display is told to show it
-        let _ = renderer.device().poll(wgpu::PollType::Wait);
+    gpu_copies.then(|| renderer.queue().submit([enc.finish()]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::idle_wait;
+
+    #[test]
+    fn a_still_desktop_is_looked_at_less_often_but_never_past_the_next_second() {
+        // the quick rate first, so that what is about to move moves at once
+        assert!(idle_wait(0, false) <= 33);
+        // then slower; never more than a second (a clock with seconds), and a second at most with the screen off
+        for streak in 0..50 {
+            let w = idle_wait(streak, false);
+            assert!((0..=200).contains(&w), "{streak}: {w}");
+        }
+        assert_eq!(idle_wait(0, true), 1000);
     }
-    stages[0] += a.built;
-    stages[1] += a.gpu;
-    stages[2] += t_copy.elapsed().as_secs_f32() * 1000.0;
-    stages[3] += a.cur.map_or((w * h) as f32, |c| (c.2 * c.3) as f32) / 1000.0;
 }

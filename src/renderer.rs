@@ -391,6 +391,37 @@ struct Header {
     genie: [f32; 4],
 }
 
+/// Spectrum bands handed to live wallpapers, plus four levels (overall, bass, mids, treble).
+pub const AUDIO_BANDS: usize = 64;
+const AUDIO_BYTES: u64 = ((AUDIO_BANDS + 4) * 4) as u64;
+
+/// WGSL every live wallpaper can use: `lw_band(x)` is the loudness (0..1) at x (0 = lowest pitch, 1 = highest), `lw_level(i)`
+/// is 0 overall, 1 bass, 2 mids, 3 treble. Silence reads as zeros.
+const AUDIO_WGSL: &str = r#"
+struct LwAudio { b: array<vec4<f32>, 16>, lvl: vec4<f32> };
+@group(1) @binding(0) var<uniform> lw_audio: LwAudio;
+fn lw_bin(i: i32) -> f32 {
+    let k = clamp(i, 0, 63);
+    let v = lw_audio.b[k / 4];
+    let r = k % 4;
+    if (r == 0) { return v.x; }
+    if (r == 1) { return v.y; }
+    if (r == 2) { return v.z; }
+    return v.w;
+}
+fn lw_band(x: f32) -> f32 {
+    let f = clamp(x, 0.0, 1.0) * 63.0;
+    let i = i32(floor(f));
+    return mix(lw_bin(i), lw_bin(i + 1), fract(f));
+}
+fn lw_level(i: i32) -> f32 {
+    if (i == 0) { return lw_audio.lvl.x; }
+    if (i == 1) { return lw_audio.lvl.y; }
+    if (i == 2) { return lw_audio.lvl.z; }
+    return lw_audio.lvl.w;
+}
+"#;
+
 /// One uniform "slot" per draw: slot 0 = wallpaper bake, 1 = shell, 2.. = window items (dynamic offsets).
 const SLOTS: u64 = 128;
 /// slots 2..WINDOW_SLOTS: window items; SHELL_SLOT0.. : spatial groups of the shell; MIP_SLOT0.. : mip-chain passes
@@ -639,6 +670,8 @@ pub struct GpuTimer {
 }
 
 pub struct Renderer {
+    /// draw the windows over this flat colour instead of the wallpaper (a shot of a window with a see-through background)
+    pub solid_bg: Option<[f64; 3]>,
     /// the part of the target (device px) the last frame redrew; `None`: all of it
     last_region: Option<(u32, u32, u32, u32)>,
     gpu_timer: Option<GpuTimer>,
@@ -656,11 +689,15 @@ pub struct Renderer {
     /// the painted `Item::Layer`, and the key of the one before it (with how many frames in a row it was the same)
     layer: Option<LayerCache>,
     layer_seen: (u64, u32),
+    /// the blur pyramid of the scene was not rebuilt by the last frame (no glass on it): it holds an older picture
+    mips_stale: bool,
     p_wall: wgpu::RenderPipeline,
     p_frame: wgpu::RenderPipeline,
     /// the same without the rarely used kinds of panel (see `EXOTIC` in the shader), for draws that have none
     p_frame_lean: wgpu::RenderPipeline,
     p_glass_lean: wgpu::RenderPipeline,
+    /// the scene copied to the target, under the shell's glass
+    p_copy: wgpu::RenderPipeline,
     p_surf: wgpu::RenderPipeline,
     p_glass: wgpu::RenderPipeline,
     p_down: wgpu::RenderPipeline,
@@ -684,6 +721,9 @@ pub struct Renderer {
     atlas: wgpu::Texture,
     app_atlas: wgpu::Texture,
     app_cells: HashMap<String, u32>,
+    /// cells of the icon atlas given back (thumbnails that went off screen) and the first one never used
+    app_free: Vec<u32>,
+    app_next: u32,
     /// the icons as loaded, kept so they can be set on tiles (or taken off them) when the style changes
     app_sources: HashMap<String, image::RgbaImage>,
     icon_tile: Option<TileStyle>,
@@ -696,6 +736,14 @@ pub struct Renderer {
     layout: wgpu::PipelineLayout,
     /// live wallpaper pipeline (re-drawn every frame) when one is active
     live: Option<wgpu::RenderPipeline>,
+    /// the spectrum a live wallpaper can read (`lw_band`): uniform buffer, its group and layout
+    audio_buf: wgpu::Buffer,
+    audio_bg: wgpu::BindGroup,
+    audio_bgl: wgpu::BindGroupLayout,
+    /// the live wallpaper reads the spectrum
+    live_audio: bool,
+    /// a video wallpaper is playing: frames arrive through `set_video_frame`
+    video: bool,
     /// the theme-switch transition in progress (see `begin_reveal`)
     reveal: Option<Reveal>,
     started: std::time::Instant,
@@ -783,6 +831,7 @@ impl Renderer {
         let pipe = |entry: &str, fmt: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| pipe_x(entry, fmt, blend, true);
         let p_frame_lean = pipe_x("fs_frame", WALL_FMT, Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), false);
         let p_glass_lean = pipe_x("fs", format, None, false);
+        let p_copy = pipe_x("fs_copy", format, None, false);
         let p_wall = pipe("fs_wall", WALL_FMT, None);
         let p_frame = pipe("fs_frame", WALL_FMT, Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING));
         let p_surf = pipe("fs_surface", WALL_FMT, Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING));
@@ -846,7 +895,15 @@ impl Renderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let audio_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("live audio"),
+            entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None }],
+        });
+        let audio_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("live audio"), size: AUDIO_BYTES, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        queue.write_buffer(&audio_buf, 0, &[0u8; AUDIO_BYTES as usize]);
+        let audio_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("live audio"), layout: &audio_bgl, entries: &[wgpu::BindGroupEntry { binding: 0, resource: audio_buf.as_entire_binding() }] });
         let mut r = Self {
+            solid_bg: None,
             last_region: None,
             gpu_timer: None,
             bg_wall: Self::make_group(&device, &bgl, &ubuf, &tile_buf, &sampler, &atlas, &text_atlas, &app_atlas, &dummy.create_view(&Default::default()), &dummy.create_view(&Default::default())),
@@ -863,10 +920,12 @@ impl Renderer {
             scene,
             layer: None,
             layer_seen: (0, 0),
+            mips_stale: false,
             p_wall,
             p_frame,
             p_frame_lean,
             p_glass_lean,
+            p_copy,
             p_surf,
             p_glass,
             p_down,
@@ -882,6 +941,8 @@ impl Renderer {
             atlas,
             app_atlas,
             app_cells: HashMap::new(),
+            app_free: Vec::new(),
+            app_next: 0,
             app_sources: HashMap::new(),
             icon_tile: None,
             text_fonts: TextFonts::load(),
@@ -892,6 +953,11 @@ impl Renderer {
             format,
             layout,
             live: None,
+            audio_buf,
+            audio_bg,
+            audio_bgl,
+            live_audio: false,
+            video: false,
             reveal: None,
             started: std::time::Instant::now(),
             glass_adapt: 0.0,
@@ -993,8 +1059,8 @@ impl Renderer {
         self.last_region
     }
 
-    /// (window pass ms, shell pass ms) of the last frame submitted, once it has finished.
-    pub fn gpu_times(&self) -> Option<(f32, f32)> {
+    /// (window pass ms, shell pass ms, whole frame ms) of the last frame submitted, once it has finished.
+    pub fn gpu_times(&self) -> Option<(f32, f32, f32)> {
         let t = self.gpu_timer.as_ref()?;
         let slice = t.read.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -1002,7 +1068,7 @@ impl Renderer {
         let v: Vec<u64> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
         t.read.unmap();
         let ms = |a: u64, b: u64| (b.saturating_sub(a)) as f32 * t.period / 1e6;
-        Some((ms(v[0], v[1]), ms(v[2], v[3])))
+        Some((ms(v[0], v[1]), ms(v[2], v[3]), ms(v[4], v[5])))
     }
 
     fn mip0(tex: &wgpu::Texture) -> wgpu::TextureView {
@@ -1071,6 +1137,7 @@ impl Renderer {
 
     pub fn set_wallpaper(&mut self, img: Option<&image::RgbaImage>) {
         self.touch();
+        self.video = false;
         self.has_image = img.is_some();
         self.dummy = match img {
             Some(img) => self.device.create_texture_with_data(
@@ -1105,16 +1172,18 @@ impl Renderer {
             return Ok(());
         };
         let code = format!(
-            "{}\n{}\n{}\n@fragment\nfn fs_live(in: VOut) -> @location(0) vec4<f32> {{\n    let uv = in.px / g.res;\n    return vec4(live_wall(uv, bitcast<f32>(g.flags.y), g.res.x / g.res.y), 1.0);\n}}\n",
+            "{}\n{}\n{}\n{}\n@fragment\nfn fs_live(in: VOut) -> @location(0) vec4<f32> {{\n    let uv = in.px / g.res;\n    return vec4(live_wall(uv, bitcast<f32>(g.flags.y), g.res.x / g.res.y), 1.0);\n}}\n",
             include_str!("glass.wgsl"),
             include_str!("icons.wgsl"),
+            AUDIO_WGSL,
             src
         );
+        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("live wallpaper"), bind_group_layouts: &[&self.bgl, &self.audio_bgl], push_constant_ranges: &[] });
         self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("live wallpaper"), source: wgpu::ShaderSource::Wgsl(code.into()) });
         let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("live wallpaper"),
-            layout: Some(&self.layout),
+            layout: Some(&layout),
             vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs_live"), targets: &[Some(WALL_FMT.into())], compilation_options: Default::default() }),
             primitive: Default::default(),
@@ -1127,16 +1196,71 @@ impl Renderer {
             return Err(e.to_string());
         }
         self.live = Some(pipeline);
+        self.live_audio = src.contains("lw_band") || src.contains("lw_level");
+        self.video = false;
         Ok(())
     }
 
+    /// Redraws every frame: a live shader or a playing video.
     pub fn is_live(&self) -> bool {
-        self.live.is_some()
+        self.live.is_some() || self.video
+    }
+
+    /// The running live wallpaper reads the spectrum (the compositor then listens to the sound).
+    pub fn live_uses_audio(&self) -> bool {
+        self.live.is_some() && self.live_audio
+    }
+
+    /// New spectrum for the live wallpaper: `bands` 0..1 low to high pitch, `levels` = overall, bass, mids, treble.
+    pub fn set_audio(&mut self, bands: &[f32; AUDIO_BANDS], levels: [f32; 4]) {
+        let mut raw = [0f32; AUDIO_BANDS + 4];
+        raw[..AUDIO_BANDS].copy_from_slice(bands);
+        raw[AUDIO_BANDS..].copy_from_slice(&levels);
+        self.queue.write_buffer(&self.audio_buf, 0, bytemuck::cast_slice(&raw));
+    }
+
+    /// One frame (tightly packed RGBA, `w` x `h`) of a video wallpaper. The texture is reused while the size stays.
+    pub fn set_video_frame(&mut self, rgba: &[u8], w: u32, h: u32) {
+        if w == 0 || h == 0 || rgba.len() < (w * h * 4) as usize {
+            return;
+        }
+        self.touch();
+        if !self.video || self.dummy.width() != w || self.dummy.height() != h {
+            self.dummy = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("video wallpaper"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: WALL_FMT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.has_image = true;
+            self.video = true;
+            self.live = None;
+            self.generation += 1;
+            self.rebuild_groups();
+        }
+        self.queue.write_texture(
+            self.dummy.as_image_copy(),
+            &rgba[..(w * h * 4) as usize],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.bake_wallpaper();
+    }
+
+    /// The video wallpaper is gone (another wallpaper follows).
+    pub fn end_video(&mut self) {
+        self.video = false;
     }
 
     /// Forget every loaded application icon (after the icon style or theme changed).
     pub fn clear_app_icons(&mut self) {
         self.app_cells.clear();
+        self.app_free.clear();
+        self.app_next = 0;
         self.app_sources.clear();
         self.touch();
     }
@@ -1218,6 +1342,29 @@ impl Renderer {
         self.icon_cell(key, img, false)
     }
 
+    /// A free cell of the icon atlas: one given back, else the next never used.
+    fn take_cell(&mut self) -> Option<u32> {
+        if let Some(id) = self.app_free.pop() {
+            return Some(id);
+        }
+        (self.app_next < APP_COLS * APP_COLS).then(|| {
+            self.app_next += 1;
+            self.app_next - 1
+        })
+    }
+
+    /// Give the cell of `key` back (a thumbnail that is no longer on screen); false when it had none.
+    pub fn app_icon_free(&mut self, key: &str) -> bool {
+        match self.app_cells.remove(key) {
+            Some(id) => {
+                self.app_sources.remove(key);
+                self.app_free.push(id);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Like `app_icon_cell` for pictures that are not application icons (file icons, thumbnails): never tiled.
     pub fn image_cell(&mut self, key: &str, img: &image::RgbaImage) -> Option<u32> {
         self.icon_cell(key, img, false)
@@ -1228,10 +1375,7 @@ impl Renderer {
             return Some(c);
         }
         // (a new cell is used by panels that are new themselves, so the frame's diff sees them: no full redraw)
-        let id = self.app_cells.len() as u32;
-        if id >= APP_COLS * APP_COLS {
-            return None;
-        }
+        let id = self.take_cell()?;
         self.upload_icon_cell(id, img, application);
         if application {
             // the source is kept to bake the icon again when the tile style changes; the atlas cell is APP_CELL, so a bigger
@@ -1263,10 +1407,7 @@ impl Renderer {
         if self.app_cells.contains_key(key) {
             return true;
         }
-        let id = self.app_cells.len() as u32;
-        if id >= APP_COLS * APP_COLS {
-            return true;
-        }
+        let Some(id) = self.take_cell() else { return true };
         self.write_icon_levels(id, &baked.levels);
         self.app_sources.insert(key.to_string(), baked.source);
         self.app_cells.insert(key.to_string(), id);
@@ -1548,6 +1689,7 @@ impl Renderer {
     /// that is redone is wider than the damage by the most the glass can reach.
     pub fn render_damaged(&mut self, target: &wgpu::TextureView, items: &[Item], shell: &[Panel], damage: Option<[f32; 4]>) -> wgpu::CommandEncoder {
         let mut enc = self.device.create_command_encoder(&Default::default());
+        self.stamp(&mut enc, 4);
         const REACH: f32 = 80.0;
         // What is redone: the damage itself, and the parts of the shell's glass near it (the glass bends and blurs what
         // is up to REACH away). Kept as separate pieces that do not overlap: a video under the top bar redoes the video
@@ -1611,14 +1753,18 @@ impl Renderer {
             });
             pass.set_pipeline(live);
             pass.set_bind_group(0, &self.bg_wall, &Self::offsets(0));
+            pass.set_bind_group(1, &self.audio_bg, &[]);
             pass.draw(0..3, 0..1);
             drop(pass);
             self.gen_mips(&mut enc, true, None);
         }
 
-        // 1. wallpaper into the scene texture
+        // 1. wallpaper into the scene texture (not when one opaque window, a fullscreen game, hides all of it)
         let (pw, ph) = ((self.size[0] * self.scale) as u32, (self.size[1] * self.scale) as u32);
+        let hidden = !skip_flags().contains("occlude")
+            && items.iter().enumerate().any(|(i, it)| matches!(it, Item::Opaque(b) if i > 0 && self.inner_px(*b).is_some_and(|r| r.0 == 0 && r.1 == 0 && r.2 >= pw && r.3 >= ph)));
         match ds {
+            _ if hidden => {}
             Some(_) => {
                 for &(x, y, w, h) in &parts {
                     let origin = wgpu::Origin3d { x, y, z: 0 };
@@ -1628,19 +1774,31 @@ impl Renderer {
                     enc.copy_texture_to_texture(src, dst, wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
                 }
             }
-            None => enc.copy_texture_to_texture(self.wall.as_image_copy(), self.scene.as_image_copy(), wgpu::Extent3d { width: pw.max(1), height: ph.max(1), depth_or_array_layers: 1 }),
+            None => match self.solid_bg {
+                Some(c) => {
+                    let view = Self::mip0(&self.scene);
+                    drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("flat background"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: c[0], g: c[1], b: c[2], a: 1.0 }), store: wgpu::StoreOp::Store } })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    }));
+                }
+                None => enc.copy_texture_to_texture(self.wall.as_image_copy(), self.scene.as_image_copy(), wgpu::Extent3d { width: pw.max(1), height: ph.max(1), depth_or_array_layers: 1 }),
+            },
         }
 
         // 2. window layer: every item is one draw with its own uniform slot, blended over the scene
         let scene_view = Self::mip0(&self.scene);
         let mut draws: Vec<(bool, Option<wgpu::BindGroup>, [u32; 2], (u32, u32, u32, u32), bool)> = Vec::new();
-        let skip_win = std::env::var("MEMRIUM_SKIP").unwrap_or_default().contains("win");
+        let skip_win = skip_flags().contains("win");
         let mut slot = 2u64;
-        let skip_frames = std::env::var("MEMRIUM_SKIP").unwrap_or_default().contains("frame");
-        let skip_surf = std::env::var("MEMRIUM_SKIP").unwrap_or_default().contains("surf");
-        let skip_layer = std::env::var("MEMRIUM_SKIP").unwrap_or_default().contains("layer");
+        let skip_frames = skip_flags().contains("frame");
+        let skip_surf = skip_flags().contains("surf");
+        let skip_layer = skip_flags().contains("layer");
         // the opaque parts of windows (device px, rounded inwards) and the item each one belongs to
-        let opaque: Vec<(usize, (u32, u32, u32, u32))> = if std::env::var("MEMRIUM_SKIP").unwrap_or_default().contains("occlude") {
+        let opaque: Vec<(usize, (u32, u32, u32, u32))> = if skip_flags().contains("occlude") {
             Vec::new()
         } else {
             items.iter().enumerate().filter_map(|(i, it)| if let Item::Opaque(b) = it { self.inner_px(*b).filter(|_| i > 0).map(|r| (i - 1, r)) } else { None }).collect()
@@ -1819,12 +1977,17 @@ impl Renderer {
         // 3. the glass shell refracts the scene. The scene's blur pyramid first, then the scene is copied to the
         // target and each spatial group of shell panels is drawn inside its own scissor rect (so the per-pixel
         // panel loop only runs where panels are, not over the whole screen).
-        let skip = std::env::var("MEMRIUM_SKIP").unwrap_or_default();
-        if !skip.contains("mip") {
-            self.gen_mips(&mut enc, false, ds);
+        let skip = skip_flags();
+        let groups = if skip.contains("shell") { Vec::new() } else { cluster_panels(shell, self.size, MAX_SHELL_GROUPS) };
+        // the pyramid is only read by glass: with none on the screen (a game in front of everything) it is not built, and
+        // the first frame with glass again builds all of it
+        if !skip.contains("mip") && (!groups.is_empty() || self.reveal.is_some()) {
+            self.gen_mips(&mut enc, false, if self.mips_stale { None } else { ds });
+            self.mips_stale = false;
+        } else {
+            self.mips_stale = true;
         }
         self.write_slot(1, &[]);
-        let groups = if skip.contains("shell") { Vec::new() } else { cluster_panels(shell, self.size, MAX_SHELL_GROUPS) };
         let mut shell_draws: Vec<([u32; 2], (u32, u32, u32, u32), bool)> = Vec::new();
         for (i, (panels, bbox)) in groups.iter().enumerate() {
             let slot = SHELL_SLOT0 + i as u64;
@@ -1845,8 +2008,7 @@ impl Renderer {
                 timestamp_writes: self.gpu_timer.as_ref().map(|t| wgpu::RenderPassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(2), end_of_pass_write_index: Some(3) }),
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.p_glass);
-            // slot 1 has no panels: this draw is just the scene copy
+            pass.set_pipeline(&self.p_copy);
             pass.set_bind_group(0, &self.bg_shell, &Self::offsets(1));
             if parts.is_empty() {
                 pass.draw(0..3, 0..1);
@@ -1861,10 +2023,6 @@ impl Renderer {
                 pass.set_scissor_rect(sc.0, sc.1, sc.2, sc.3);
                 pass.draw(0..3, 0..1);
             }
-        }
-        if let Some(t) = &self.gpu_timer {
-            enc.resolve_query_set(&t.set, 0..4, &t.resolve, 0);
-            enc.copy_buffer_to_buffer(&t.resolve, 0, &t.read, 0, 32);
         }
         if let Some(r) = &self.reveal {
             let (w, h) = self.pixel_size();
@@ -1881,7 +2039,26 @@ impl Renderer {
             pass.set_bind_group(0, &r.bind, &[]);
             pass.draw(0..3, 0..1);
         }
+        self.stamp(&mut enc, 5);
+        if let Some(t) = &self.gpu_timer {
+            enc.resolve_query_set(&t.set, 0..6, &t.resolve, 0);
+            enc.copy_buffer_to_buffer(&t.resolve, 0, &t.read, 0, 48);
+        }
         enc
+    }
+
+    /// Timer: a timestamp at this point of the frame (an empty pass, as timestamps outside passes need another feature).
+    fn stamp(&self, enc: &mut wgpu::CommandEncoder, index: u32) {
+        let Some(t) = &self.gpu_timer else { return };
+        let view = Self::mip0(&self.scene);
+        let at = |i| (index == i).then_some(index);
+        drop(enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("timer"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+            depth_stencil_attachment: None,
+            timestamp_writes: Some(wgpu::RenderPassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: at(4), end_of_pass_write_index: at(5) }),
+            occlusion_query_set: None,
+        }));
     }
 
     /// Start a circular reveal: `old` is the picture to wipe away (a texture of the screen's size and format).
@@ -2080,6 +2257,12 @@ fn cluster_panels(panels: &[Panel], screen: [f32; 2], max_groups: usize) -> Vec<
 }
 
 /// Render one frame into an offscreen texture of the renderer's target format and return RGBA8 pixels.
+/// `MEMRIUM_SKIP` (a bench switch), read once: the render path asks for it every frame
+fn skip_flags() -> &'static str {
+    static SKIP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SKIP.get_or_init(|| std::env::var("MEMRIUM_SKIP").unwrap_or_default())
+}
+
 pub fn render_to_rgba(r: &mut Renderer, w: u32, h: u32, items: &[Item], shell: &[Panel]) -> Vec<u8> {
     let format = r.format;
     let tex = r.device().create_texture(&wgpu::TextureDescriptor {

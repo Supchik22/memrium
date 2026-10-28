@@ -3,7 +3,7 @@
 //! saved in the `.memicon` format, a small binary container of our own:
 //!
 //! ```text
-//!   "MEMICON4"            8 bytes   magic and format version (versions 1 to 3 are still read)
+//!   "MEMICON5"            8 bytes   magic and format version (versions 1 to 4 are still read)
 //!   flags                 1 byte    bit 0: the payload is deflated
 //!   raw length            u32 LE    size of the payload before deflating
 //!   payload               ...       the document, written field by field (see `Writer`)
@@ -13,10 +13,12 @@
 //! Numbers are little-endian, strings are a `u32` length and UTF-8 bytes, a list is a `u32` count and its items.
 
 use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression, Crc};
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const MAGIC: &[u8; 8] = b"MEMICON4";
+pub const MAGIC: &[u8; 8] = b"MEMICON5";
+const MAGIC_V4: &[u8; 8] = b"MEMICON4";
 const MAGIC_V3: &[u8; 8] = b"MEMICON3";
 const MAGIC_V2: &[u8; 8] = b"MEMICON2";
 const MAGIC_V1: &[u8; 8] = b"MEMICON1";
@@ -64,12 +66,17 @@ coded_enum!(Shape {
     Circle = 1, "Circle";
     Squircle = 2, "Squircle";
     Rounded = 3, "Rounded";
+    Super = 4, "Super";
 });
 
 coded_enum!(FillKind {
     None = 0, "None";
     Solid = 1, "Solid";
     Gradient = 2, "Gradient";
+    // what the system makes of it, as in Apple's icons: a light plate, a dark one in the dark looks
+    System = 3, "System";
+    // one colour, lighter at the top and deeper at the bottom
+    Auto = 4, "Auto";
 });
 
 /// Where a dragged node is dropped, relative to another node.
@@ -381,19 +388,109 @@ impl Default for Glass {
     }
 }
 
+/// Most blobs a gradient can have.
+pub const MAX_BLOBS: usize = 6;
+
+/// One soft spot of colour: where its middle is (as fractions of the shape's box), how far it reaches (a fraction of the
+/// box's longer side) and its colour.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Blob {
+    pub at: [f32; 2],
+    pub size: f32,
+    pub colour: [f32; 3],
+}
+
+/// A gradient made of blobs: spots of colour fading into each other over a base colour (the `a` of the gradient).
+/// `count` spots of `spots` are in use; none means a plain gradient.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Blobs {
+    pub count: u8,
+    pub spots: [Blob; MAX_BLOBS],
+}
+
+impl Default for Blobs {
+    fn default() -> Blobs {
+        Blobs { count: 0, spots: [Blob { at: [0.5, 0.5], size: 0.6, colour: [1.0; 3] }; MAX_BLOBS] }
+    }
+}
+
+impl Blobs {
+    /// Three blobs spread over the box: a start for a fresh blob gradient.
+    pub fn starter(a: [f32; 3], b: [f32; 3]) -> Blobs {
+        let mut s = Blobs::default();
+        let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, (a[2] + b[2]) / 2.0];
+        s.spots[0] = Blob { at: [0.2, 0.15], size: 0.7, colour: b };
+        s.spots[1] = Blob { at: [0.85, 0.35], size: 0.6, colour: [mid[2], mid[0], mid[1]] };
+        s.spots[2] = Blob { at: [0.4, 0.95], size: 0.65, colour: [1.0 - b[0] * 0.5, 1.0 - b[1] * 0.4, 1.0 - b[2] * 0.2] };
+        s.count = 3;
+        s
+    }
+
+    pub fn used(&self) -> &[Blob] {
+        &self.spots[..(self.count as usize).min(MAX_BLOBS)]
+    }
+
+    /// Add a blob in the emptiest looking place; false when full.
+    pub fn add(&mut self) -> bool {
+        let n = self.count as usize;
+        if n >= MAX_BLOBS {
+            return false;
+        }
+        let mut best = ([0.5, 0.5], -1.0f32);
+        for gy in 0..5 {
+            for gx in 0..5 {
+                let p = [0.1 + gx as f32 * 0.2, 0.1 + gy as f32 * 0.2];
+                let d = self.used().iter().map(|b| (b.at[0] - p[0]).hypot(b.at[1] - p[1])).fold(f32::MAX, f32::min);
+                if d > best.1 {
+                    best = (p, d);
+                }
+            }
+        }
+        let c = if n > 0 { self.spots[n - 1].colour } else { [1.0; 3] };
+        self.spots[n] = Blob { at: best.0, size: 0.55, colour: [c[1], c[2], c[0]] };
+        self.count += 1;
+        true
+    }
+
+    pub fn remove(&mut self, i: usize) {
+        let n = self.count as usize;
+        if i < n {
+            self.spots.copy_within(i + 1..n, i);
+            self.count -= 1;
+        }
+    }
+
+    /// The colour at (`x`, `y`) of the box (0 to 1) over `base`: each blob covers what is below it by a soft falloff.
+    pub fn colour_at(&self, base: [f32; 3], x: f32, y: f32) -> [f32; 3] {
+        let mut c = base;
+        for b in self.used() {
+            let d = (x - b.at[0]).hypot(y - b.at[1]) / b.size.max(0.02);
+            if d < 1.0 {
+                let t = 1.0 - d;
+                let a = t * t * (3.0 - 2.0 * t);
+                for k in 0..3 {
+                    c[k] += (b.colour[k] - c[k]) * a;
+                }
+            }
+        }
+        c
+    }
+}
+
 /// A gradient the layer is painted with: from colour `a` to `b`, along the angle (0 is from the top to the bottom, degrees,
-/// clockwise) or, when `radial`, from the middle out.
+/// clockwise) or, when `radial`, from the middle out; or, with `blobs`, spots of colour over `a`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Gradient {
     pub a: [f32; 3],
     pub b: [f32; 3],
     pub angle: f32,
     pub radial: bool,
+    pub blobs: Blobs,
 }
 
 impl Default for Gradient {
     fn default() -> Gradient {
-        Gradient { a: [1.0, 0.85, 0.3], b: [0.95, 0.35, 0.15], angle: 0.0, radial: false }
+        Gradient { a: [1.0, 0.85, 0.3], b: [0.95, 0.35, 0.15], angle: 0.0, radial: false, blobs: Blobs::default() }
     }
 }
 
@@ -495,14 +592,17 @@ pub struct IconDoc {
     pub nodes: Vec<Node>,
     /// the empty border around the icon as a fraction, room for shadows
     pub margin: f32,
-    /// the colour of the tinted looks
-    pub tint: [f32; 3],
+    /// the colour of the "tinted by icon" look, when it is set by hand (None: found from the colours of the layers)
+    pub icon_tint: Option<[f32; 3]>,
     pub next_id: u32,
 }
 
+/// What the file holds in the place of the icon's tint when there is none (files from before it was kept held this).
+const NO_ICON_TINT: [f32; 3] = [0.42, 0.34, 0.80];
+
 impl IconDoc {
     pub fn new(name: &str) -> IconDoc {
-        IconDoc { name: name.to_string(), background: Variants::new(Background::default()), nodes: Vec::new(), margin: 0.05, tint: [0.42, 0.34, 0.80], next_id: 1 }
+        IconDoc { name: name.to_string(), background: Variants::new(Background::default()), nodes: Vec::new(), margin: 0.05, icon_tint: None, next_id: 1 }
     }
 
     pub fn fresh_id(&mut self) -> u32 {
@@ -747,6 +847,15 @@ impl Writer {
         self.rgb(g.b);
         self.f32(g.angle);
         self.bool(g.radial);
+        if self.version >= 5 {
+            self.u8(g.blobs.count);
+            for b in g.blobs.used() {
+                self.f32(b.at[0]);
+                self.f32(b.at[1]);
+                self.f32(b.size);
+                self.rgb(b.colour);
+            }
+        }
     }
     fn props(&mut self, p: &Props) {
         self.bool(p.visible);
@@ -903,7 +1012,19 @@ impl<'a> Reader<'a> {
         Ok(Glass { bevel: self.f32()?, bevel_width: self.f32()?, inner_shadow: self.f32()?, glow: self.f32()?, ..d })
     }
     fn gradient(&mut self) -> Res<Gradient> {
-        Ok(Gradient { a: self.rgb()?, b: self.rgb()?, angle: self.f32()?, radial: self.bool()? })
+        let (a, b, angle, radial) = (self.rgb()?, self.rgb()?, self.f32()?, self.bool()?);
+        let mut blobs = Blobs::default();
+        if self.version >= 5 {
+            let n = self.u8()? as usize;
+            if n > MAX_BLOBS {
+                return Err("a gradient has too many blobs".into());
+            }
+            for i in 0..n {
+                blobs.spots[i] = Blob { at: [self.f32()?, self.f32()?], size: self.f32()?, colour: self.rgb()? };
+            }
+            blobs.count = n as u8;
+        }
+        Ok(Gradient { a, b, angle, radial, blobs })
     }
     fn props(&mut self) -> Res<Props> {
         Ok(Props {
@@ -1031,11 +1152,16 @@ fn pack(magic: &[u8; 8], raw: Vec<u8>) -> Vec<u8> {
 
 /// The document as the bytes of a `.memicon` file.
 pub fn encode(doc: &IconDoc) -> Vec<u8> {
-    let mut w = Writer { buf: Vec::new(), version: 4 };
+    let mut w = Writer { buf: Vec::new(), version: 5 };
     w.str(&doc.name);
     w.variants(&doc.background, |w, b| w.background(b), |w, p| w.background_patch(p));
     w.f32(doc.margin);
-    w.rgb(doc.tint);
+    // (the tint colour of the "tinted by icon" look; the placeholder of older files stands for none)
+    w.rgb(match doc.icon_tint {
+        Some(c) if c != NO_ICON_TINT => c,
+        Some(c) => [c[0] + 0.004, c[1], c[2]],
+        None => NO_ICON_TINT,
+    });
     w.u32(doc.next_id);
     w.u32(doc.nodes.len() as u32);
     for n in &doc.nodes {
@@ -1046,10 +1172,10 @@ pub fn encode(doc: &IconDoc) -> Vec<u8> {
 
 /// The document in the bytes of a `.memicon` file.
 pub fn decode(bytes: &[u8]) -> Result<IconDoc, String> {
-    if bytes.len() < 17 || (&bytes[..8] != MAGIC && &bytes[..8] != MAGIC_V3 && &bytes[..8] != MAGIC_V2 && &bytes[..8] != MAGIC_V1) {
+    if bytes.len() < 17 || (&bytes[..8] != MAGIC && &bytes[..8] != MAGIC_V4 && &bytes[..8] != MAGIC_V3 && &bytes[..8] != MAGIC_V2 && &bytes[..8] != MAGIC_V1) {
         return Err("this is not a .memicon file".into());
     }
-    let version = if &bytes[..8] == MAGIC_V1 { 1 } else if &bytes[..8] == MAGIC_V2 { 2 } else if &bytes[..8] == MAGIC_V3 { 3 } else { 4 };
+    let version = if &bytes[..8] == MAGIC_V1 { 1 } else if &bytes[..8] == MAGIC_V2 { 2 } else if &bytes[..8] == MAGIC_V3 { 3 } else if &bytes[..8] == MAGIC_V4 { 4 } else { 5 };
     let flags = bytes[8];
     let raw_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
     if raw_len > 256 << 20 {
@@ -1076,7 +1202,7 @@ pub fn decode(bytes: &[u8]) -> Result<IconDoc, String> {
     let name = r.str()?;
     let background = r.variants(|r| r.background(), |r| r.background_patch())?;
     let margin = r.f32()?;
-    let tint = r.rgb()?;
+    let icon_tint = Some(r.rgb()?).filter(|c| *c != NO_ICON_TINT);
     let next_id = r.u32()?;
     let n = r.u32()? as usize;
     let mut nodes = Vec::new();
@@ -1086,7 +1212,7 @@ pub fn decode(bytes: &[u8]) -> Result<IconDoc, String> {
     if r.at != raw.len() {
         return Err("the file has extra data at the end".into());
     }
-    Ok(IconDoc { name, background, nodes, margin, tint, next_id })
+    Ok(IconDoc { name, background, nodes, margin, icon_tint, next_id })
 }
 
 pub fn save(path: &Path, doc: &IconDoc) -> Result<(), String> {
@@ -1346,7 +1472,7 @@ mod tests {
         let mut d = IconDoc::new("grad");
         let id = d.fresh_id();
         let props = Props {
-            gradient: Some(Gradient { a: [0.1, 0.2, 0.3], b: [0.9, 0.8, 0.7], angle: 135.0, radial: true }),
+            gradient: Some(Gradient { a: [0.1, 0.2, 0.3], b: [0.9, 0.8, 0.7], angle: 135.0, radial: true, blobs: Blobs::starter([0.1, 0.2, 0.3], [0.9, 0.8, 0.7]) }),
             glass: Glass { enabled: true, bevel: 0.7, bevel_width: 0.3, inner_shadow: 0.4, glow: 0.2, ..Glass::default() },
             ..Props::default()
         };
@@ -1359,7 +1485,7 @@ mod tests {
         w.str(&d.name);
         w.variants(&d.background, |w, b| w.background(b), |w, b| w.background_patch(b));
         w.f32(d.margin);
-        w.rgb(d.tint);
+        w.rgb([0.42, 0.34, 0.80]);
         w.u32(d.next_id);
         w.u32(1);
         w.node(&d.nodes[0]);

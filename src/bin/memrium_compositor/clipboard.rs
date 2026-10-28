@@ -180,14 +180,17 @@ impl Clipboard {
     }
 
     /// Put an entry in (a copy of something already there moves it to the top); the pinned ones stay above.
-    fn add(&mut self, data: ClipData) {
+    fn add(&mut self, data: ClipData) -> u64 {
         let fresh = ClipEntry::new(self.next_id, data, crate::notify::unix_now());
+        let id;
         if let Some(i) = self.items.iter().position(|e| e.hash == fresh.hash) {
             let mut e = self.items.remove(i);
             e.at = fresh.at;
+            id = e.id;
             self.place(e);
         } else {
             self.next_id += 1;
+            id = fresh.id;
             self.place(fresh);
         }
         // the oldest of each kind that is not pinned go
@@ -202,6 +205,7 @@ impl Clipboard {
             });
         }
         self.touch();
+        id
     }
 
     /// After the pinned ones, before the others.
@@ -263,6 +267,15 @@ impl State {
             return;
         }
         self.clipboard.want = Some(mimes);
+    }
+
+    /// Make a picture (PNG bytes) the clipboard, and keep it in the history.
+    pub fn clip_set_image(&mut self, png: Vec<u8>, w: u32, h: u32) {
+        let id = self.clipboard.add(ClipData::Image { png: Arc::new(png), w, h });
+        self.clipboard.serving = Some(id);
+        self.clipboard.own_expected = true;
+        set_data_device_selection(&self.dh, &self.seat, vec!["image/png".to_string()], ());
+        self.clipboard.own_expected = false;
     }
 
     /// Somebody pastes what we offered: write the entry to them.
