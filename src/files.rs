@@ -13,6 +13,8 @@ use std::time::Instant;
 pub const WIN_W: f32 = 980.0;
 pub const WIN_H: f32 = 620.0;
 const TB: f32 = 48.0;
+/// Height of the toolbar row, which is also the window's title bar when the shell draws Files without one.
+pub const TOOLBAR_H: f32 = TB;
 const CMD: f32 = 40.0;
 const STATUS: f32 = 30.0;
 const HEADER: f32 = 28.0;
@@ -284,6 +286,13 @@ pub struct Files {
     pub wanted: Vec<Entry>,
     /// folder under a file being dragged (highlighted)
     pub drop_hover: Option<PathBuf>,
+    /// The window has no title bar of its own and its toolbar row is the title bar: the room the window buttons take
+    /// at the left and at the right of that row (set by the shell before `draw`). None = a separate title bar.
+    pub chrome: Option<[f32; 2]>,
+    /// the window's corner radius in that look (its content follows the rounded shape)
+    pub corner: f32,
+    /// the toolbar row as last drawn: its bare parts move the window (see `drag_at`)
+    bar: [f32; 4],
 }
 
 impl Default for Files {
@@ -527,6 +536,9 @@ impl Files {
             pending_convert: None,
             wanted: Vec::new(),
             drop_hover: None,
+            chrome: None,
+            corner: 0.0,
+            bar: [0.0; 4],
         }
     }
 
@@ -559,6 +571,22 @@ impl Files {
         self.open = true;
     }
 
+    /// Show a file in its folder with the file selected (a folder is just opened).
+    pub fn show(&mut self, path: &Path) {
+        if path.is_dir() {
+            return self.goto(path.to_path_buf(), true);
+        }
+        let Some(dir) = path.parent() else { return };
+        self.goto(dir.to_path_buf(), true);
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Some(i) = self.view.iter().map(|&i| &self.entries[i]).position(|e| e.path == path) {
+            // rows are 28 px high in the list; keep the file in view
+            self.scroll = (i as f32 * 28.0 - 56.0).max(0.0);
+            self.sel = vec![path.clone()];
+            self.anchor = Some(path);
+        }
+    }
+
     pub fn close(&mut self) {
         self.open = false;
         self.edit = None;
@@ -581,6 +609,12 @@ impl Files {
     }
 
     /// Is a text field taking keyboard input?
+    /// A press at `p` lands on a bare part of the toolbar row of a window without a title bar (no button or field
+    /// there): it moves the window, as the title bar would.
+    pub fn drag_at(&self, p: [f32; 2]) -> bool {
+        self.open && self.chrome.is_some() && inside(p, self.bar) && !self.hits.iter().any(|(r, _)| inside(p, *r))
+    }
+
     pub fn typing(&self) -> bool {
         self.edit.is_some() || self.path_edit.is_some() || self.filter_focus
     }
@@ -1510,7 +1544,10 @@ impl Files {
         let prefs = self.prefs.clone();
 
         // frosted background
-        let mut bg = theme.glass.panel(x + w / 2.0, y + h / 2.0, w, h, 0.0);
+        // (without a title bar the content is the whole window, so it follows the window's rounded corners)
+        let corner = if self.chrome.is_some() { self.corner } else { 0.0 };
+        let win = [x, y, w, h];
+        let mut bg = theme.glass.panel(x + w / 2.0, y + h / 2.0, w, h, corner);
         bg.fx[0] = bg.fx[0].max(18.0);
         bg.extra[0] = 0.0;
         bg.params[3] = 0.0;
@@ -1548,10 +1585,18 @@ impl Files {
         let drop_hover = self.drop_hover.clone();
 
         // ---- toolbar ------------------------------------------------------
-        let tb = [x, y, w, TB];
-        fill!([x, y + TB - 1.0, w, 1.0], 0.0, ink, 0.08);
+        // Without a title bar (the shell's unified look) the sidebar runs up to the window's top edge with the window
+        // buttons over it, as in Finder, and the toolbar row starts right of it, clear of the buttons on either side.
+        let unified = self.chrome.is_some();
+        let [lead, trail] = self.chrome.unwrap_or([0.0; 2]);
+        let side_w = if prefs.sidebar { prefs.sidebar_w } else { 0.0 };
+        let bar_x = if unified { x + side_w.max(lead) } else { x };
+        let bar_w = (x + w - trail - bar_x).max(0.0);
+        let tb = [bar_x, y, bar_w, TB];
+        self.bar = [x, y, w, TB];
+        fill!([bar_x, y + TB - 1.0, x + w - bar_x, 1.0], 0.0, ink, 0.08);
         let nav = [("arrow-left", Hit::Back, !self.back.is_empty()), ("arrow-right", Hit::Forward, !self.fwd.is_empty()), ("arrow-up", Hit::Up, self.cwd.parent().is_some()), ("refresh-cw", Hit::Refresh, true)];
-        let mut bx = x + 10.0;
+        let mut bx = bar_x + 10.0;
         for (icon, hit, enabled) in nav {
             let r = [bx, y + 8.0, 32.0, 32.0];
             if enabled && inside(mouse, r) {
@@ -1564,9 +1609,11 @@ impl Files {
             bx += 34.0;
         }
         // right side: search, view toggle, menu
-        let menu_r = [x + w - 42.0, y + 8.0, 32.0, 32.0];
+        let menu_r = [bar_x + bar_w - 42.0, y + 8.0, 32.0, 32.0];
         let view_r = [menu_r[0] - 36.0, y + 8.0, 32.0, 32.0];
-        let search_r = [view_r[0] - 214.0, y + 9.0, 206.0, 30.0];
+        // (a narrow window gives the filter less room before the path field disappears)
+        let search_w = (view_r[0] - bx - 150.0).clamp(90.0, 206.0);
+        let search_r = [view_r[0] - search_w - 8.0, y + 9.0, search_w, 30.0];
         for (r, icon, hit) in [(menu_r, "sliders-horizontal", Hit::MenuBtn), (view_r, match prefs.view { ViewMode::Icons => "layout-grid", ViewMode::Details => "list", ViewMode::Compact => "columns-2" }, Hit::ViewToggle)] {
             if inside(mouse, r) {
                 fill!(r, 8.0, ink, 0.10);
@@ -1590,7 +1637,7 @@ impl Files {
 
         // path bar
         let path_x = bx + 6.0;
-        let path_r = [path_x, y + 9.0, search_r[0] - path_x - 10.0, 30.0];
+        let path_r = [path_x, y + 9.0, (search_r[0] - path_x - 10.0).max(0.0), 30.0];
         fill!(path_r, 9.0, ink, if self.path_edit.is_some() { 0.14 } else { 0.07 });
         if let Some(t) = &self.path_edit {
             let avail = path_r[2] - 24.0;
@@ -1663,6 +1710,8 @@ impl Files {
         // ---- labelled command row (Explorer style) ----------------------------
         let mut top = y + TB;
         if prefs.toolbar_labels {
+            let x = if unified { x + side_w } else { x };
+            let w = if unified { w - side_w } else { w };
             fill!([x, top + CMD - 1.0, w, 1.0], 0.0, ink, 0.06);
             let sel_n = self.sel.len();
             let acts: [(&str, &str, u32, bool); 6] = [
@@ -1697,15 +1746,22 @@ impl Files {
         {
             let ground = if dark { [0.11, 0.11, 0.11] } else { [0.97, 0.98, 1.0] };
             let side = if prefs.sidebar { prefs.sidebar_w } else { 0.0 };
-            let parts = [[x, y, w, top - y], [x + side, top, w - side, bottom - top], [x, bottom, w, y + h - bottom]];
-            let panels: Vec<Panel> = parts.iter().filter(|r| r[2] > 0.0 && r[3] > 0.0).map(|r| Panel::solid(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, r[2], r[3], 0.0, ground, ground).flat()).collect();
+            let parts = if unified {
+                // the sidebar is glass from the top edge down
+                [[0.0; 4], [x + side, y, w - side, bottom - y], [x, bottom, w, y + h - bottom]]
+            } else {
+                [[x, y, w, top - y], [x + side, top, w - side, bottom - top], [x, bottom, w, y + h - bottom]]
+            };
+            let panels: Vec<Panel> = parts.iter().filter(|r| r[2] > 0.0 && r[3] > 0.0).map(|r| window_fill(*r, win, corner, ground, 1.0)).collect();
             p.splice(opaque_at..opaque_at, panels);
         }
         if prefs.sidebar {
             let sw = prefs.sidebar_w;
-            fill!([x, top, sw, bottom - top], 0.0, if dark { [0.0, 0.0, 0.0] } else { [0.5, 0.55, 0.65] }, if dark { 0.14 } else { 0.07 });
-            fill!([x + sw - 1.0, top, 1.0, bottom - top], 0.0, ink, 0.07);
-            let mut sy = top + 10.0;
+            // (in the unified look the column starts at the top edge, its rows under the window buttons)
+            let col = if unified { y } else { top };
+            p.push(window_fill([x, col, sw, bottom - col], win, corner, if dark { [0.0, 0.0, 0.0] } else { [0.5, 0.55, 0.65] }, if dark { 0.14 } else { 0.07 }));
+            fill!([x + sw - 1.0, col, 1.0, bottom - col], 0.0, ink, 0.07);
+            let mut sy = if unified { y + TB + 4.0 } else { top + 10.0 };
             let section = |title: &str, items: Vec<(&str, &str, PathBuf)>, sy: &mut f32, p: &mut Vec<Panel>, l: &mut Vec<Label>, hits: &mut Vec<([f32; 4], Hit)>, cwd: &Path| {
                 if prefs.sidebar_headers {
                     l.push(Label::new(title, x + 18.0, *sy + 14.0, 11.0, true, ink, 0.45, Align::Left));
@@ -1982,6 +2038,20 @@ impl Files {
 }
 
 /// Icon used for a file in other places (desktop).
+/// A fill of `rc` that is rounded (by `radius`) only at those of its corners that are corners of the window `win`, so a
+/// window's content keeps the window's rounded shape: a rounded box reaching past every side that is not on the window's
+/// edge, cut back to `rc`.
+pub fn window_fill(rc: [f32; 4], win: [f32; 4], radius: f32, color: [f32; 3], alpha: f32) -> Panel {
+    let on = |a: f32, b: f32| (a - b).abs() < 1.0;
+    let g = if radius > 0.0 { 2.0 * radius } else { 0.0 };
+    let x0 = if on(rc[0], win[0]) { rc[0] } else { rc[0] - g };
+    let y0 = if on(rc[1], win[1]) { rc[1] } else { rc[1] - g };
+    let x1 = if on(rc[0] + rc[2], win[0] + win[2]) { rc[0] + rc[2] } else { rc[0] + rc[2] + g };
+    let y1 = if on(rc[1] + rc[3], win[1] + win[3]) { rc[1] + rc[3] } else { rc[1] + rc[3] + g };
+    let p = Panel::solid((x0 + x1) / 2.0, (y0 + y1) / 2.0, x1 - x0, y1 - y0, radius, color, color).flat().alpha(alpha);
+    if g > 0.0 { p.cut_to(rc) } else { p }
+}
+
 pub fn kind_icon(k: Kind) -> &'static str {
     k.icon()
 }

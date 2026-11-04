@@ -1152,9 +1152,15 @@ impl ControlCenter {
         match self.tiles[tile].kind {
             Kind::Light => Some(self.glass.tint),
             // the glass tiles: white ink on a dark backdrop, dark ink over a bright wallpaper
-            Kind::Dark if self.style == CcStyle::Mac => Some(self.glass.tint),
+            Kind::Dark if self.style == CcStyle::Mac => Some(self.dark_tint()),
             _ => None,
         }
+    }
+
+    /// The tint of the glass tiles: a pale blue sheen by day, smoke by night (so their white ink stays readable over a
+    /// bright wallpaper; the ink is chosen against this same tint).
+    fn dark_tint(&self) -> [f32; 4] {
+        if self.dark { [0.08, 0.08, 0.10, 0.52] } else { [0.84, 0.89, 0.98, 0.34] }
     }
 
     fn is_ink(c: [f32; 3]) -> bool {
@@ -1168,9 +1174,9 @@ impl ControlCenter {
         let g = |tint: [f32; 4]| self.glass.panel(cx, cy, w, h, r).tinted(tint);
         match t.kind {
             Kind::Light => self.glass.panel(cx, cy, w, h, r).adaptive(),
-            Kind::Dark => g([0.50, 0.55, 0.66, 0.26]).adaptive(),
+            Kind::Dark => g(self.dark_tint()).adaptive(),
             Kind::Active => g([0.10, 0.40, 0.98, 0.80]),
-            Kind::Circle => g([0.30, 0.35, 0.46, 0.40]).shadow(0.0, 0.0, 0.0).adaptive(),
+            Kind::Circle => g([0.78, 0.84, 0.96, 0.38]).shadow(0.0, 0.0, 0.0).adaptive(),
             Kind::Glow => g([0.42, 0.58, 0.98, 0.60]).shadow(0.0, 0.0, 0.0),
             Kind::White => Panel::white(cx, cy, w, h, r),
             Kind::Acrylic => {

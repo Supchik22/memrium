@@ -8,6 +8,7 @@ mod exif;
 use chebrium::app::{self, App, Config, Host};
 use chebrium::draw::Align;
 use chebrium::ui::Ui;
+use chebrium::widgets;
 use memrium_de::fsops::{self, human_size, Kind};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -142,17 +143,6 @@ impl PropsApp {
     }
 }
 
-fn fit(ui: &mut Ui<'_>, text: &str, size: f32, max: f32) -> String {
-    if ui.measure_raw(text, size, false) <= max {
-        return text.to_string();
-    }
-    let mut s = text.to_string();
-    while !s.is_empty() && ui.measure_raw(&format!("{s}…"), size, false) > max {
-        s.pop();
-    }
-    format!("{s}…")
-}
-
 impl App for PropsApp {
     fn start(&mut self, waker: app::Waker) {
         self.waker = Some(waker);
@@ -184,7 +174,7 @@ impl App for PropsApp {
         let kind = fsops::kind_of(&name, self.is_dir);
         ui.fill([PAD, 18.0, 48.0, 48.0], 14.0, accent, 0.18);
         ui.glyph(PAD + 24.0, 42.0, 24.0, if self.is_dir { "folder" } else { kind.icon() }, accent, 1.0);
-        let title = fit(ui, &name, 18.0, w - PAD * 2.0 - 62.0);
+        let title = widgets::fit(ui, &name, 18.0, false, w - PAD * 2.0 - 62.0);
         ui.text(PAD + 62.0, 36.0, &title, 18.0, true, ink, 0.96, Align::Left);
         let sub = match &self.tally {
             Some(t) => {
@@ -199,13 +189,8 @@ impl App for PropsApp {
         let view = [0.0, HEAD_H, w, h - HEAD_H];
         let rows: usize = self.sections.iter().map(|(_, r)| r.len()).sum();
         let content = self.sections.len() as f32 * 44.0 + rows as f32 * ROW_H + 24.0;
-        let max = (content - view[3]).max(0.0);
-        if ui.scroll != 0.0 {
-            self.scroll += ui.scroll * 2.5;
-        }
-        self.scroll = self.scroll.clamp(0.0, max);
-        ui.push_clip(view);
-        let mut y = HEAD_H + 22.0 - self.scroll;
+        let page = widgets::scroll_area(ui, view, content, &mut self.scroll);
+        let mut y = page.y(22.0);
         for (title, rows) in &self.sections {
             ui.text(PAD, y, &title.to_uppercase(), 11.5, true, ink, 0.50, Align::Left);
             y += 12.0;
@@ -216,13 +201,13 @@ impl App for PropsApp {
             let mut ry = y + 4.0;
             for (label, value) in rows {
                 ui.text(PAD + 16.0, ry + 19.0, label, 13.0, false, ink, 0.55, Align::Left);
-                let v = fit(ui, value, 13.0, w - 2.0 * PAD - LABEL_W - 32.0);
+                let v = widgets::fit(ui, value, 13.0, false, w - 2.0 * PAD - LABEL_W - 32.0);
                 ui.text(PAD + 16.0 + LABEL_W, ry + 19.0, &v, 13.0, false, ink, 0.92, Align::Left);
                 ry += ROW_H;
             }
             y = card[1] + card[3] + 32.0;
         }
-        ui.pop_clip();
+        page.end(ui);
     }
 }
 

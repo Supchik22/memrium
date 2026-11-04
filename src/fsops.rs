@@ -496,6 +496,100 @@ pub fn open_external(path: &Path, socket: &str) {
     }
 }
 
+/// `file://` address of a path (what a `text/uri-list` line holds).
+pub fn uri_of(p: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::from("file://");
+    for &b in p.as_os_str().as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The local path of a `file://` address (percent escapes undone).
+pub fn path_of_uri(uri: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let rest = uri.trim().strip_prefix("file://")?;
+    let rest = rest.find('/').map_or("", |i| &rest[i..]);
+    let b = rest.as_bytes();
+    let (mut out, mut i) = (Vec::with_capacity(b.len()), 0);
+    while i < b.len() {
+        let hex = |c: Option<&u8>| c.and_then(|&c| (c as char).to_digit(16));
+        match (b[i], hex(b.get(i + 1)), hex(b.get(i + 2))) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+}
+
+/// The files on the system clipboard as the last change reported them: `None` until the watcher has reported once (or
+/// when there is no `wl-paste`), then `Some(files, cut)` where the list is empty if the clipboard holds something else.
+static SYSTEM_CLIP: std::sync::Mutex<Option<(Vec<PathBuf>, bool)>> = std::sync::Mutex::new(None);
+
+/// Follow the Wayland clipboard for files: one `wl-paste --watch` for the whole process, run on every change (no polling).
+/// Each change prints the file list (`x-special/gnome-copied-files` says copy or cut; a plain `text/uri-list` is a copy)
+/// and a 0x1e byte; a change to anything else prints just the byte.
+fn system_clip() -> Option<(Vec<PathBuf>, bool)> {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return;
+        }
+        std::thread::spawn(|| {
+            use std::io::Read;
+            const SCRIPT: &str = "t=$(wl-paste -l 2>/dev/null); \
+                if echo \"$t\" | grep -qx x-special/gnome-copied-files; then wl-paste -n -t x-special/gnome-copied-files; \
+                elif echo \"$t\" | grep -qx text/uri-list; then echo copy; wl-paste -n -t text/uri-list; fi; printf '\\036'";
+            let Ok(mut child) = std::process::Command::new("wl-paste").args(["--watch", "sh", "-c", SCRIPT]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn() else { return };
+            let Some(mut out) = child.stdout.take() else { return };
+            let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
+            while let Ok(n) = out.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                while let Some(end) = buf.iter().position(|&b| b == 0x1e) {
+                    let record: Vec<u8> = buf.drain(..=end).collect();
+                    let text = String::from_utf8_lossy(&record[..record.len() - 1]).into_owned();
+                    let mut lines = text.lines();
+                    let cut = text.trim_start().starts_with("cut");
+                    let first = lines.next();
+                    // the first line is the verb; a bare uri list was given the verb "copy" above
+                    let files: Vec<PathBuf> = first.into_iter().chain(lines).filter(|l| !l.starts_with('#')).filter_map(path_of_uri).collect();
+                    if let Ok(mut g) = SYSTEM_CLIP.lock() {
+                        *g = Some((files, cut));
+                    }
+                }
+            }
+        });
+    });
+    SYSTEM_CLIP.lock().ok().and_then(|g| g.clone())
+}
+
+/// Offer files to other programs on the Wayland clipboard (`text/uri-list`; wl-copy can serve only one type).
+fn offer_files(paths: &[PathBuf]) {
+    use std::io::Write;
+    let list: String = paths.iter().map(|p| uri_of(p) + "\r\n").collect();
+    if let Ok(mut c) = std::process::Command::new("wl-copy").args(["-t", "text/uri-list"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn() {
+        if let Some(mut i) = c.stdin.take() {
+            let _ = i.write_all(list.as_bytes());
+        }
+        std::thread::spawn(move || {
+            let _ = c.wait();
+        });
+    }
+}
+
 /// Clipboard + undo history shared by every file view (the file manager and the desktop).
 #[derive(Default)]
 pub struct Fm {
@@ -514,12 +608,24 @@ impl Fm {
             return;
         }
         self.note = format!("{} item{} {}", paths.len(), if paths.len() == 1 { "" } else { "s" }, if cut { "cut" } else { "copied" });
+        offer_files(&paths);
         self.clip = paths;
         self.cut = cut;
+        system_clip();
+    }
+
+    /// What a paste would bring: the files on the system clipboard once it has reported (what another program copied, or
+    /// our own copy coming back with its cut mark), else what was copied here.
+    fn pending(&self) -> (Vec<PathBuf>, bool) {
+        match system_clip() {
+            Some((files, _)) if files == self.clip => (files, self.cut),
+            Some((files, cut)) => (files, cut),
+            None => (self.clip.clone(), self.cut),
+        }
     }
 
     pub fn can_paste(&self) -> bool {
-        !self.clip.is_empty()
+        !self.pending().0.is_empty()
     }
 
     fn record(&mut self, group: Vec<Undo>) {
@@ -536,7 +642,9 @@ impl Fm {
     pub fn paste_into(&mut self, dir: &Path) -> Vec<PathBuf> {
         let mut group = Vec::new();
         let mut out = Vec::new();
-        for src in self.clip.clone() {
+        let (files, cut) = self.pending();
+        self.cut = cut;
+        for src in files {
             let r = if self.cut { move_to(&src, dir) } else { copy_to(&src, dir) };
             match r {
                 Ok(dst) => {
@@ -555,6 +663,12 @@ impl Fm {
         if self.cut {
             self.clip.clear();
             self.cut = false;
+            // the moved files are gone from where the clipboard names them
+            if let Ok(mut g) = SYSTEM_CLIP.lock() {
+                if g.is_some() {
+                    *g = Some((Vec::new(), false));
+                }
+            }
         }
         self.record(group);
         out
@@ -655,8 +769,16 @@ pub fn is_computer(p: &Path) -> bool {
     p.as_os_str() == COMPUTER
 }
 
-/// Mounted disks (real file systems only) as entries: "Name (/mount) - 120 GB free of 450 GB".
-pub fn drives() -> Vec<Entry> {
+/// A mounted disk of this machine, with how full it is.
+pub struct Mount {
+    pub label: String,
+    pub path: PathBuf,
+    pub total: u64,
+    pub free: u64,
+}
+
+/// Mounted disks (real file systems only), without the servers (asking one that has gone away would hold the caller up).
+pub fn mounts() -> Vec<Mount> {
     const REAL: [&str; 11] = ["ext4", "ext3", "ext2", "btrfs", "xfs", "vfat", "exfat", "ntfs", "ntfs3", "f2fs", "fuseblk"];
     let text = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
@@ -679,11 +801,21 @@ pub fn drives() -> Vec<Entry> {
         } else {
             Path::new(&mp).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| mp.clone())
         };
+        out.push(Mount { label, path: PathBuf::from(mp), total, free });
+    }
+    out
+}
+
+/// Mounted disks as entries: "Name (/mount) - 120 GB free of 450 GB".
+pub fn drives() -> Vec<Entry> {
+    let text = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let mut out = Vec::new();
+    for m in mounts() {
         out.push(Entry {
-            name: format!("{label} ({mp}) - {} free of {}", human_size(free), human_size(total)),
-            path: PathBuf::from(&mp),
+            name: format!("{} ({}) - {} free of {}", m.label, m.path.display(), human_size(m.free), human_size(m.total)),
+            path: m.path,
             is_dir: true,
-            size: total,
+            size: m.total,
             modified: 0,
             hidden: false,
             kind: Kind::Dir,

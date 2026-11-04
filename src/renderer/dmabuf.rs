@@ -44,6 +44,8 @@ pub struct DmaPlane {
 const WANTED: [&CStr; 4] = [khr::external_memory_fd::NAME, ext::external_memory_dma_buf::NAME, ext::image_drm_format_modifier::NAME, khr::image_format_list::NAME];
 /// extensions the ones above build on; core in Vulkan 1.1 / 1.2, but harmless to enable
 const SUPPORT: [&CStr; 4] = [khr::bind_memory2::NAME, khr::sampler_ycbcr_conversion::NAME, khr::external_memory::NAME, khr::dedicated_allocation::NAME];
+/// switched on when present, not needed for importing: a semaphore that hands out a sync file (`DoneFence`)
+const OPTIONAL: [&CStr; 2] = [khr::external_semaphore::NAME, khr::external_semaphore_fd::NAME];
 
 /// A wgpu device and queue; with the DMA-BUF import extensions when the driver has them.
 pub fn create_device(adapter: &wgpu::Adapter, desc: &wgpu::DeviceDescriptor) -> Result<(wgpu::Device, wgpu::Queue), String> {
@@ -74,7 +76,7 @@ unsafe fn vulkan_device(adapter: &wgpu::Adapter, desc: &wgpu::DeviceDescriptor) 
             }
             let features = desc.required_features;
             let mut exts = hal.required_device_extensions(features);
-            for e in WANTED.iter().chain(SUPPORT.iter()).chain([ext::physical_device_drm::NAME].iter()) {
+            for e in WANTED.iter().chain(SUPPORT.iter()).chain(OPTIONAL.iter()).chain([ext::physical_device_drm::NAME].iter()) {
                 if has(e) && !exts.contains(e) {
                     exts.push(e);
                 }

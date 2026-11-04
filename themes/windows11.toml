@@ -20,6 +20,9 @@ shadow = [0.22, 30.0, 10.0]
 decoration = "win11"
 radius = 8.0
 titlebar = 32.0
+# the shadow these looks have always had (the default follows macOS now)
+shadow = [0.42, 46.0, 22.0]
+shadow_idle = [0.22, 30.0, 12.0]
 title_align = "left"
 
 [[bars]]

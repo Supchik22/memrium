@@ -267,6 +267,35 @@ impl State {
         Some(PreviewLayout { popup, cards, fade: p.k.x.clamp(0.0, 1.0) })
     }
 
+    /// The Alt+Tab switcher: every window in the order Tab goes through them, the chosen one lit, in the middle of the screen.
+    pub fn alt_tab_layout(&self) -> Option<PreviewLayout> {
+        let (order, pos) = self.alt_tab.as_ref()?;
+        let wins: Vec<DockWin> = order
+            .iter()
+            .filter_map(|id| self.wins.iter().find(|w| w.id == *id))
+            .map(|w| DockWin { id: w.id, title: if w.title.is_empty() { w.app_id.clone() } else { w.title.clone() }, minimized: w.minimized })
+            .collect();
+        if wins.len() < 2 {
+            return None;
+        }
+        let mon = self.mons.get(self.mon_at(self.mouse)).copied().unwrap_or([0.0, 0.0, self.size[0], self.size[1]]);
+        let cols = wins.len().min(((mon[2] - 60.0 - PAD) / (CARD_W + PAD)).floor().max(1.0) as usize);
+        let rows = wins.len().div_ceil(cols);
+        let (w, h) = (cols as f32 * CARD_W + (cols as f32 + 1.0) * PAD, rows as f32 * CARD_H + (rows as f32 + 1.0) * PAD);
+        let popup = [mon[0] + (mon[2] - w) / 2.0, mon[1] + (mon[3] - h) / 2.0, w, h];
+        let cards = wins
+            .into_iter()
+            .enumerate()
+            .map(|(i, win)| {
+                let (c, r) = (i % cols, i / cols);
+                let rect = [popup[0] + PAD + c as f32 * (CARD_W + PAD), popup[1] + PAD + r as f32 * (CARD_H + PAD), CARD_W, CARD_H];
+                // no close button: the cards are only chosen with the keys
+                PreviewCard { win, rect, thumb: [rect[0] + 6.0, rect[1] + TITLE_H, rect[2] - 12.0, THUMB_H], close: [-1000.0, -1000.0, 0.0, 0.0], hover: i == *pos, hover_close: false }
+            })
+            .collect();
+        Some(PreviewLayout { popup, cards, fade: 1.0 })
+    }
+
     pub fn preview_hit(&self, p: [f32; 2]) -> bool {
         self.preview_layout().is_some_and(|l| l.fade > 0.3 && inside(p, l.popup))
     }
@@ -499,7 +528,7 @@ pub fn preview_items<'a>(
         if c.hover_close {
             panels.push(Panel::solid(qx, qy, c.close[2], c.close[3], 11.0, [0.92, 0.28, 0.28], [0.92, 0.28, 0.28]).flat().alpha(0.95));
         }
-        if c.hover || c.hover_close {
+        if c.close[2] > 0.0 && (c.hover || c.hover_close) {
             panels.push(Panel::glyph(qx, qy, 12.0, "x", ink, if c.hover_close { 1.0 } else { 0.7 }));
         }
         if c.win.id >= SHELL_FILES {

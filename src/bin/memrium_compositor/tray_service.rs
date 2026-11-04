@@ -34,6 +34,9 @@ pub struct MenuNode {
     pub icon_name: String,
     pub icon_data: Vec<u8>,
     pub children: Vec<MenuNode>,
+    /// the program says it opens a submenu (`children-display`), also while its entries are not built yet (Qt fills
+    /// "Recent files" and the like only when it is about to be shown)
+    pub submenu: bool,
 }
 
 pub enum TrayEv {
@@ -339,6 +342,7 @@ pub(crate) fn node_of((id, props, children): Layout) -> Option<MenuNode> {
         icon_data: props.get("icon-data").and_then(|v| Vec::<u8>::try_from(v.try_clone().ok()?).ok()).unwrap_or_default(),
         checked: props.get("toggle-state").and_then(|v| i32::try_from(v.try_clone().ok()?).ok()) == Some(1),
         children: children.into_iter().filter_map(|c| Layout::try_from(c).ok().and_then(node_of)).collect(),
+        submenu: get_s("children-display").as_deref() == Some("submenu"),
     })
 }
 

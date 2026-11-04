@@ -1,38 +1,149 @@
 name = "Jelly Glass"
 layout = "macos"
 dark = false
-accent = [0.04, 0.52, 1.0]
+accent = [
+    0.949999988079071,
+    0.6200000047683716,
+    0.37929999828338623,
+]
+auto_dark = false
 
 [glass]
-blur = 5.9902
-refraction = 30.5948
-bezel = 90.0
-dispersion = 0.0469
-rim = 0.5293
-rim_sharp = 0.7842
-gloss = 0.0694
-saturation = 1.2873
-adapt = 0.1203
-tint = [0.7336, 0.84, 0.92, 0.1109]
-border = [0.0, 0.0, 0.0, 0.0325]
-shadow = [0.1836, 22.0, 8.0]
+# Liquid glass (macOS Tahoe): clear and neutral, a thin bright rim from above, a lens only at the very edge
+mode = "liquid"
+amount = 1.0
+tint_accent = false
+blur = 5.0
+refraction = 26.0
+bezel = 24.0
+dispersion = 0.012
+rim = 0.85
+rim_sharp = 1.0
+gloss = 0.0
+saturation = 1.22
+adapt = 0.22
+tint = [1.0, 1.0, 1.0, 0.12]
+border = [0.0, 0.0, 0.0, 0.0]
+shadow = [0.16, 26.0, 9.0]
 
 [window]
-decoration = "mac"
-radius = 26.0
-titlebar = 40.0
+decoration = "custom"
+radius = 20.0
+titlebar = 24.0
 title_align = "center"
-# a maximized window gives up its title bar: the close / minimize / zoom buttons move into the menu bar
+shadow = [0.30, 56.0, 20.0]
+shadow_idle = [0.16, 36.0, 10.0]
+shadow_near = [0.16, 5.0]
+shadow_near_idle = [0.10, 4.0]
+outline = 0.12
+outline_light = 0.12
+client_opacity = 0.945900022983551
+max_gap = 0.0
+adapt = true
 hide_title_max = true
+
+[window.frame]
+side = "left"
+order = "close_min_max"
+shape = "square"
+colors = "traffic"
+glyphs = "hover"
+bar = "body"
+body = "auto"
+button = 12.407299995422363
+gap = 10.461600303649902
+border = 0.0
+outline = true
+title_size = 13.435099601745605
+title_bold = true
 
 [menubar]
 height = 38.0
 bar = true
 kind = "glass"
-opacity = 0.35
+opacity = 0.4336000084877014
 blur = 16.0
 border = true
 show_title = true
+
+[[bars]]
+name = "menubar"
+edge = "top"
+shape = "strip"
+height = 26.0
+margin = 14.0
+surface = "look"
+inset = 0.0
+radius = 0.0
+autohide = "off"
+hide_anim = "fade"
+hide_speed = 1.0
+left = [
+    { icon = "house", kind = "logo" },
+    "window-buttons",
+    "title",
+    "app-menu",
+]
+center = []
+right = [
+    { battery = false, bluetooth = false, chevron = false, kind = "tray", volume = false, wifi = false },
+    "keyboard",
+    "notifications",
+    "battery",
+    "wifi",
+    { action = "launcher", kind = "search" },
+    "control-center",
+    "clock",
+]
+
+[bars.look]
+height = 38.0
+bar = true
+kind = "solid"
+opacity = 0.9334999918937683
+blur = 16.0
+border = true
+show_title = true
+
+[[bars]]
+name = "dock"
+edge = "bottom"
+shape = "floating"
+height = 39.0
+margin = 14.0
+surface = "look"
+inset = 0.0
+radius = 0.0
+autohide = "always"
+hide_anim = "slide"
+hide_speed = 1.0
+left = []
+right = []
+
+[bars.look]
+height = 38.0
+bar = true
+kind = "glass"
+opacity = 0.414900004863739
+blur = 16.0
+border = true
+show_title = true
+
+[[bars.center]]
+dim_idle = 0.37
+gap = 2.28
+hover_bg = "none"
+hover_color = "white"
+indicator = "underline"
+kind = "dock"
+lift = 11.01
+magnify_amount = 0.18
+magnify_range = 58.76
+mark_focus_long = true
+mark_per_window = false
+rainbow = false
+running_bg = "none"
+running_color = "accent"
 
 [dock]
 icon_size = 64.0
@@ -41,28 +152,70 @@ radius = 36.0
 gap = 14.0
 
 [launcher]
-style = "figlet"
+style = "launchpad"
 
 [icons]
+theme = "Memrium-Icons"
+shape = "none"
+plate = "none"
+padding = 0.0
+tile = "vivid"
+own_look = "tinted-icon"
+
+[icons.overrides]
+
+[icons.simple]
+theme = "auto"
 shape = "rounded"
 plate = "tile"
+padding = 0.1599999964237213
 tile = "vivid"
-padding = 0.16
 
-# Which widgets the top bar holds. A widget is a name or a table with options.
-# Names: logo, title, app-menu, clock {format}, battery, wifi, bluetooth, volume, search,
-#        button {icon, action}, text {text, bold}, spacer {width}, divider, control-center
-# Actions: launcher, settings, files, terminal, screenshot, screenshot-region, control-center, edit-controls, quit
-# [bar]
-# left   = ["logo", "title", "app-menu"]
-# center = []
-# right  = ["battery", "wifi", "search", "control-center", "clock"]
+[wallpaper]
+kind = "image"
+path = "/run/current-system/sw/share/wallpapers/ScarletTree/contents/images/5120x2880.png"
 
-# motion: Aero is quick and snappy, Fluent fades, macOS is springy
 [animations]
+enabled = true
 speed = 1.0
 switch = "circle"
-switch_ms = 800
+switch_ms = 800.0
 rim = true
+sounds = true
+sound_volume = 0.800000011920929
 
+[animations.effects.menu_highlight]
+on = true
+speed = 1.0154999494552612
+
+[animations.effects.submenu]
+on = true
+speed = 1.0154000520706177
+
+[animations.effects.window_minimize]
+on = true
+speed = 1.0153000354766846
+
+[ui]
+sidebar = "medium"
+wall_tint = true
+scrollbars = "auto"
+scroll_click = "page"
+follow_gtk = false
+style_apps = true
+popup_opacity = 0.0
+slide = true
+
+[ui.controls]
+look = "keys"
+depth = 0.6326000094413757
+round = 1.0
+accent_pick = true
+multi = false
+
+[ui.clock]
+hour24 = false
+seconds = false
+date = true
+week_monday = true
 

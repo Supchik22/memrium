@@ -156,7 +156,41 @@ impl ShotEdit {
     }
 }
 
+/// The whole desktop as it was when the area picker opened.
+pub struct Freeze {
+    img: RgbaImage,
+    pub tex: SurfaceTex,
+}
+
 impl State {
+    /// Open the area picker on a frozen picture of the screen, so what moves underneath does not change while picking.
+    pub fn begin_shot_sel(&mut self, start: Option<[f32; 2]>, record: bool) {
+        let (w, h, rgba) = self.capture_rgba(None);
+        self.shot_freeze = RgbaImage::from_raw(w, h, rgba).map(|img| {
+            let tex = self.renderer.create_surface_tex(w, h, true);
+            let stride = w as usize * 4;
+            let mut bgra = Vec::with_capacity(img.as_raw().len());
+            for px in img.as_raw().chunks_exact(4) {
+                bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+            self.renderer.upload_surface_rows(&tex, &bgra, stride as u32, 0..h);
+            Freeze { img, tex }
+        });
+        self.shot_sel = Some(crate::state::ShotSel { start, record });
+    }
+
+    /// `logical` cut out of the frozen picture (device px, RGBA).
+    fn crop_freeze(&self, f: &Freeze, logical: [f32; 4]) -> (u32, u32, Vec<u8>) {
+        let full = self.crop_px(None);
+        let [x0, y0, x1, y1] = self.crop_px(Some(logical));
+        let (fw, fh) = f.img.dimensions();
+        let x = x0.saturating_sub(full[0]).min(fw.saturating_sub(1));
+        let y = y0.saturating_sub(full[1]).min(fh.saturating_sub(1));
+        let (w, h) = ((x1 - x0).min(fw - x), (y1 - y0).min(fh - y));
+        let img = image::imageops::crop_imm(&f.img, x, y, w, h).to_image();
+        (w, h, img.into_raw())
+    }
+
     /// Take the picture of `logical` and open the editor on it.
     pub fn start_shot_edit(&mut self, logical: [f32; 4]) {
         let [wx0, wy0, wx1, wy1] = self.world;
@@ -166,7 +200,11 @@ impl State {
         if r[2] < 4.0 || r[3] < 4.0 {
             return;
         }
-        let (w, h, rgba) = self.capture_rgba(Some(r));
+        let (w, h, rgba) = match self.shot_freeze.take() {
+            // cut out of the picture the picker showed, so the area is what the user saw when picking it
+            Some(f) => self.crop_freeze(&f, r),
+            None => self.capture_rgba(Some(r)),
+        };
         let Some(base) = RgbaImage::from_raw(w, h, rgba) else { return };
         let tex = self.renderer.create_surface_tex(w, h, true);
         let edit = ShotEdit { rect: r, work: base.clone(), base, tex, tool: Tool::Pen, color: 0, width: 1, ops: Vec::new(), cur: None };
@@ -251,7 +289,7 @@ impl State {
             // a press beside the picture starts a new selection (the drawing so far is dropped)
             if !on_bar {
                 self.shot_edit = None;
-                self.shot_sel = Some(crate::state::ShotSel { start: Some(p), record: false });
+                self.begin_shot_sel(Some(p), false);
             }
             return;
         }

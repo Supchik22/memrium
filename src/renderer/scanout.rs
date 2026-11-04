@@ -189,3 +189,77 @@ impl ScanoutImage {
         });
     }
 }
+
+/// Tells when the GPU has finished a submission through a sync file the kernel signals, which the session polls next to
+/// its other fds. Waiting with `device.poll(Wait)` (even on another thread) holds wgpu's fence lock, and every
+/// `queue.submit` meanwhile waits for it: the main loop stalled on the GPU after all, and input waited with it.
+pub struct DoneFence {
+    sem: vk::Semaphore,
+    raw: ash::Device,
+    fd_fn: khr::external_semaphore_fd::Device,
+    // keeps the Vulkan device alive as long as the semaphore
+    _device: wgpu::Device,
+}
+
+impl DoneFence {
+    /// None when the device cannot export a semaphore as a sync file.
+    pub fn new(device: &wgpu::Device) -> Option<DoneFence> {
+        if std::env::var_os("MEMRIUM_NO_SYNC_FILE").is_some() {
+            return None;
+        }
+        // SAFETY: a semaphore created on the device's own handles, destroyed in Drop before the device can go
+        unsafe {
+            device.as_hal::<Vulkan, _, _>(|hal| {
+                let hal = hal?;
+                if !hal.enabled_device_extensions().contains(&khr::external_semaphore_fd::NAME) {
+                    return None;
+                }
+                let instance = hal.shared_instance().raw_instance();
+                let info = vk::PhysicalDeviceExternalSemaphoreInfo::default().handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+                let mut props = vk::ExternalSemaphoreProperties::default();
+                instance.get_physical_device_external_semaphore_properties(hal.raw_physical_device(), &info, &mut props);
+                if !props.external_semaphore_features.contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE) {
+                    return None;
+                }
+                let raw = hal.raw_device().clone();
+                let mut export = vk::ExportSemaphoreCreateInfo::default().handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+                let sem = raw.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None).ok()?;
+                let fd_fn = khr::external_semaphore_fd::Device::new(instance, &raw);
+                Some(DoneFence { sem, raw, fd_fn, _device: device.clone() })
+            })
+        }
+    }
+
+    /// Make the next `queue.submit` signal the semaphore; call it right before that submit.
+    pub fn arm(&self, queue: &wgpu::Queue) {
+        // SAFETY: the semaphore is unsignalled (a sync-file export resets it) and outlives the submission
+        unsafe {
+            queue.as_hal::<Vulkan, _, _>(|q| {
+                if let Some(q) = q {
+                    q.add_signal_semaphore(self.sem, None);
+                }
+            })
+        }
+    }
+
+    /// After the armed submit: a sync file that becomes readable when the GPU is done (None: done already). Err: the
+    /// export failed, the caller has to wait some other way.
+    pub fn export(&self) -> Result<Option<OwnedFd>, ()> {
+        let info = vk::SemaphoreGetFdInfoKHR::default().semaphore(self.sem).handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        // SAFETY: the semaphore has a signal operation submitted (armed before the last submit)
+        match unsafe { self.fd_fn.get_semaphore_fd(&info) } {
+            // -1: already signalled
+            Ok(fd) if fd < 0 => Ok(None),
+            // SAFETY: a new fd we own
+            Ok(fd) => Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) })),
+            Err(_) => Err(()),
+        }
+    }
+}
+
+impl Drop for DoneFence {
+    fn drop(&mut self) {
+        // SAFETY: nothing waits on the semaphore any more (its last payload went out as a sync file)
+        unsafe { self.raw.destroy_semaphore(self.sem, None) };
+    }
+}

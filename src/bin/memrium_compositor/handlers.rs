@@ -65,7 +65,9 @@ impl State {
 
         memrium_de::keys::set_style(&config.keys.style);
         let [lw, lh] = renderer.logical_size();
-        let theme = config.resolve();
+        let base_theme = config.resolve();
+        memrium_de::efficiency::load();
+        let theme = if memrium_de::efficiency::enabled() { base_theme.efficient() } else { base_theme.clone() };
         // the programs follow the shell's look: leave it where they can read it (changes are written when they happen)
         memrium_de::theme::export_appearance(&theme, &config.language);
         let apps = memrium_de::apps::scan();
@@ -113,6 +115,7 @@ impl State {
             next_id: 0,
             config: config.clone(),
             theme: theme.clone(),
+            base_theme,
             hover_btn: None,
             last_title_click: None,
             settings: Default::default(),
@@ -161,12 +164,18 @@ impl State {
             cursor_shape: Default::default(),
             client_cursor: Default::default(),
             client_cursor_surface: None,
+            dnd_icon: None,
+            dnd_icon_off: [0.0; 2],
             client_cursor_img: None,
             cursor_focus: None,
             cursor_check: std::time::Instant::now(),
             cursor_gen: 0,
             busy_until: None,
             busy_wins: 0,
+            soft_since: HashMap::new(),
+            soft_check: Instant::now(),
+            busy_icon: None,
+            typing_hid_cursor: false,
             preview: None,
             dock_wait: (String::new(), 0.0),
             dock_drag: (String::new(), 0.0),
@@ -196,6 +205,7 @@ impl State {
             persistent_target: false,
             damage: Default::default(),
             shot_sel: None,
+            shot_freeze: None,
             shot_req: None,
             recording: None,
             rec_done: None,
@@ -212,6 +222,9 @@ impl State {
             move_samples: Vec::new(),
             frame_skipped: false,
             frames_drawn: 0,
+            fps_on: std::env::var_os("MEMRIUM_FPS").is_some(),
+            fps_since: (std::time::Instant::now(), 0),
+            fps_text: "…".into(),
             last_hash: 0,
             pending_vt: None,
             xwm: None,
@@ -255,6 +268,8 @@ impl State {
             mons: vec![[0.0, 0.0, lw, lh]],
             main_mon: 0,
             monitor_infos: Vec::new(),
+            cursor_previews: Vec::new(),
+            cursor_preview_look: String::new(),
             displays_dirty: false,
             widgets_panel: crate::widgets_panel::WidgetsPanel::new(),
             text_input_state: smithay::wayland::text_input::TextInputManagerState::new::<State>(dh),
@@ -391,13 +406,7 @@ impl XdgShellHandler for State {
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
         // place it, keeping it on screen (flip/slide per the client's constraint adjustment)
-        let mut geometry = positioner.get_geometry();
-        if let Some(parent) = surface.get_parent_surface() {
-            if let Some(o) = self.popup_parent_origin(&parent) {
-                let target = Rectangle::<i32, Logical>::new((self.world[0] as i32 - o[0] as i32, self.world[1] as i32 - o[1] as i32).into(), ((self.world[2] - self.world[0]) as i32, (self.world[3] - self.world[1]) as i32).into());
-                geometry = positioner.get_unconstrained_geometry(target);
-            }
-        }
+        let geometry = self.constrained_popup(&surface, &positioner);
         surface.with_pending_state(|s| {
             s.geometry = geometry;
             s.positioner = positioner;
@@ -416,8 +425,9 @@ impl XdgShellHandler for State {
     }
 
     fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+        let geometry = self.constrained_popup(&surface, &positioner);
         surface.with_pending_state(|s| {
-            s.geometry = positioner.get_geometry();
+            s.geometry = geometry;
             s.positioner = positioner;
         });
         surface.send_repositioned(token);
@@ -502,6 +512,14 @@ impl State {
     /// Geometry origin of the popup's parent (a toplevel or another popup), for placing it on screen.
     fn popup_parent_origin(&self, parent: &WlSurface) -> Option<[f32; 2]> {
         self.geometry_origin_pub(parent)
+    }
+
+    /// The popup's place relative to its parent, flipped/slid to stay on the desktop.
+    fn constrained_popup(&self, surface: &PopupSurface, positioner: &PositionerState) -> Rectangle<i32, Logical> {
+        let geometry = positioner.get_geometry();
+        let Some(o) = surface.get_parent_surface().and_then(|p| self.popup_parent_origin(&p)) else { return geometry };
+        let target = Rectangle::<i32, Logical>::new((self.world[0] as i32 - o[0] as i32, self.world[1] as i32 - o[1] as i32).into(), ((self.world[2] - self.world[0]) as i32, (self.world[3] - self.world[1]) as i32).into());
+        positioner.get_unconstrained_geometry(target)
     }
 }
 
@@ -611,7 +629,21 @@ impl DataDeviceHandler for State {
     }
 }
 
-impl ClientDndGrabHandler for State {}
+impl ClientDndGrabHandler for State {
+    /// A program began dragging something out of itself: its picture is drawn at the pointer until the drop.
+    fn started(&mut self, _source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>, icon: Option<WlSurface>, _seat: Seat<Self>) {
+        self.dnd_icon_off = [0.0; 2];
+        if let Some(s) = &icon {
+            // (a picture committed before the drag began: its first offset is already waiting)
+            self.take_dnd_offset(s);
+        }
+        self.dnd_icon = icon;
+    }
+
+    fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
+        self.dnd_icon = None;
+    }
+}
 impl ServerDndGrabHandler for State {
     /// A program took the dropped files: it asks for them as a `text/uri-list`.
     fn send(&mut self, mime_type: String, fd: std::os::fd::OwnedFd, _seat: Seat<Self>) {

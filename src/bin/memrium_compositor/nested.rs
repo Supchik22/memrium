@@ -66,8 +66,8 @@ pub fn apply_test_hooks(state: &mut State, args: &mut Args, socket: &str) {
     }
     if let Ok(m) = std::env::var("MEMRIUM_TEST_GLASS") {
         use memrium_de::theme::GlassMode;
-        let mut t = state.theme.clone();
-        t.glass.set_mode(match m.as_str() { "flat" => GlassMode::Flat, "glass" => GlassMode::Glass, "clay" => GlassMode::Clay, "paper" => GlassMode::Paper, "wood" => GlassMode::Wood, _ => GlassMode::Custom });
+        let mut t = state.base_theme.clone();
+        t.glass.set_mode(match m.as_str() { "flat" => GlassMode::Flat, "glass" => GlassMode::Glass, "clay" => GlassMode::Clay, "paper" => GlassMode::Paper, "wood" => GlassMode::Wood, "liquid" => GlassMode::Liquid, _ => GlassMode::Custom });
         state.apply_theme(t);
     }
     if std::env::var_os("MEMRIUM_TEST_WIDGETS").is_some() {
@@ -280,7 +280,8 @@ impl ApplicationHandler for App {
             g.pump_wayland();
             // the window's own cursor follows the shell's
             static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
-            if SHOWN.swap(g.state.cursor_gen, std::sync::atomic::Ordering::Relaxed) != g.state.cursor_gen {
+            let gen = g.state.cursor_gen.wrapping_mul(2) | g.state.typing_hid_cursor as u32;
+            if SHOWN.swap(gen, std::sync::atomic::Ordering::Relaxed) != gen {
                 use memrium_de::cursor::Shape;
                 use winit::window::CursorIcon as C;
                 let icon = match g.state.cursor_shape {
@@ -311,7 +312,7 @@ impl ApplicationHandler for App {
                     Some(c) => g.window.set_cursor(winit::window::Cursor::Custom(c)),
                     None => g.window.set_cursor(icon),
                 }
-                g.window.set_cursor_visible(g.state.cursor_shape != Shape::Hidden);
+                g.window.set_cursor_visible(g.state.cursor_shape != Shape::Hidden && !g.state.typing_hid_cursor);
             }
             if g.idle {
                 // nothing moved: sleep ~30 ms (input events wake the loop at once); a redraw is only requested when

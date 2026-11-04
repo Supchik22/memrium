@@ -69,6 +69,8 @@ pub fn run(mut args: Args) {
     let mut files_opened = false;
     // test hook: the same for Settings (`MEMRIUM_TEST_SETTINGS_AT`)
     let settings_at: Option<u128> = std::env::var("MEMRIUM_TEST_SETTINGS_AT").ok().and_then(|v| v.parse().ok());
+    // test hook: the volume indicator, as Settings' "Show the indicator" button shows it (`MEMRIUM_TEST_OSD_AT`)
+    let mut osd_at: Option<u128> = std::env::var("MEMRIUM_TEST_OSD_AT").ok().and_then(|v| v.parse().ok());
     let mut settings_opened = false;
     // test hook: the launcher (`MEMRIUM_TEST_LAUNCHER_AT`)
     let launcher_at: Option<u128> = std::env::var("MEMRIUM_TEST_LAUNCHER_AT").ok().and_then(|v| v.parse().ok());
@@ -205,6 +207,19 @@ pub fn run(mut args: Args) {
                 }
                 // real key presses (evdev codes, as from the keyboard), so they reach the focused program: `type ls_-la`
                 // (`_` is a space, `~` is Enter)
+                // `hold super` ... `release super`: a modifier kept down across pointer steps (Super + drag)
+                Some(cmd @ ("hold" | "release")) => {
+                    let code = match it.next() {
+                        Some("super") => 125,
+                        Some("alt") => 56,
+                        Some("ctrl") => 29,
+                        Some("shift") => 42,
+                        _ => 0,
+                    };
+                    if code != 0 {
+                        state.key(code, cmd == "hold");
+                    }
+                }
                 Some("type") => {
                     for c in it.next().unwrap_or("").chars() {
                         let (code, shift) = evdev_of(c);
@@ -257,6 +272,10 @@ pub fn run(mut args: Args) {
                 state.open_shell(crate::state::Sw::Files);
                 files_opened = true;
             }
+        }
+        if osd_at.is_some_and(|at| now_ms > at) {
+            osd_at = None;
+            state.test_osd();
         }
         if let (Some(at), false) = (settings_at, settings_opened) {
             if now_ms > at {

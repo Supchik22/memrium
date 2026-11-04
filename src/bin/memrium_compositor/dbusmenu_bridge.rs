@@ -88,8 +88,10 @@ fn item_of(n: &MenuNode) -> Item {
     if n.separator {
         return Item::sep();
     }
-    if !n.children.is_empty() {
-        let mut parent = Item::parent(n.label.clone(), n.children.iter().map(item_of).collect()).enabled(n.enabled).icon(&n.icon_name);
+    if !n.children.is_empty() || n.submenu {
+        // a submenu the program left empty still opens, saying so
+        let entries = if n.children.is_empty() { vec![Item::new(0, "Empty").enabled(false)] } else { n.children.iter().map(item_of).collect() };
+        let mut parent = Item::parent(n.label.clone(), entries).enabled(n.enabled).icon(&n.icon_name);
         parent.icon_png = n.icon_data.clone();
         return parent;
     }
@@ -108,11 +110,41 @@ fn read_menu(conn: &Connection, source: &Source) -> Option<(Vec<Menu>, Arc<Actio
         Source::Dbusmenu(s, p) => (s, p),
         Source::Gtk(g) => return gtkmenu::read(conn, g).map(|(m, a)| (m, Arc::new(a))),
     };
-    // some programs build a menu only when asked to show it
-    let _ = conn.call_method(Some(service.as_str()), path.as_str(), Some(MENU), "AboutToShow", &(0i32,));
-    let msg = conn.call_method(Some(service.as_str()), path.as_str(), Some(MENU), "GetLayout", &(0i32, -1i32, Vec::<String>::new())).ok()?;
-    let (_, root): (u32, Layout) = msg.body().deserialize().ok()?;
-    node_of(root).map(menus_of_layout).map(|m| (m, Arc::default()))
+    let about_to_show = |id: i32| {
+        let _ = conn.call_method(Some(service.as_str()), path.as_str(), Some(MENU), "AboutToShow", &(id,));
+    };
+    let layout = || -> Option<MenuNode> {
+        let msg = conn.call_method(Some(service.as_str()), path.as_str(), Some(MENU), "GetLayout", &(0i32, -1i32, Vec::<String>::new())).ok()?;
+        let (_, root): (u32, Layout) = msg.body().deserialize().ok()?;
+        node_of(root)
+    };
+    // some programs build a menu only when asked to show it: the root, then the bar's menus, then submenus that came
+    // empty (Qt's "Recent files"), a few levels deep
+    about_to_show(0);
+    let mut root = layout()?;
+    let mut asked = std::collections::HashSet::new();
+    for _ in 0..3 {
+        let mut ids = Vec::new();
+        empty_submenus(&root, true, &mut ids);
+        ids.retain(|id| asked.insert(*id));
+        if ids.is_empty() {
+            break;
+        }
+        ids.into_iter().for_each(about_to_show);
+        root = layout()?;
+    }
+    Some((menus_of_layout(root), Arc::default()))
+}
+
+/// Ids of the entries whose submenus the program may build only when asked: empty ones that say they open a submenu,
+/// and (`top`) the bar's menus themselves.
+fn empty_submenus(n: &MenuNode, top: bool, out: &mut Vec<i32>) {
+    for c in &n.children {
+        if c.submenu && c.children.is_empty() || top && !c.separator {
+            out.push(c.id);
+        }
+        empty_submenus(c, false, out);
+    }
 }
 
 impl Bridge {
@@ -240,5 +272,16 @@ mod tests {
         assert!(menus[0].items[1].separator);
         assert_eq!(menus[0].items[2], Item::parent("Recent", vec![Item::new(4, "a.txt")]));
         assert_eq!(menus[1].items[0], Item::new(6, "Undo").enabled(false).checked(true));
+    }
+
+    #[test]
+    fn a_submenu_the_program_fills_later_is_still_a_submenu() {
+        let recent = MenuNode { submenu: true, ..node(3, "Recently Opened Projects", vec![]) };
+        let root = node(0, "", vec![node(1, "File", vec![node(2, "New", vec![]), recent])]);
+        let mut ids = Vec::new();
+        empty_submenus(&root, true, &mut ids);
+        assert_eq!(ids, [1, 3], "the bar's menu and the empty submenu are asked to build themselves");
+        let menus = menus_of_layout(root);
+        assert_eq!(menus[0].items[1], Item::parent("Recently Opened Projects", vec![Item::new(0, "Empty").enabled(false)]));
     }
 }

@@ -13,6 +13,7 @@ pub const ACTIONS: &[(&str, &str, &str)] = &[
     ("menu-search", "Search the program's menus", "Alt+Slash"),
     ("lock", "Lock screen", "Super+L"),
     ("settings", "Open Settings", "Super+Comma"),
+    ("fps-overlay", "Show the frame rate (debug)", "Ctrl+Alt+F"),
     ("wallpaper", "Change wallpaper", "Super+Shift+D"),
     ("files", "Open Files", "Super+E"),
     ("terminal", "Open terminal", "Ctrl+Alt+T"),

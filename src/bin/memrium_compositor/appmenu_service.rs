@@ -32,8 +32,66 @@ impl Service {
     }
 }
 
+/// `org.freedesktop.FileManager1`: what "Show in folder" of Telegram, browsers and the like call. The folders asked for
+/// wait in `queue` until the shell opens them in its Files window.
+struct FileManager {
+    queue: Arc<Mutex<Vec<std::path::PathBuf>>>,
+}
+
+/// The path of a `file://` uri (percent escapes undone); anything else is not a local file.
+fn path_of_uri(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.find('/').map_or("", |i| &rest[i..]);
+    let b = rest.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).and_then(|&c| hex(c)), b.get(i + 2).and_then(|&c| hex(c))) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Some(std::path::PathBuf::from(String::from_utf8_lossy(&out).into_owned()))
+}
+
+impl FileManager {
+    /// The paths to show.
+    fn push(&self, uris: &[String], folders: bool) {
+        let Ok(mut q) = self.queue.lock() else { return };
+        for p in uris.iter().filter_map(|u| path_of_uri(u)) {
+            // a folder opens as it is; a file is shown selected in its folder (`ShowFolders` never selects)
+            let target = if folders && !p.is_dir() { p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| p.clone()) } else { p };
+            q.push(target);
+        }
+    }
+}
+
+#[interface(name = "org.freedesktop.FileManager1")]
+impl FileManager {
+    fn show_folders(&self, uris: Vec<String>, _startup_id: String) {
+        self.push(&uris, true);
+    }
+
+    fn show_items(&self, uris: Vec<String>, _startup_id: String) {
+        self.push(&uris, false);
+    }
+
+    fn show_item_properties(&self, uris: Vec<String>, _startup_id: String) {
+        self.push(&uris, false);
+    }
+}
+
 pub struct AppMenuService {
     conn: Option<Connection>,
+    /// folders other programs asked the file manager to show
+    pub folder_requests: Arc<Mutex<Vec<std::path::PathBuf>>>,
     menus: Menus,
     /// menus of programs that register with the Unity-style registrar instead
     pub bridge: crate::dbusmenu_bridge::Bridge,
@@ -49,7 +107,7 @@ pub enum MenuTarget {
 
 impl AppMenuService {
     pub fn new() -> AppMenuService {
-        AppMenuService { conn: None, menus: Arc::new(Mutex::new(HashMap::new())), bridge: crate::dbusmenu_bridge::Bridge::new() }
+        AppMenuService { conn: None, menus: Arc::new(Mutex::new(HashMap::new())), folder_requests: Arc::default(), bridge: crate::dbusmenu_bridge::Bridge::new() }
     }
 
     /// Offer the service on the session bus (programs then see that a menu bar is there).
@@ -59,6 +117,11 @@ impl AppMenuService {
             Ok(conn) => {
                 eprintln!("appmenu: serving {BUS}");
                 self.bridge.start(&conn);
+                let fm = conn.object_server().at("/org/freedesktop/FileManager1", FileManager { queue: self.folder_requests.clone() });
+                match fm.map_err(|e| e.to_string()).and_then(|_| conn.request_name("org.freedesktop.FileManager1").map_err(|e| e.to_string())) {
+                    Ok(()) => eprintln!("appmenu: serving org.freedesktop.FileManager1"),
+                    Err(e) => eprintln!("appmenu: no FileManager1 ({e})"),
+                }
                 self.conn = Some(conn);
             }
             Err(e) => eprintln!("appmenu: not serving ({e})"),
@@ -269,6 +332,12 @@ impl crate::state::State {
 
     /// Draw the bar again when a menu was read.
     pub fn appmenu_update(&mut self) {
+        let asked: Vec<_> = self.appmenu.folder_requests.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+        for path in asked {
+            self.open_shell(crate::state::Sw::Files);
+            self.files.show(&path);
+            self.invalidate();
+        }
         if self.appmenu.bridge.take_dirty() {
             self.invalidate();
         }

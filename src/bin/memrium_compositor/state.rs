@@ -51,6 +51,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Instant;
 
+mod render;
+
 /// resize grab margin around a window (logical px)
 const EDGE: f32 = 7.0;
 pub const BTN_LEFT: u32 = 0x110;
@@ -547,7 +549,10 @@ pub struct State {
 
     // ---- look
     pub config: Config,
+    /// the theme as shown: the user's theme, or its maximum-efficiency form (see `memrium_de::efficiency`)
     pub theme: Theme,
+    /// the user's theme as they chose it: what is saved, edited in Settings and cloned for a change
+    pub base_theme: Theme,
     pub hover_btn: Option<(usize, Btn)>,
     pub last_title_click: Option<Instant>,
 
@@ -601,6 +606,9 @@ pub struct State {
     /// the icons menus show beside their entries (the "actions" folders), indexed off-thread
     pub action_icons: Arc<IconSlot>,
     pub icon_failed: HashSet<String>,
+    /// the cursor previews of the Mouse settings page in the icon atlas, and the look (accent and preferences) they show
+    pub cursor_previews: Vec<String>,
+    pub cursor_preview_look: String,
     /// set by the thread that rebuilt the icon indexes for a new icon theme: the loaded icons are dropped on the next frame
     pub icons_rebuilt: Arc<std::sync::atomic::AtomicBool>,
     /// when the icon theme the editor writes was last looked at, and the time its marker file had then
@@ -615,12 +623,22 @@ pub struct State {
     pub client_cursor: memrium_de::cursor::Shape,
     /// the surface a program drew its own cursor on, and what it looks like now (Xwayland and older toolkits do that)
     pub client_cursor_surface: Option<WlSurface>,
+    /// the picture a program drags out of itself follows the pointer (its surface, and where its corner is from the pointer)
+    pub dnd_icon: Option<WlSurface>,
+    pub dnd_icon_off: [f32; 2],
     pub client_cursor_img: Option<memrium_de::cursor::ClientCursor>,
     pub cursor_focus: Option<ObjectId>,
     pub cursor_check: Instant,
     pub cursor_gen: u32,
     pub busy_until: Option<Instant>,
     pub busy_wins: usize,
+    /// Wayland programs seen stretched (soft) since when, and when that was last looked at (see `watch_soft`)
+    pub soft_since: HashMap<String, Instant>,
+    pub soft_check: Instant,
+    /// the icon of the program being started: drawn beside the busy cursor (straight RGBA)
+    pub busy_icon: Option<image::RgbaImage>,
+    /// typing hid the cursor; the next mouse motion, click or scroll shows it again
+    pub typing_hid_cursor: bool,
     pub preview: Option<crate::dock::DockPreview>,
     pub dock_wait: (String, f32),
     /// the Dock item files are being carried over, and for how long (negative once its window was brought up)
@@ -642,6 +660,8 @@ pub struct State {
     pub damage: crate::damage::DamageTracker,
     pub ghosts: Vec<Ghost>,
     pub shot_sel: Option<ShotSel>,
+    /// the screen as it was when the area picker opened: shown instead of the live desktop while the area is picked
+    pub shot_freeze: Option<crate::shot_edit::Freeze>,
     pub shot_req: Option<ShotReq>,
     pub recording: Option<crate::screenrec::Recording>,
     /// a finished recording being closed by ffmpeg in the background
@@ -668,6 +688,11 @@ pub struct State {
     pub frame_skipped: bool,
     /// frames that were really drawn (not skipped as identical); screen capture waits on this
     pub frames_drawn: u64,
+    /// debug: the frame-rate badge (Ctrl+Alt+F, or `MEMRIUM_FPS=1` at start)
+    pub fps_on: bool,
+    /// when the badge was last refreshed, `frames_drawn` then, and the text it shows
+    pub fps_since: (Instant, u64),
+    pub fps_text: String,
     pub last_hash: u64,
     /// ask the session backend to switch to this VT
     pub pending_vt: Option<i32>,
@@ -936,7 +961,19 @@ impl State {
         });
     }
 
+    /// Move the dragged picture by the offset its program gave with its last commit.
+    pub fn take_dnd_offset(&mut self, s: &WlSurface) {
+        let d = with_states(s, |st| st.cached_state.get::<SurfaceAttributes>().current().buffer_delta.take());
+        if let Some(d) = d {
+            self.dnd_icon_off[0] += d.x as f32;
+            self.dnd_icon_off[1] += d.y as f32;
+        }
+    }
+
     pub fn on_commit(&mut self, surface: &WlSurface) {
+        if self.dnd_icon.as_ref() == Some(surface) {
+            self.take_dnd_offset(surface);
+        }
         if std::env::var_os("MEMRIUM_WHY").is_some() {
             self.why_commit(surface);
         }
@@ -997,7 +1034,7 @@ impl State {
             self.refresh_geometry(i);
             let has_buf = self.surfaces.get(&root.id()).is_some_and(|n| n.tex.is_some());
             if has_buf && !self.wins[i].mapped {
-                // a splash screen (one fixed size, no parent) is shown as it is, with no frame of ours
+                // a splash screen (one fixed size, no parent, no title) is shown as it is, with no frame of ours
                 if self.wins[i].deco == Deco::Server && self.wins[i].role.is_splash() {
                     self.wins[i].deco = Deco::Legacy;
                     self.wins[i].ins = [0.0; 4];
@@ -1009,7 +1046,7 @@ impl State {
                 // in "fullscreen" that only made its window the screen's size, as CS2 on Wayland): it comes up so, not as a
                 // window at the cascade
                 let g = self.wins[i].geo;
-                let screen_sized = self.wins[i].role.fixed_size() && self.mons.iter().any(|m| g[2] >= m[2] - 1.0 && g[3] >= m[3] - 1.0);
+                let screen_sized = (self.wins[i].role.fixed_size() || self.wins[i].role.borderless()) && self.mons.iter().any(|m| g[2] >= m[2] - 1.0 && g[3] >= m[3] - 1.0);
                 if self.wins[i].fs.is_none() && (self.wins[i].role.asked_fullscreen() || screen_sized) {
                     self.fullscreen_now(i, true);
                     let w = &mut self.wins[i];
@@ -1446,7 +1483,7 @@ impl State {
     pub fn tile_shell_window(&mut self, k: Sw, side: i8) {
         let c = self.sw_frame(k);
         let r = self.snap_rect([c[0] + c[2] / 2.0, c[1] + c[3] / 2.0], side);
-        let ins = if self.theme.window.hide_title_max { [0.0; 4] } else { decor::insets(&self.theme) };
+        let ins = if self.theme.window.hide_title_max || self.sw_unified() { [0.0; 4] } else { decor::insets(&self.theme) };
         let w = self.shell_win_mut(k);
         if w.restore.is_none() {
             w.restore = Some([w.x.target, w.y.target]);
@@ -1980,6 +2017,7 @@ impl State {
     pub fn pointer_motion(&mut self, x: f32, y: f32) {
         if (x - self.mouse[0]).abs() + (y - self.mouse[1]).abs() > 0.0 {
             self.activity();
+            self.typing_hid_cursor = false;
         }
         self.mouse = [x, y];
         if self.lock.is_some() {
@@ -2028,7 +2066,7 @@ impl State {
         self.title_menu_hover([x, y]);
         let covering = self.shell_covers([x, y]);
         for k in [Sw::Settings, Sw::Files] {
-            let hover = if covering == Some(k) { decor::buttons(&self.theme, self.sw_frame(k)).into_iter().find(|(_, r)| Self::in_rect([x, y], *r)).map(|(b, _)| b) } else { None };
+            let hover = if covering == Some(k) { decor::buttons(&self.sw_theme(k), self.sw_frame(k)).into_iter().find(|(_, r)| Self::in_rect([x, y], *r)).map(|(b, _)| b) } else { None };
             self.shell_win_mut(k).hover = hover;
         }
         self.hover_btn = match self.chrome_at([x, y]) {
@@ -2083,6 +2121,9 @@ impl State {
                 let w = self.shell_win_mut(win);
                 w.x.target = x - off[0];
                 w.y.target = y - off[1];
+                // the window stays under the pointer while it is dragged: the spring only plays on release
+                w.x.snap();
+                w.y.snap();
             }
             Some(Grab::ShellResize { win, edges, start_mouse, start }) => {
                 let (win, edges, sm, st) = (*win, *edges, *start_mouse, *start);
@@ -2106,6 +2147,8 @@ impl State {
                     self.wins[i].jgrab = off[0] / fw;
                     self.wins[i].x.target = x - off[0];
                     self.wins[i].y.target = y - off[1];
+                    self.wins[i].x.snap();
+                    self.wins[i].y.snap();
                 }
             }
             Some(Grab::Resize { surf, edges, start_mouse, start }) => {
@@ -2174,6 +2217,7 @@ impl State {
     }
 
     pub fn pointer_button(&mut self, button: u32, pressed: bool) {
+        self.typing_hid_cursor = false;
         self.activity();
         if std::env::var_os("MEMRIUM_DEBUG_CLICK").is_some() {
             eprintln!("click {button} {pressed} at {:?}: bar_hit {:?} menu {} launcher {} card {} shell_hit {}", self.mouse, self.bar_hit(self.mouse).map(|h| (h.bar, h.widget)), self.menu.open, self.launcher_modal(), self.card_hit(self.mouse), self.shell_hit());
@@ -2356,6 +2400,11 @@ impl State {
                 }
                 return;
             }
+            // Super held: the left button moves the window under the pointer from anywhere in it, the right one resizes it
+            // from the nearest corner (the program never sees the click)
+            if (button == BTN_LEFT || button == BTN_RIGHT) && self.keyboard.modifier_state().logo && self.super_drag(button == BTN_RIGHT) {
+                return;
+            }
             if (button == BTN_LEFT || button == BTN_RIGHT) && self.shell_pointer_down(button == BTN_RIGHT) {
                 return;
             }
@@ -2470,6 +2519,7 @@ impl State {
     }
 
     pub fn pointer_axis(&mut self, dx: f64, dy: f64) {
+        self.typing_hid_cursor = false;
         self.activity();
         if self.lock.is_some() {
             return;
@@ -2527,12 +2577,29 @@ impl State {
                 Some(latin) if mods.ctrl || mods.alt || mods.logo => latin,
                 _ => handle.modified_sym(),
             };
+            if pressed && st.typing_hides_cursor(mods, sym) {
+                st.typing_hid_cursor = true;
+            }
             if st.handle_key(evdev, pressed, mods, sym) {
                 FilterResult::Intercept(())
             } else {
                 FilterResult::Forward
             }
         });
+    }
+
+    /// Does this key press hide the cursor? Typing does (text, Backspace, Enter, Delete without Ctrl/Alt/Super), but not
+    /// in a game: a fullscreen window or a held pointer keeps it (WASD would make it blink).
+    fn typing_hides_cursor(&self, mods: &ModifiersState, sym: Keysym) -> bool {
+        if !self.config.input.cursor.hide_typing || mods.ctrl || mods.alt || mods.logo || self.lock.is_some() {
+            return false;
+        }
+        let typing = sym.key_char().is_some_and(|c| !c.is_control()) || matches!(sym, Keysym::BackSpace | Keysym::Return | Keysym::KP_Enter | Keysym::Delete);
+        if !typing || self.pointer_locked() {
+            return false;
+        }
+        let fullscreen = self.focused_shell().is_none() && self.wins.iter().rposition(|w| !w.minimized && !w.or).is_some_and(|i| self.wins[i].fs.is_some());
+        !fullscreen
     }
 
     /// Alt+Tab: the next window by most recent use (`back`: the previous one). Holding Alt and pressing Tab again goes further
@@ -2581,7 +2648,7 @@ impl State {
                 if let Some(h) = self.shot_hold.take() {
                     if !h.fired {
                         self.menu.close();
-                        self.shot_sel = Some(ShotSel { start: None, record: false });
+                        self.begin_shot_sel(None, false);
                     }
                 }
             }
@@ -2636,6 +2703,12 @@ impl State {
             "menu-search" => self.menu_search(),
             "launcher" | "launcher-alt" => self.launcher.toggle(),
             "lock" => self.lock_screen(),
+            "fps-overlay" => {
+                self.fps_on = !self.fps_on;
+                self.fps_since = (Instant::now(), self.frames_drawn);
+                self.fps_text = "…".into();
+                self.invalidate();
+            }
             "settings" => self.toggle_settings(),
             "wallpaper" => self.bar_action("wallpaper"),
             "files" => self.open_shell(Sw::Files),
@@ -2668,7 +2741,7 @@ impl State {
             "screenshot-window" => self.shot_req = Some(ShotReq::Window),
             "screenshot-region" => {
                 self.menu.close();
-                self.shot_sel = Some(ShotSel { start: None, record: false });
+                self.begin_shot_sel(None, false);
             }
             "screen-record" => self.toggle_recording(),
             "workspace-next" => self.step_workspace(1),
@@ -2819,6 +2892,11 @@ impl State {
             self.pending_vt = Some((raw - 0x1008FE01 + 1) as i32);
             return true;
         }
+        // the key's symbol is read without modifiers, so Ctrl+Alt+F1 is plain F1 here, never XF86Switch_VT_1
+        if ctrl && alt && (Keysym::F1.raw()..=Keysym::F12.raw()).contains(&raw) {
+            self.pending_vt = Some((raw - Keysym::F1.raw() + 1) as i32);
+            return true;
+        }
         if self.media_key(raw) {
             return true;
         }
@@ -2863,10 +2941,19 @@ impl State {
             self.open_shell(Sw::Files);
             return;
         }
+        let t0 = std::time::Instant::now();
         match apps::launch(app, &self.socket) {
             Ok(()) => {
+                let spawned = t0.elapsed();
                 eprintln!("launched {}", app.name);
                 self.start_busy();
+                let t1 = std::time::Instant::now();
+                // big enough for the launch icon's size at this scale (it is only scaled down when drawn)
+                let icon_px = ((self.config.input.cursor.launch_size * self.renderer.scale()).ceil() as u32).clamp(48, 128);
+                self.busy_icon = self.icons.get().and_then(|index| index.load(&app.icon, icon_px));
+                if std::env::var_os("MEMRIUM_STATS").is_some() {
+                    eprintln!("stats: launch {}: spawn {:.1} ms, busy icon {:.1} ms", app.name, spawned.as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3);
+                }
             }
             Err(e) => eprintln!("could not launch {}: {e}", app.name),
         }
@@ -3083,7 +3170,11 @@ impl State {
             let windows = self.dock_windows(&key);
             let is_pinned = pinned.contains(&key);
             let badge = self.notifications.unread_for(&key, &name) as u32;
-            items.push(DockItem { key, name, icon, running, separator_before: sep, windows, pinned: is_pinned, badge });
+            // a program the shell did not start was not given the dedicated card
+            // the integrated / dedicated card mark on running programs: off for now (the user asked); true brings it back
+            const GPU_MARKS: bool = false;
+            let gpu = (GPU_MARKS && running && memrium_de::gpu::is_hybrid()).then(|| memrium_de::gpu::launched_on(&key).unwrap_or(false));
+            items.push(DockItem { key, name, icon, running, separator_before: sep, windows, pinned: is_pinned, badge, gpu });
         }
         let focused = if let Some(k) = self.focused_shell() {
             Some(if k == Sw::Settings { apps::SETTINGS_ID } else { apps::FILES_ID }.to_string())
@@ -3153,15 +3244,26 @@ impl State {
                 }
                 return;
             }
-            let target = self.wins.iter().rposition(|w| {
+            let of_app = |s: &State, w: &Win| {
                 w.mapped && !w.or
                     && match key.strip_prefix("win:") {
                         Some(app_id) => w.app_id == app_id,
-                        None => self.app_index_for_window(w).map(|i| self.apps[i].id == key).unwrap_or(false),
+                        None => s.app_index_for_window(w).map(|i| s.apps[i].id == key).unwrap_or(false),
                     }
-            });
+            };
+            let target = self.wins.iter().rposition(|w| of_app(self, w));
             match target {
                 Some(i) => {
+                    // the app has several windows and one of them is in front: the click brings up another (the one
+                    // that was in front longest ago), so repeated clicks go round them all
+                    let front = self.wins.iter().rposition(|w| w.mapped && !w.minimized && !w.or && w.ws == self.workspace);
+                    let count = self.wins.iter().filter(|w| of_app(self, w)).count();
+                    if count > 1 && front == Some(i) && self.focused_shell().is_none() {
+                        if let Some(next) = self.wins.iter().position(|w| of_app(self, w)) {
+                            self.focus_window(next);
+                            return;
+                        }
+                    }
                     // a click on the icon of the window that is in front puts it away (as it does for Settings and Files);
                     // otherwise it comes to the front
                     let front = self.wins.iter().rposition(|w| w.mapped && !w.minimized && !w.or && w.ws == self.workspace);
@@ -3222,8 +3324,8 @@ impl State {
     /// Maximise / restore a shell window (Files and Settings both lay themselves out for any size).
     pub(crate) fn toggle_shell_maximize(&mut self, k: Sw) {
         let area = self.maximize_area([self.size[0] / 2.0, self.size[1] / 2.0]);
-        // the title bar is left out of a maximized window when the setting says so
-        let ins = if self.theme.window.hide_title_max { [0.0; 4] } else { decor::insets(&self.theme) };
+        // the title bar is left out of a maximized window when the setting says so (and always in the unified look)
+        let ins = if self.theme.window.hide_title_max || self.sw_unified() { [0.0; 4] } else { decor::insets(&self.theme) };
         let w = self.shell_win_mut(k);
         if let Some(r) = w.restore.take() {
             w.tile = 0;
@@ -3384,6 +3486,43 @@ impl State {
     }
 
     /// A press on a shell window: chrome buttons, titlebar drag, or content. True when consumed.
+    /// Super + drag: move (or with `resize`, resize from the corner nearest the pointer) the window under the pointer,
+    /// whatever part of it was pressed. False when there is no window there.
+    fn super_drag(&mut self, resize: bool) -> bool {
+        let p = self.mouse;
+        // the corner of `f` nearest to the pointer, as resize edges (left 1, right 2, top 4, bottom 8)
+        let corner = |f: [f32; 4]| (if p[0] < f[0] + f[2] / 2.0 { 1 } else { 2 }) | (if p[1] < f[1] + f[3] / 2.0 { 4 } else { 8 });
+        if let Some(k) = self.shell_covers(p) {
+            self.raise_shell(k);
+            let f = self.sw_frame(k);
+            if resize {
+                if self.shell_win(k).restore.is_none() {
+                    self.grab = Some(Grab::ShellResize { win: k, edges: corner(f), start_mouse: p, start: f });
+                }
+            } else {
+                self.grab = Some(Grab::ShellMove { win: k, off: [p[0] - f[0], p[1] - f[1]], start: p });
+            }
+            return true;
+        }
+        let Some((i, _)) = self.chrome_at(p) else { return false };
+        if self.wins[i].fs.is_some() || self.wins[i].or {
+            return false;
+        }
+        let i = self.focus_window(i);
+        if resize {
+            if !self.wins[i].role.fixed_size() {
+                let e = corner(Self::frame_rect(&self.wins[i]));
+                self.start_resize(i, e);
+            }
+            return true;
+        }
+        let (x, y) = (self.wins[i].x.x, self.wins[i].y.x);
+        let Some(surface) = self.wins[i].role.surface() else { return false };
+        self.wins[i].scale.target = 1.018;
+        self.grab = Some(Grab::Move { surf: surface, off: [p[0] - x, p[1] - y], start: p });
+        true
+    }
+
     fn shell_pointer_down(&mut self, right: bool) -> bool {
         let p = self.mouse;
         if !right {
@@ -3412,11 +3551,20 @@ impl State {
                     return true;
                 }
             }
-            if p[1] < f[1] + ins[1] {
-                self.grab = Some(Grab::ShellMove { win: k, off: [p[0] - f[0], p[1] - f[1]], start: p });
+            // the title bar, or the bare parts of the top row of a window without one, moves the window; a quick
+            // second click there maximizes / restores it
+            if p[1] < f[1] + ins[1] || self.sw_drag_at(k, p) {
+                let now = Instant::now();
+                let double = self.last_title_click.is_some_and(|t| now.duration_since(t).as_millis() < 350);
+                self.last_title_click = if double { None } else { Some(now) };
+                if double {
+                    self.toggle_shell_maximize(k);
+                } else {
+                    self.grab = Some(Grab::ShellMove { win: k, off: [p[0] - f[0], p[1] - f[1]], start: p });
+                }
                 return true;
             }
-        } else if p[1] < f[1] + ins[1] {
+        } else if p[1] < f[1] + ins[1] || self.sw_drag_at(k, p) {
             return true;
         }
         match k {
@@ -3633,24 +3781,71 @@ impl State {
         }
     }
 
-    /// The same for a shell window (Settings, Files).
+    /// The same for a shell window (Settings, Files). In the unified look they have no title bar at all.
     fn sw_ins(&self, k: Sw) -> [f32; 4] {
-        if self.theme.window.hide_title_max && self.shell_win(k).restore.is_some() {
+        if self.sw_unified() || (self.theme.window.hide_title_max && self.shell_win(k).restore.is_some()) {
             [0.0; 4]
         } else {
             decor::insets(&self.theme)
         }
     }
 
+    /// Do the shell's own windows (Files, Settings) leave out the title bar and put the window buttons into their top
+    /// row, as macOS does (Finder, System Settings)? Every frame but a slab of glass around the client (Aero) does.
+    pub(crate) fn sw_unified(&self) -> bool {
+        !decor::glass_frame(&self.theme)
+    }
+
+    /// Height of a shell window's top row, the title bar in the unified look.
+    fn sw_bar_h(k: Sw) -> f32 {
+        match k {
+            Sw::Files => files::TOOLBAR_H,
+            Sw::Settings => memrium_de::settings::TOOLBAR_H,
+        }
+    }
+
     /// The theme to draw and hit-test a shell window with: without a title bar while it is maximized and that is left out.
+    /// In the unified look the "title bar" is the window's top row: the buttons are centred in it, and nothing of a
+    /// coloured bar is drawn under the content.
     fn sw_theme(&self, k: Sw) -> std::borrow::Cow<'_, Theme> {
         if self.theme.window.hide_title_max && self.shell_win(k).restore.is_some() {
             let mut t = self.theme.clone();
             t.window.decoration = DecoKind::Minimal;
             std::borrow::Cow::Owned(t)
+        } else if self.sw_unified() {
+            let mut t = self.theme.clone();
+            t.window.titlebar = Self::sw_bar_h(k);
+            t.window.frame.bar = memrium_de::theme::BarMaterial::Body;
+            std::borrow::Cow::Owned(t)
         } else {
             std::borrow::Cow::Borrowed(&self.theme)
         }
+    }
+
+    /// The room a shell window's buttons take at the left and the right of its top row (unified look only).
+    fn sw_chrome(&self, k: Sw) -> Option<[f32; 2]> {
+        if !self.sw_unified() {
+            return None;
+        }
+        let f = self.sw_frame(k);
+        let mut room = [0.0f32; 2];
+        for (_, r) in decor::buttons(&self.sw_theme(k), f) {
+            if r[0] + r[2] / 2.0 < f[0] + f[2] / 2.0 {
+                room[0] = room[0].max(r[0] + r[2] - f[0] + 12.0);
+            } else {
+                room[1] = room[1].max(f[0] + f[2] - r[0] + 8.0);
+            }
+        }
+        Some(room)
+    }
+
+    /// A press at `p` on a bare part of a unified shell window's top row: it moves the window like a title bar.
+    fn sw_drag_at(&self, k: Sw, p: [f32; 2]) -> bool {
+        self.sw_unified()
+            && match k {
+                Sw::Files => self.files.drag_at(p),
+                Sw::Settings => self.settings.drag_at(p),
+            }
     }
 
     pub(crate) fn with_bar_ctx<R>(&self, f: impl FnOnce(&BarCtx) -> R) -> R {
@@ -3997,7 +4192,7 @@ impl State {
             "files" => self.open_shell(Sw::Files),
             "terminal" => self.bar_command(B_TERMINAL),
             "screenshot" => self.shot_req = Some(ShotReq::Full),
-            "screenshot-region" => self.shot_sel = Some(ShotSel { start: None, record: false }),
+            "screenshot-region" => self.begin_shot_sel(None, false),
             "screen-record" => self.toggle_recording(),
             "control-center" => self.bar_command(B_CC),
             "edit-controls" => self.bar_command(B_EDIT),
@@ -4014,7 +4209,7 @@ impl State {
             "prev-desktop" => self.step_workspace(-1),
             "quit" => self.quit = true,
             "dark-mode" => {
-                let mut t = self.theme.clone();
+                let mut t = self.base_theme.clone();
                 t.dark = !t.dark;
                 self.apply_theme(t);
             }
@@ -4460,6 +4655,9 @@ impl State {
 
     /// Switch to a new theme: window insets, shell layout and the saved config follow.
     pub fn apply_theme(&mut self, theme: Theme) {
+        // what is saved and edited is the user's theme; what is drawn may be its maximum-efficiency form
+        self.base_theme = theme.clone();
+        let theme = if memrium_de::efficiency::enabled() { theme.efficient() } else { theme };
         // light <-> dark spreads out from the pointer (the button that was clicked) as a circle
         let an = theme.animations.clone();
         if theme.dark != self.theme.dark && an.enabled && an.switch != memrium_de::theme::SwitchAnim::None && self.lock.is_none() && !self.capturing && std::env::var_os("MEMRIUM_NO_ANIM").is_none() {
@@ -4473,6 +4671,13 @@ impl State {
         match self.theme.glass.mode {
             memrium_de::theme::GlassMode::Paper => self.theme.glass.tint = memrium_de::theme::GlassStyle::paper_tint(self.theme.dark),
             memrium_de::theme::GlassMode::Wood => self.theme.glass.tint = memrium_de::theme::GlassStyle::wood_tint(self.theme.dark),
+            // liquid glass is whitish by day and smoky by night; its strength is the user's
+            memrium_de::theme::GlassMode::Liquid => {
+                let a = self.theme.glass.tint[3];
+                let t = memrium_de::theme::GlassStyle::liquid_tint(self.theme.dark);
+                let base = memrium_de::theme::GlassStyle::liquid_tint(false)[3];
+                self.theme.glass.tint = [t[0], t[1], t[2], if self.theme.dark { t[3] * a / base } else { a }.clamp(0.0, 0.9)];
+            }
             _ => {}
         }
         let (hide, normal) = (self.theme.window.hide_title_max, decor::insets(&self.theme));
@@ -4483,7 +4688,7 @@ impl State {
         self.renderer.set_icon_tile(self.theme.icons.tile_style());
         self.scene.set_theme(&self.theme);
         self.scene.set_menu_light(self.menu_light);
-        self.config.set_from(&self.theme);
+        self.config.set_from(&self.base_theme);
         self.cfg_dirty = Some(Instant::now());
         memrium_de::theme::export_appearance(&self.theme, &self.config.language);
         self.export_cursor_theme();
@@ -4510,7 +4715,7 @@ impl State {
         };
         let dark = !(7..19).contains(&hour);
         if dark != self.theme.dark {
-            let mut t = self.theme.clone();
+            let mut t = self.base_theme.clone();
             t.dark = dark;
             self.apply_theme(t);
         }
@@ -4702,6 +4907,7 @@ impl State {
                 SettingsAction::Close => self.settings.close(),
                 SettingsAction::Sys(cmd) => self.sys_watcher.send(cmd),
                 SettingsAction::TestNotification => self.test_notification(),
+                SettingsAction::TestOsd => self.test_osd(),
                 SettingsAction::Preset(id) => {
                     // a clean template switch, but keep the user's wallpaper
                     let wallpaper = self.theme.wallpaper.clone();
@@ -4745,7 +4951,7 @@ impl State {
                     });
                 }
                 SettingsAction::Wallpaper(spec) => {
-                    let mut t = self.theme.clone();
+                    let mut t = self.base_theme.clone();
                     t.wallpaper = spec.clone();
                     self.apply_theme(t);
                     self.apply_wallpaper(&spec);
@@ -4827,11 +5033,19 @@ impl State {
             }
         }
         let origin = [frame[0] + ins[0], frame[1] + ins[1]];
+        // the unified look: no title bar; the content covers the whole frame and the window buttons go on top of it,
+        // in its top row. The window's name is where macOS has it: the page title, the folder in the path bar.
+        let chrome = self.sw_chrome(k);
+        let buttons = if chrome.is_some() { decor::take_buttons(&frame_theme, frame, &mut panels) } else { Vec::new() };
+        let title_text = |name: &str| if chrome.is_some() { String::new() } else { name.to_string() };
+        let corner = if self.shell_win(k).restore.is_some() && self.theme.window.max_gap < 0.5 { 0.0 } else { decor::radius(&self.theme) };
         match k {
             Sw::Settings => {
-                let title = decor::title_labels(&frame_theme, frame, "Settings", focused);
+                self.settings.chrome = chrome;
+                self.settings.corner = corner;
+                let title = decor::title_labels(&frame_theme, frame, &title_text("Settings"), focused);
                 panels.extend(self.renderer.label_panels(&title));
-                let mut theme = self.theme.clone();
+                let mut theme = self.base_theme.clone();
                 let mut cfg = self.config.clone();
                 // a few of the apps in the Dock, for the Icons page's preview
                 let icon_cells: Vec<(u32, String)> = self.pinned_indices().into_iter().filter_map(|i| Some((self.renderer.app_icon_get(&self.apps[i].id)?, self.apps[i].name.clone()))).take(8).collect();
@@ -4856,6 +5070,21 @@ impl State {
                             let tile = self.renderer.icon_tile();
                             self.icon_loader.request_pack(&id, pack, icon, tile);
                         }
+                    } else if id.starts_with("cursor:") {
+                        // a cursor preview of the Mouse page; the previews of an older look go back to the atlas
+                        if self.renderer.app_icon_get(&id).is_none() {
+                            if let Some((img, look)) = memrium_de::cursor::preview_image(&id) {
+                                if look != self.cursor_preview_look {
+                                    for old in self.cursor_previews.drain(..) {
+                                        self.renderer.app_icon_free(&old);
+                                    }
+                                    self.cursor_preview_look = look;
+                                }
+                                if self.renderer.image_cell(&id, &img).is_some() {
+                                    self.cursor_previews.push(id);
+                                }
+                            }
+                        }
                     } else if let Some(name) = id.strip_prefix("icon:") {
                         // an icon of the pack in use, for a widget's icon picker
                         if budget > 0 && self.renderer.app_icon_get(&id).is_none() && !self.icon_failed.contains(&id) {
@@ -4872,7 +5101,7 @@ impl State {
                 tidy(&mut cfg.keys);
                 let mut had = self.config.keys.clone();
                 tidy(&mut had);
-                if cfg.screenshots != self.config.screenshots || cfg.power != self.config.power || cfg.keys != had || cfg.weather_city != self.config.weather_city || cfg.display != self.config.display || cfg.input != self.config.input || cfg.notifications != self.config.notifications || cfg.desktop != self.config.desktop {
+                if cfg.screenshots != self.config.screenshots || cfg.power != self.config.power || cfg.keys != had || cfg.weather_city != self.config.weather_city || cfg.display != self.config.display || cfg.input != self.config.input || cfg.notifications != self.config.notifications || cfg.desktop != self.config.desktop || cfg.osd != self.config.osd {
                     self.desktop.prefs = cfg.desktop.clone();
                     self.config.desktop = cfg.desktop;
                     self.config.screenshots = cfg.screenshots;
@@ -4881,6 +5110,8 @@ impl State {
                     self.config.keys = cfg.keys;
                     self.config.weather_city = cfg.weather_city;
                     self.config.notifications = cfg.notifications;
+                    // (the Indicator page: without this its changes were thrown away the next frame)
+                    self.config.osd = cfg.osd;
                     self.config.display = cfg.display;
                     // pointer speed and the like reach the devices on the next turn of the session's loop
                     self.input_dirty = cfg.input != self.config.input;
@@ -4893,14 +5124,16 @@ impl State {
                 }
                 panels.extend(cp);
                 panels.extend(self.renderer.label_panels(&cl));
-                if theme != self.theme {
+                if theme != self.base_theme {
                     self.pending_theme = Some(theme);
                 }
                 self.pending_actions.extend(actions);
             }
             Sw::Files => {
                 let name = if fsops::is_computer(&self.files.cwd) { "Computer".to_string() } else { self.files.cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "/".into()) };
-                let title = decor::title_labels(&frame_theme, frame, &format!("Files — {name}"), focused);
+                self.files.chrome = chrome;
+                self.files.corner = corner;
+                let title = decor::title_labels(&frame_theme, frame, &title_text(&format!("Files — {name}")), focused);
                 panels.extend(self.renderer.label_panels(&title));
                 let time = self.time_ms() as f32 / 1000.0;
                 let files_size = self.client_size(Sw::Files);
@@ -4918,6 +5151,10 @@ impl State {
                 panels.extend(self.renderer.label_panels(&cl));
             }
         }
+        // the content's fills that reach the window's corners are rounded like the window
+        let ws = &frame_theme.window;
+        decor::round_to_frame(&mut panels, frame, if self.shell_win(k).restore.is_some() && ws.max_gap < 0.5 { 0.0 } else { ws.radius });
+        panels.extend(buttons);
         panels
     }
 
@@ -4946,14 +5183,15 @@ impl State {
             p
         } else {
             let sh = self.theme.window.shadow_idle;
-            let r = if deco == Deco::Client { self.theme.window.radius.min(18.0) } else { 0.0 };
-            vec![Panel::solid(f[0] + f[2] / 2.0, f[1] + f[3] / 2.0, f[2], f[3], r, [0.97; 3], [0.95; 3]).flat().alpha(0.0).shadow(sh[0], sh[1], sh[2])]
+            let filled = maximized && self.theme.window.max_gap < 0.5;
+            let r = if deco == Deco::Client && !filled { self.theme.window.radius.min(18.0) } else { 0.0 };
+            vec![decor::client_shadow(&self.theme, f, r, sh, false, deco == Deco::Client && !filled)]
         };
         let clip = match (deco, self.theme.window.decoration) {
             (Deco::Legacy, _) => None,
             (Deco::Server, _) if decor::glass_frame(&self.theme) => Some(([f[0] + ins[0], f[1] + ins[1], f[2] - ins[0] - ins[2], f[3] - ins[1] - ins[3]], 0.0)),
             (Deco::Server, _) => Some((f, if maximized && self.theme.window.max_gap < 0.5 { 0.0 } else { self.theme.window.radius })),
-            (Deco::Client, _) => Some((f, self.theme.window.radius.min(18.0))),
+            (Deco::Client, _) => Some((f, if maximized && self.theme.window.max_gap < 0.5 { 0.0 } else { self.theme.window.radius.min(18.0) })),
         };
         let mut surf = None;
         if let Some(n) = self.surfaces.get_mut(&root.id()) {
@@ -4979,13 +5217,40 @@ impl State {
         }
         self.follow_gtk();
         self.sync_app_style();
+        if self.fps_on && self.fps_since.0.elapsed().as_secs_f32() >= 1.0 {
+            let secs = self.fps_since.0.elapsed().as_secs_f32();
+            let drawn = self.frames_drawn - self.fps_since.1;
+            // the badge's own redraw is one frame: a desktop that only did that is idle (and stays so, the text not changing)
+            let text = if drawn <= 1 { "idle".to_string() } else { format!("{:.0} fps", drawn as f32 / secs) };
+            self.fps_since = (Instant::now(), self.frames_drawn);
+            if text != self.fps_text {
+                self.fps_text = text;
+                self.invalidate();
+            }
+        }
         // give free memory back to the system now and then (a wallpaper or an icon scan leaves a lot behind); only after
         // something was drawn since the last time: an idle desktop allocates nothing, and the trim walks the whole heap
+        // The trim walks every arena with its lock held (tens of ms, other threads' allocations wait): it waits until the
+        // desktop has been still for two seconds, never in the middle of a drag or an animation
         static LAST_TRIM: std::sync::Mutex<Option<(Instant, u64)>> = std::sync::Mutex::new(None);
+        static LAST_DRAWN: std::sync::Mutex<(u64, Option<Instant>)> = std::sync::Mutex::new((0, None));
+        let still = match LAST_DRAWN.lock() {
+            Ok(mut d) => {
+                if d.0 != self.frames_drawn || d.1.is_none() {
+                    *d = (self.frames_drawn, Some(Instant::now()));
+                }
+                d.1.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(2))
+            }
+            Err(_) => false,
+        };
         if let Ok(mut last) = LAST_TRIM.lock() {
             let due = last.map_or(true, |(t, drawn)| t.elapsed() > std::time::Duration::from_secs(4) && drawn != self.frames_drawn);
-            if due && self.start.elapsed() > std::time::Duration::from_secs(3) {
+            if due && still && self.start.elapsed() > std::time::Duration::from_secs(3) {
+                let t0 = Instant::now();
                 chebrium::mem::trim();
+                if std::env::var_os("MEMRIUM_STATS").is_some() && t0.elapsed().as_millis() > 20 {
+                    eprintln!("stall: malloc_trim took {} ms", t0.elapsed().as_millis());
+                }
                 *last = Some((Instant::now(), self.frames_drawn));
             }
         }
@@ -5013,6 +5278,10 @@ impl State {
         if let Some(req) = self.shot_req.take() {
             self.take_screenshot(req);
         }
+        // the frozen picture is only needed until the picked area has been cut out of it
+        if self.shot_sel.is_none() && self.shot_req.is_none() {
+            self.shot_freeze = None;
+        }
         self.record_tick();
         self.sync_dock();
         self.scene.set_animation(&an);
@@ -5021,6 +5290,7 @@ impl State {
         self.update_dock_preview(dt);
         self.update_tooltip(dt);
         self.tick_cursor();
+        self.watch_soft();
         self.process_shell_events();
         let kind = self.launcher.kind(self.theme.launcher.style);
         self.launcher.figlet = kind == memrium_de::theme::LauncherKind::Figlet;
@@ -5081,6 +5351,12 @@ impl State {
         self.update_reveal();
         self.update_idle();
         self.update_auto_dark();
+        // the maximum-efficiency mode was switched in Settings: show the theme in its new form
+        if memrium_de::efficiency::take_changed() {
+            let t = self.base_theme.clone();
+            self.apply_theme(t);
+            self.invalidate();
+        }
         self.update_widgets(dt);
         self.update_vinyl(dt);
         self.update_visualizer();
@@ -5294,228 +5570,6 @@ impl State {
         self.scene.set_menu_light(self.menu_light);
     }
 
-    /// Draw one frame into `target`.
-    pub fn render(&mut self, target: &wgpu::TextureView) -> wgpu::CommandEncoder {
-        match self.render_lazy(|| Some(target.clone())) {
-            Some(enc) => enc,
-            // identical to the last frame: nothing to draw
-            None => self.renderer.device().create_command_encoder(&Default::default()),
-        }
-    }
-
-    /// Like `render`, but the target is only asked for when the frame really changed (acquiring a swapchain image
-    /// costs a vblank wait). `None` = nothing to draw (the frame is identical to the last one, or no target).
-    pub fn render_lazy(&mut self, target: impl FnOnce() -> Option<wgpu::TextureView>) -> Option<wgpu::CommandEncoder> {
-        if self.screen_off {
-            let w = self.world;
-            let mut shell = vec![Panel::solid((w[0] + w[2]) / 2.0, (w[1] + w[3]) / 2.0, w[2] - w[0], w[3] - w[1], 0.0, [0.0; 3], [0.0; 3]).flat()];
-            let mut items: Vec<Item<'_>> = Vec::new();
-            let hash = self.frame_hash(&shell, &items);
-            self.frame_skipped = self.allow_skip && hash == self.last_hash;
-            self.last_hash = hash;
-            if self.frame_skipped {
-                return None;
-            }
-            let target = target()?;
-            self.damage.reset();
-            let off = self.canvas_off();
-            memrium_de::renderer::shift_scene(&mut items, &mut shell, off[0], off[1]);
-            return Some(self.renderer.render(&target, &items, &shell));
-        }
-        if self.lock.is_some() {
-            // the lock screen is the whole picture: no windows, bars or notifications behind it
-            let (lock_shell, labels) = self.lock_panels();
-            // every monitor is covered, not only the main one
-            let w = self.world;
-            let mut shell = vec![Panel::solid((w[0] + w[2]) / 2.0, (w[1] + w[3]) / 2.0, w[2] - w[0], w[3] - w[1], 0.0, [0.0; 3], [0.0; 3]).flat()];
-            shell.extend(lock_shell);
-            shell.extend(self.renderer.label_panels(&labels));
-            let mut items: Vec<Item<'_>> = Vec::new();
-            let hash = self.frame_hash(&shell, &items);
-            self.frame_skipped = self.allow_skip && !self.renderer.is_live() && hash == self.last_hash;
-            self.last_hash = hash;
-            if self.frame_skipped {
-                return None;
-            }
-            self.frames_drawn += 1;
-            let Some(target) = target() else {
-                self.last_hash = 0;
-                return None;
-            };
-            self.damage.reset();
-            let off = self.canvas_off();
-            memrium_de::renderer::shift_scene(&mut items, &mut shell, off[0], off[1]);
-            return Some(self.renderer.render(&target, &items, &shell));
-        }
-        self.renderer.set_glass_adapt(self.theme.glass.adapt);
-        // shell: Dock, Quick Settings, labels
-        let (bar_p, bar_l) = self.bar_draw();
-        let mut shell = bar_p;
-        shell.extend(self.scene.shell_panels());
-        let mut labels = self.scene.labels();
-        labels.extend(bar_l);
-        // the Glass page's samples refract the backdrop the page paints, so they live above the window
-        if self.focused_shell() == Some(Sw::Settings) && self.settings.open && !self.swin.minimized && self.swin.k.x > 0.985 {
-            let (pp, pl) = self.settings.preview_shell.clone();
-            shell.extend(pp);
-            labels.extend(pl);
-        }
-        if self.launcher.visible() {
-            let pinned = self.pinned_indices();
-            let mut budget = 8u32;
-            for i in self.launcher.wanted_icons(&pinned, &self.apps) {
-                self.ensure_icon(i, &mut budget);
-            }
-            let renderer = &self.renderer;
-            // the start menu sits on the bar that holds the start button
-            let (bar, anchor) = self.with_bar_ctx(|c| match self.bars.iter().find(|b| b.has("start")) {
-                Some(b) => ((Some((b.cfg.edge, b.rect(c)))), b.widget_rects(c).iter().find(|(_, _, k)| *k == "start").map(|(_, r, _)| *r)),
-                None => (None, None),
-            });
-            let ctx = DrawCtx { screen: self.size, apps: &self.apps, pinned: &pinned, theme: &self.theme, bar, anchor, icon_cell: &|a: &AppEntry| renderer.app_icon_get(&a.id) };
-            let (lp, ll) = self.launcher.draw(&ctx);
-            shell.extend(lp);
-            labels.extend(ll);
-        }
-        let mut toast_labels = Vec::new();
-        self.toast_panels(&mut shell, &mut toast_labels);
-        self.widgets_panels(&mut shell, &mut toast_labels);
-        self.flyout_panels(&mut shell, &mut toast_labels);
-        self.card_panels(&mut shell, &mut toast_labels);
-        labels.extend(toast_labels);
-        shell.extend(self.renderer.label_panels(&labels));
-        if let Some(d) = self.file_drag.as_ref().filter(|d| d.active) {
-            let text = match d.paths.as_slice() {
-                [one] => one.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-                many => format!("{} items", many.len()),
-            };
-            let text = if self.renderer.text_width(&text, 13.0, true) > 200.0 { format!("{}…", text.chars().take(24).collect::<String>()) } else { text };
-            let w = self.renderer.text_width(&text, 13.0, true) + 46.0;
-            let (cx, cy) = (self.mouse[0] + 18.0 + w / 2.0, self.mouse[1] + 22.0);
-            let mut g = self.theme.glass.panel(cx, cy, w, 30.0, 15.0).tinted([0.08, 0.10, 0.16, 0.70]);
-            g.extra[0] = 0.25;
-            shell.push(g);
-            shell.push(Panel::glyph(cx - w / 2.0 + 18.0, cy, 15.0, if d.paths.len() > 1 { "copy" } else { "file" }, [1.0; 3], 0.95));
-            let gl = vec![Label::new(text, cx - w / 2.0 + 34.0, cy + 4.8, 13.0, true, [1.0; 3], 1.0, memrium_de::renderer::Align::Left)];
-            shell.extend(self.renderer.label_panels(&gl));
-        }
-        if self.panel_edit.is_some() && !self.capturing {
-            let (ep, el) = self.panel_edit_overlay();
-            shell.extend(ep);
-            shell.extend(self.renderer.label_panels(&el));
-        }
-        if self.menu.open {
-            let r = &self.renderer;
-            let (mp, ml) = self.menu.draw(&self.theme, self.size, &|t, s, b| r.text_width(t, s, b));
-            shell.extend(mp);
-            shell.extend(self.renderer.label_panels(&ml));
-        }
-
-        if !self.capturing {
-            self.shot_overlay(&mut shell);
-            self.shot_edit_overlay(&mut shell);
-        }
-
-        // window layer (titles are text panels inside each window's frame)
-        let default_dock = [self.size[0] / 2.0, self.size[1] - 40.0];
-        let docks: Vec<[f32; 2]> = self.wins.iter().map(|w| self.item_center(&self.key_of(w)).unwrap_or(default_dock)).collect();
-        let focus = self.wins.iter().rposition(|w| !w.minimized);
-        let mut title_panels: HashMap<usize, Vec<Panel>> = HashMap::new();
-        if !self.menu.open {
-            self.title_menu = None;
-        }
-        let title_hover = match self.chrome_at(self.mouse) {
-            Some((j, Hit::Titlebar)) if !self.menu.open => Some(j),
-            _ => None,
-        };
-        for (i, w) in self.wins.iter().enumerate() {
-            if !w.mapped || w.min_k.x > 0.985 || w.deco != Deco::Server {
-                continue;
-            }
-            let f = Self::frame_rect(w);
-            // the program's menus take the left of the title bar, and the title moves over to make room
-            let menus = self.title_menus(i);
-            let mut tf = f;
-            if let Some((_, last)) = menus.last() {
-                let shift = last[0] + last[2] + 14.0 - decor::title_span(&self.theme, f).0;
-                if shift > 0.0 {
-                    tf = [f[0] + shift, f[1], f[2] - shift, f[3]];
-                }
-            }
-            let (x0, x1) = decor::title_span(&self.theme, tf);
-            let title = ellipsize(&self.renderer, &w.title, 13.0, (x1 - x0).max(40.0));
-            let th = w.chrome_theme(&self.theme);
-            let mut labels = decor::title_labels(&th, tf, &title, Some(i) == focus);
-            let mut panels = Vec::new();
-            if !menus.is_empty() {
-                let rects: Vec<[f32; 4]> = menus.iter().map(|(_, r)| *r).collect();
-                let open = self.menu.open.then(|| self.title_menu.as_ref().filter(|(id, _)| *id == w.id).and_then(|(_, n)| menus.iter().position(|(m, _)| m == n))).flatten();
-                let under = if open.is_none() && title_hover == Some(i) { menus.iter().position(|(_, r)| Self::in_rect(self.mouse, *r)) } else { None };
-                panels = decor::title_menu_panels(&th, &rects, open.or(under), open.is_some());
-                labels.extend(decor::title_menu_labels(&th, f, &menus, Some(i) == focus));
-            }
-            panels.extend(self.renderer.label_panels(&labels));
-            title_panels.insert(i, panels);
-        }
-
-        let mut shells = Vec::new();
-        for k in self.z.clone() {
-            let stamp = self.shell_win(k).stamp;
-            shells.push((stamp, self.shell_item(k)));
-        }
-        let desktop = if self.capture_alone { None } else { self.desktop_item() };
-        let preview = self.preview_layout();
-        self.tooltip_panels(&mut shell);
-        if let Some(l) = &preview {
-            let labels = self.preview_shell(l);
-            let lp = self.renderer.label_panels(&labels);
-            shell.extend(lp);
-        }
-        let ime = self.ime_popup_origins();
-        let mut items = build_items(&self.wins, &self.popups, &self.surfaces, ime, focus, &docks, &title_panels, &self.theme, self.hover_btn, shells, desktop, &self.ghosts, self.renderer.scale().max(1.0), &self.rules, (self.ws_pos.x, self.size[0]));
-        if let Some(l) = &preview {
-            items.extend(crate::dock::preview_items(l, &self.wins, &self.surfaces, self.theme.dark, self.theme.accent));
-        }
-        if self.capture_alone {
-            shell.clear();
-        }
-        // the picked area's picture, over everything the screen shows
-        if let Some(e) = &self.shot_edit {
-            items.push(Item::Surface { tex: e.tex(), rect: e.rect(), clip: None, frosted: false, alpha: 1.0, veil: 1.0 });
-        }
-        let hash = self.frame_hash(&shell, &items);
-        self.frame_skipped = self.allow_skip && !self.renderer.is_live() && hash == self.last_hash;
-        self.last_hash = hash;
-        if self.frame_skipped {
-            return None;
-        }
-        self.frames_drawn += 1;
-        if std::env::var_os("MEMRIUM_WHY").is_some() {
-            self.why_redraw(&shell, &items);
-        }
-        let Some(target) = target() else {
-            // nothing was drawn, so the next frame must not be skipped as a duplicate
-            self.last_hash = 0;
-            self.damage.reset();
-            return None;
-        };
-        match self.theme.glass.mode {
-            memrium_de::theme::GlassMode::Wood => memrium_de::renderer::retint_boards(&mut items, &mut shell, 13, self.theme.glass.tint),
-            memrium_de::theme::GlassMode::Clay => memrium_de::renderer::pastelize_clay(&mut items, &mut shell, self.theme.dark),
-            _ => {}
-        }
-        let off = self.canvas_off();
-        // what changed since the last frame (the glass modes that recolour the panels afterwards redraw everything)
-        let full = !(self.persistent_target && self.allow_skip) || self.renderer.is_live() || self.capturing || self.renderer.reveal_key() != 0 || std::env::var_os("MEMRIUM_NO_DAMAGE").is_some() || matches!(self.theme.glass.mode, memrium_de::theme::GlassMode::Wood | memrium_de::theme::GlassMode::Clay);
-        let damage = self.damage.diff(self.renderer.epoch(), &items, &shell, full).map(|d| [d[0] + off[0], d[1] + off[1], d[2] + off[0], d[3] + off[1]]);
-        if !self.allow_skip {
-            // drawn into some other texture (a screenshot): the real target does not hold this frame
-            self.damage.reset();
-        }
-        memrium_de::renderer::shift_scene(&mut items, &mut shell, off[0], off[1]);
-        Some(self.renderer.render_damaged(&target, &items, &shell, damage))
-    }
-
     /// Draw the region picker, the notice and the flash.
     fn shot_overlay(&mut self, shell: &mut Vec<Panel>) {
         // the picker spans the whole desktop; the notice stays on the main monitor
@@ -5686,7 +5740,7 @@ impl State {
             self.stop_recording();
         } else if self.rec_done.is_none() {
             self.menu.close();
-            self.shot_sel = Some(ShotSel { start: None, record: true });
+            self.begin_shot_sel(None, true);
         }
     }
 
@@ -5791,117 +5845,6 @@ impl State {
         }
     }
 
-    /// Forget the last frame so the next `render` draws for sure (VT switch, resize).
-    pub fn invalidate(&mut self) {
-        self.last_hash = 0;
-        self.damage.reset();
-    }
-
-    /// Debug (`MEMRIUM_WHY=1`): says what made this frame differ from the last one, summed up every 200 frames.
-    fn why_redraw(&self, shell: &[Panel], items: &[memrium_de::renderer::Item]) {
-        use memrium_de::renderer::Item;
-        use std::cell::RefCell;
-        use std::collections::HashMap;
-        use std::hash::Hasher;
-        #[derive(Default)]
-        struct Why {
-            n: u32,
-            epoch: u64,
-            shell: u64,
-            surf: HashMap<usize, u64>,
-            count: HashMap<String, u32>,
-        }
-        thread_local!(static WHY: RefCell<Why> = RefCell::new(Why::default()));
-        WHY.with(|w| {
-            let mut w = w.borrow_mut();
-            let mut hs = std::collections::hash_map::DefaultHasher::new();
-            hs.write(bytemuck::cast_slice(shell));
-            let (ep, sh) = (self.renderer.epoch(), hs.finish());
-            if ep != w.epoch {
-                *w.count.entry("renderer epoch".into()).or_default() += 1;
-            }
-            if sh != w.shell {
-                *w.count.entry("shell panels".into()).or_default() += 1;
-            }
-            let mut changed = Vec::new();
-            for it in items {
-                match it {
-                    Item::Surface { tex, .. } => {
-                        let k = *tex as *const _ as usize;
-                        let g = tex.generation();
-                        if w.surf.insert(k, g) != Some(g) {
-                            changed.push("surface".to_string());
-                        }
-                    }
-                    Item::Frame { .. } => changed.push("window frame".to_string()),
-                    Item::Layer { .. } => changed.push("layer".to_string()),
-                    _ => {}
-                }
-            }
-            // a frame item is only counted when the whole item list's hash moved, so the surface lines are the useful ones
-            for c in changed.into_iter().filter(|c| c == "surface") {
-                *w.count.entry(c).or_default() += 1;
-            }
-            w.epoch = ep;
-            w.shell = sh;
-            w.n += 1;
-            if w.n >= 200 {
-                eprintln!("why: {} redraws: {:?}", w.n, w.count);
-                w.n = 0;
-                w.count.clear();
-            }
-        });
-    }
-
-    fn frame_hash(&self, shell: &[Panel], items: &[memrium_de::renderer::Item]) -> u64 {
-        use memrium_de::renderer::Item;
-        use std::hash::Hasher;
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        h.write_u64(self.renderer.epoch());
-        h.write_u32(self.renderer.reveal_key());
-        h.write(bytemuck::cast_slice(shell));
-        for it in items {
-            match it {
-                Item::Warp(w) => {
-                    h.write_u8(2);
-                    if let Some(w) = w {
-                        h.write(bytemuck::cast_slice(&w.rect));
-                        h.write_u32(w.t.to_bits());
-                        h.write(bytemuck::cast_slice(&w.dock));
-                        if let Some(j) = &w.jelly {
-                            h.write(bytemuck::cast_slice(j));
-                        }
-                    }
-                }
-                Item::Frame { panels, bbox, fade } => {
-                    h.write_u8(0);
-                    h.write_u32(fade.to_bits());
-                    h.write(bytemuck::cast_slice(panels));
-                    h.write(bytemuck::cast_slice(bbox));
-                }
-                Item::Layer { panels, bbox } => {
-                    h.write_u8(3);
-                    h.write(bytemuck::cast_slice(panels));
-                    h.write(bytemuck::cast_slice(bbox));
-                }
-                Item::Opaque(_) => {}
-                Item::Surface { tex, rect, clip, frosted, alpha, veil } => {
-                    h.write_u8(1);
-                    h.write_u32(veil.to_bits());
-                    h.write_u32(alpha.to_bits());
-                    h.write_usize(*tex as *const _ as usize);
-                    h.write_u64(tex.generation());
-                    h.write(bytemuck::cast_slice(rect));
-                    h.write_u8(*frosted as u8);
-                    if let Some((r, rad)) = clip {
-                        h.write(bytemuck::cast_slice(r));
-                        h.write_u32(rad.to_bits());
-                    }
-                }
-            }
-        }
-        h.finish().max(1)
-    }
 }
 
 /// Apply a window's lift/minimize transform (scale about its centre, then a pull towards the Dock).
@@ -5935,6 +5878,11 @@ impl Xf {
         p.params[0] *= self.s;
         p.extra[1] *= self.s;
         p.extra[2] *= self.s;
+        // the box a panel is cut to moves and scales with it
+        if p.clip[2] > 0.0 {
+            let cc = [self.c[0] + (p.clip[0] - self.c[0]) * self.s + self.t[0], self.c[1] + (p.clip[1] - self.c[1]) * self.s + self.t[1]];
+            p.clip = [cc[0], cc[1], p.clip[2] * self.s, p.clip[3] * self.s];
+        }
         p
     }
 }
@@ -6000,8 +5948,11 @@ fn build_items<'a>(
             decor::frame_panels(&w.chrome_theme(theme), f, focused, maximized, hover.filter(|(hi, _)| *hi == i).map(|(_, b)| b))
         } else {
             let sh = if fs { [0.0; 3] } else if focused { theme.window.shadow } else { theme.window.shadow_idle };
-            let r = if w.deco == Deco::Client && !fs { theme.window.radius.min(18.0) } else { 0.0 };
-            vec![Panel::solid(f[0] + f[2] / 2.0, f[1] + f[3] / 2.0, f[2], f[3], r, [0.97; 3], [0.95; 3]).flat().alpha(0.0).shadow(sh[0], sh[1], sh[2])]
+            // a maximized window that fills its area has square corners: nothing of the desktop may show in them
+            let rounded = w.deco == Deco::Client && !fs && !(maximized && theme.window.max_gap < 0.5);
+            let r = if rounded { theme.window.radius.min(18.0) } else { 0.0 };
+            // (the hairline only round a shape we cut the program's picture to)
+            vec![decor::client_shadow(theme, f, r, sh, focused, rounded)]
         };
         for p in panels.iter_mut() {
             *p = xf.panel(*p);
@@ -6025,9 +5976,13 @@ fn build_items<'a>(
             // Aero: the glass frame supplies the rounded outline, the client is a plain rectangle
             (Deco::Server, _) if decor::glass_frame(theme) => Some((xf.rect(client_rect), 0.0)),
             (Deco::Server, _) => Some((xf.rect(f), if maximized && theme.window.max_gap < 0.5 { 0.0 } else { theme.window.radius * xf.s })),
-            (Deco::Client, _) => Some((xf.rect(f), theme.window.radius.min(18.0) * xf.s)),
+            (Deco::Client, _) => Some((xf.rect(f), if maximized && theme.window.max_gap < 0.5 { 0.0 } else { theme.window.radius.min(18.0) * xf.s })),
         };
-        for (s, off) in surface_tree(root) {
+        let tree = surface_tree(root);
+        // a surface placed under the window (a picture the program draws on the GPU) shows through the window's
+        // transparent parts: frosting would blur it
+        let has_under = tree.iter().take_while(|(s, _)| s != root).next().is_some();
+        for (s, off) in tree {
             let Some((tex, sz, opaque)) = node_size(&s) else { continue };
             let mut r = xf.rect([origin[0] + off[0] as f32, origin[1] + off[1] as f32, sz[0], sz[1]]);
             // while the window is animating (opening, jelly, genie) it moves smoothly; at rest it is on the pixel grid
@@ -6040,11 +5995,18 @@ fn build_items<'a>(
             // a rule for the program can thin it out (`opacity`) and frost what is behind it (`frost`)
             let rule = rules.find(&[w.app_id.as_str()]);
             let veil = if is_root { rule.and_then(|r| r.opacity).unwrap_or(1.0) } else { 1.0 };
-            let frosted = is_root && rule.and_then(|r| r.frost).unwrap_or(!tex.opaque || veil < 0.999);
+            // (the maximum-efficiency mode blurs nothing: a see-through program shows what is behind it as it is)
+            let frosted = is_root && rule.and_then(|r| r.frost).unwrap_or((!tex.opaque || veil < 0.999) && !has_under) && !memrium_de::efficiency::enabled();
             out.push(Item::Surface { tex, rect: r, clip, frosted, alpha: xf.fade, veil });
-            // a window at rest hides what is under its opaque part: the renderer leaves that out (not when it is thinned out)
-            if let Some(o) = opaque.filter(|_| genie <= 0.001 && !wobble && (xf.s - 1.0).abs() < 0.002 && xf.fade >= 0.999 && veil >= 0.999) {
-                let mut b = [r[0] + o[0], r[1] + o[1], r[0] + o[0] + o[2], r[1] + o[1] + o[3]];
+            // a window hides what is under its opaque part: the renderer leaves that out (not when it is thinned out). While it
+            // wobbles (dragged) a pixel shows the window's picture from at most `slack` away, so a box that much smaller is
+            // still covered: dragging a window no longer redraws the whole desktop and the window's own frame under it
+            // (lifted while dragged, the window is a little bigger: its opaque part grows with it, less a pixel the filter blends)
+            let scaled = (xf.s - 1.0).abs() >= 0.002;
+            let slack = if wobble { w.jel[0].x.hypot(w.jel[1].x) + 1.0 } else { 0.0 } + if scaled { 1.0 } else { 0.0 };
+            if let Some(o) = opaque.filter(|_| genie <= 0.001 && xf.fade >= 0.999 && veil >= 0.999) {
+                let o = [o[0] * xf.s, o[1] * xf.s, o[2] * xf.s, o[3] * xf.s];
+                let mut b = [r[0] + o[0] + slack, r[1] + o[1] + slack, r[0] + o[0] + o[2] - slack, r[1] + o[1] + o[3] - slack];
                 if let Some((c, rad)) = clip {
                     // the rounded corners let the frame show: only the band between them counts
                     b = [b[0].max(c[0]), b[1].max(c[1] + rad), b[2].min(c[0] + c[2]), b[3].min(c[1] + c[3] - rad)];
@@ -6082,7 +6044,8 @@ fn build_items<'a>(
         // popup geometry origin chain
         let go = popup_geometry_origin(wins, popups, &root_of(&parent), p);
         let Some(go) = go else { continue };
-        let gl = with_states(root, |st| st.cached_state.get::<SurfaceCachedState>().current().geometry).map(|g| [g.loc.x as f32, g.loc.y as f32]).unwrap_or([0.0, 0.0]);
+        let geo = with_states(root, |st| st.cached_state.get::<SurfaceCachedState>().current().geometry);
+        let gl = geo.map(|g| [g.loc.x as f32, g.loc.y as f32]).unwrap_or([0.0, 0.0]);
         let origin = [go[0] - gl[0], go[1] - gl[1]];
         let Some((_, root_sz, _)) = node_size(root) else { continue };
         // it opens from the edge that is next to what it belongs to: a little smaller, a little higher, then settles
@@ -6112,6 +6075,14 @@ fn build_items<'a>(
             } else {
                 Vec::new()
             };
+            // a popup whose picture cannot be read (a GPU buffer: Chromium and Brave menus) says where its body is with its window
+            // geometry; the margin round it holds the program's own shadow, so ours must not be drawn there
+            let parts = match geo.filter(|_| is_root && parts.is_empty()) {
+                Some(g) if g.size.w > 0 && g.size.h > 0 && ((g.size.w as f32) < sz[0] - 2.0 || (g.size.h as f32) < sz[1] - 2.0) => {
+                    vec![[go[0], go[1], g.size.w as f32, g.size.h as f32]]
+                }
+                _ => parts,
+            };
             if is_root {
                 let pieces: Vec<[f32; 4]> = if parts.is_empty() { vec![r] } else { parts.clone() };
                 let mut bbox = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
@@ -6120,7 +6091,8 @@ fn build_items<'a>(
                     .map(|q| {
                         bbox = [bbox[0].min(q[0] - 40.0), bbox[1].min(q[1] - 40.0), bbox[2].max(q[0] + q[2] + 40.0), bbox[3].max(q[1] + q[3] + 60.0)];
                         let radius = if parts.is_empty() { 10.0 } else { (q[3] / 2.0).min(12.0) };
-                        let panel = Panel::solid(q[0] + q[2] / 2.0, q[1] + q[3] / 2.0, q[2], q[3], radius, [1.0; 3], [1.0; 3]).flat().alpha(0.0).shadow(0.30, 24.0, 8.0);
+                        let shadow = if memrium_de::efficiency::enabled() { [0.0; 3] } else { [0.30, 24.0, 8.0] };
+                        let panel = Panel::solid(q[0] + q[2] / 2.0, q[1] + q[3] / 2.0, q[2], q[3], radius, [1.0; 3], [1.0; 3]).flat().alpha(0.0).shadow(shadow[0], shadow[1], shadow[2]);
                         if at_rest { panel } else { xf.panel(panel) }
                     })
                     .collect();
@@ -6140,7 +6112,7 @@ fn build_items<'a>(
                 let b = if at_rest { b } else { xf.rect(b) };
                 Some(([b[0] + xf.s, b[1] + xf.s, b[2] - 2.0 * xf.s, b[3] - 2.0 * xf.s], 10.0 * xf.s))
             };
-            out.push(Item::Surface { tex, rect, clip, frosted: is_root && !tex.opaque, alpha: xf.fade, veil: 1.0 });
+            out.push(Item::Surface { tex, rect, clip, frosted: is_root && !tex.opaque && !memrium_de::efficiency::enabled(), alpha: xf.fade, veil: 1.0 });
         }
     }
     // the input method's candidate windows, over everything

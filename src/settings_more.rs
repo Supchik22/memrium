@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::sysctl::Cmd;
-use crate::theme::Corner;
+use crate::theme::{Corner, OsdPlace, OsdStyle};
 
 /// A card for a group of settings, with its heading above; returns where its first row goes (the card is `rows` rows
 /// of `pitch` tall, and the next group starts at the returned y plus that).
@@ -46,6 +46,42 @@ pub(super) fn page_notifications(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: 
     let by = top + 130.0 + 26.0;
     if ui.button([x, by, 220.0, 34.0], "Show a test notification", false) {
         actions.push(SettingsAction::TestNotification);
+    }
+}
+
+/// The indicator that volume, brightness and media keys show.
+pub(super) fn page_osd(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, actions: &mut Vec<SettingsAction>) {
+    title(ui, x, y, "On-screen indicator");
+    let o = &mut ctx.cfg.osd;
+    let before = *o;
+    let top = card(ui, x, y + 70.0, cw, "SHOW", 112.0);
+    let mut f = Form::new(x + 16.0, top + 32.0, cw - 32.0, 46.0);
+    f.toggle(ui, "When a key changes the volume or the brightness", &mut o.show);
+    rule(ui, x, top + 56.0, cw);
+    f.toggle(ui, "Also for play, pause, next and previous", &mut o.media);
+
+    let top = card(ui, x, top + 112.0 + 26.0, cw, "LOOK", 4.0 * 46.0 + 20.0);
+    let mut f = Form::new(x + 16.0, top + 34.0, cw - 32.0, 46.0);
+    f.pick(ui, "Style", &mut o.style, &[(OsdStyle::Bar, "Bar"), (OsdStyle::Pill, "Pill"), (OsdStyle::Vertical, "Vertical")]);
+    f.slider(ui, "Size", &mut o.scale, 0.7, 1.6, "");
+    f.slider(ui, "Glass tint", &mut o.tint, 0.0, 1.0, "");
+    f.pick(ui, "Fill", &mut o.accent, &[(true, "Accent"), (false, "White")]);
+
+    let top = card(ui, x, top + 4.0 * 46.0 + 20.0 + 26.0, cw, "PLACE AND TIME", 3.0 * 46.0 + 20.0);
+    let mut f = Form::new(x + 16.0, top + 34.0, cw - 32.0, 46.0);
+    f.pick(ui, "Where", &mut o.place, &[(OsdPlace::Bottom, "Bottom"), (OsdPlace::Top, "Top"), (OsdPlace::Left, "Left"), (OsdPlace::Right, "Right"), (OsdPlace::Centre, "Centre")]);
+    f.slider(ui, "Stay for", &mut o.seconds, 0.6, 5.0, " s");
+    o.seconds = (o.seconds * 10.0).round() / 10.0;
+    f.toggle(ui, "Show the percentage", &mut o.percent);
+
+    let top = card(ui, x, top + 3.0 * 46.0 + 20.0 + 26.0, cw, "SOUND", 66.0);
+    let mut f = Form::new(x + 16.0, top + 32.0, cw - 32.0, 46.0);
+    f.toggle(ui, "Tick when the volume changes", &mut o.sound);
+
+    let by = top + 66.0 + 26.0;
+    // any change shows it at once, so the look can be judged while it is being set
+    if ui.button([x, by, 220.0, 34.0], "Show the indicator", false) || *o != before {
+        actions.push(SettingsAction::TestOsd);
     }
 }
 
@@ -170,10 +206,22 @@ pub(super) fn page_power(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw:
         }
         cy = top + 104.0 + 26.0;
     }
+    // maximum efficiency: square windows, nothing see-through, no blur, shadows or animations (the theme itself is kept)
+    {
+        let top = card(ui, x, cy, cw, "EFFICIENCY", 96.0);
+        let mut f = Form::new(x + 16.0, top + 38.0, cw - 32.0, 42.0);
+        let mut on = crate::efficiency::enabled();
+        f.toggle(ui, "Maximum efficiency", &mut on);
+        ui.text(x + 16.0, top + 70.0, "Square windows, no transparency, blur, shadows or animations. Your theme comes back when it is off.", 11.5, false, ui.ink, 0.55, Align::Left);
+        if on != crate::efficiency::enabled() {
+            crate::efficiency::set(on);
+        }
+        cy = top + 96.0 + 26.0;
+    }
     // the graphics cards of a hybrid laptop, and which one programs start on
     let gpus = crate::gpu::detect();
     if crate::gpu::hybrid(&gpus) {
-        let top = card(ui, x, cy, cw, "GRAPHICS", 62.0 + 46.0 + 30.0 + gpus.len() as f32 * 22.0);
+        let top = card(ui, x, cy, cw, "GRAPHICS", 62.0 + 46.0 + 46.0 + 30.0 + gpus.len() as f32 * 22.0);
         let mut ty = top + 30.0;
         for g in &gpus {
             let state = match g.power.as_deref() {
@@ -195,7 +243,14 @@ pub(super) fn page_power(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw:
             crate::gpu::save_mode(crate::gpu::Mode::ALL[sel]);
         }
         ui.text(x + 16.0, f.y + 28.0, crate::gpu::Mode::ALL[sel].describe(), 11.5, false, ui.ink, 0.55, Align::Left);
-        cy = top + 62.0 + 46.0 + 30.0 + gpus.len() as f32 * 22.0 + 26.0;
+        let mut shell = usize::from(crate::gpu::shell_dedicated());
+        ui.row(f.x, f.y + 62.0, "The shell draws on");
+        let w = (f.cw - 170.0).min(110.0 * 2.0);
+        if ui.segmented([f.x + f.cw - w, f.y + 47.0, w, 30.0], &["Integrated", "Dedicated"], &mut shell) {
+            crate::gpu::save_shell_dedicated(shell == 1);
+        }
+        ui.text(x + 16.0, f.y + 90.0, "Takes effect at the next login. Dedicated can be faster, and keeps the card awake.", 11.5, false, ui.ink, 0.55, Align::Left);
+        cy = top + 62.0 + 46.0 + 46.0 + 30.0 + gpus.len() as f32 * 22.0 + 26.0;
     }
     // when the computer is not used
     let top = card(ui, x, cy, cw, "WHEN THE COMPUTER IS NOT USED", 196.0);

@@ -3,16 +3,51 @@
 
 use crate::state::{Grab, Hit, State};
 use memrium_de::cursor::Shape;
+use smithay::reexports::wayland_server::Resource;
 use std::time::{Duration, Instant};
 
 /// How long the pointer shows "starting" after a program was launched, if no window turns up.
-const BUSY_FOR: Duration = Duration::from_secs(6);
+pub const BUSY_FOR: Duration = Duration::from_secs(6);
 
 impl State {
     /// A program was started from the shell: show the busy cursor until its window appears.
     pub fn start_busy(&mut self) {
         self.busy_until = Some(Instant::now() + BUSY_FOR);
         self.busy_wins = self.open_window_count();
+        self.busy_icon = None;
+        self.cursor_gen = self.cursor_gen.wrapping_add(1);
+    }
+
+    /// A program that draws for 100% on a fractional desktop is stretched and soft. After a few seconds of that the shell
+    /// remembers it (it starts on X11 next time, see softapps.rs) and says so once.
+    pub fn watch_soft(&mut self) {
+        if self.soft_check.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.soft_check = Instant::now();
+        let want = self.renderer.scale();
+        memrium_de::softapps::set_scale(want);
+        if want < 1.01 {
+            return;
+        }
+        let mut now_soft: Vec<String> = Vec::new();
+        for w in self.wins.iter().filter(|w| w.mapped && !w.or && !w.minimized && !w.role.is_x11() && !w.app_id.is_empty()) {
+            let Some(root) = w.role.surface() else { continue };
+            let Some(n) = self.surfaces.get(&root.id()) else { continue };
+            let (Some(t), Some(l)) = (n.tex.as_ref(), n.logical_size()) else { continue };
+            // (a buffer smaller than the desktop's scale asks for; a window in the middle of a resize reads wrong, hence the wait)
+            if t.size.0 as f32 / l[0].max(1.0) < want - 0.05 {
+                now_soft.push(w.app_id.clone());
+            }
+        }
+        self.soft_since.retain(|k, _| now_soft.contains(k));
+        for id in now_soft {
+            let since = *self.soft_since.entry(id.clone()).or_insert_with(Instant::now);
+            if since.elapsed() > Duration::from_secs(4) && memrium_de::softapps::learn(&id) {
+                eprintln!("soft: {id} is stretched at {want:.2}x; it starts on X11 from now on");
+                self.shot_notice = Some((format!("{id} is drawn soft at this scale: next start uses a sharp mode"), 4.0));
+            }
+        }
     }
 
     fn open_window_count(&self) -> usize {
@@ -95,6 +130,9 @@ impl State {
         }
         if self.busy_until.is_some_and(|t| t <= Instant::now()) {
             self.busy_until = None;
+        }
+        if self.busy_until.is_none() {
+            self.busy_icon = None;
         }
         if self.cursor_check.elapsed() > Duration::from_millis(120) {
             self.update_cursor_shape();

@@ -1,9 +1,9 @@
 //! Graphics cards of a hybrid laptop: which there are, which one a program is started on, and the preset that decides it.
 //!
-//! The shell itself always stays on the integrated card (it drives the screen); a program started on the dedicated one
+//! The shell itself stays on the integrated card (it drives the screen) unless `shell = "dedicated"` is set there; a program started on the dedicated one
 //! draws there (PRIME render offload) and the compositor imports what it drew as a DMA-BUF.
 //!
-//! `~/.config/memrium/gpu.toml` holds the preset: `mode = "auto" | "dedicated" | "integrated" | "plugged"`. A program's own
+//! `~/.config/memrium/gpu.toml` holds the preset: `mode = "auto" | "dedicated" | "integrated" | "plugged"` (and `shell = "integrated" | "dedicated"`, read at login). A program's own
 //! `gpu = true|false` in app-rules.toml (see apprules.rs) beats the preset, except under `integrated`.
 
 use crate::theme::config_dir;
@@ -70,11 +70,24 @@ pub fn load_mode() -> Mode {
 }
 
 pub fn save_mode(m: Mode) {
+    write(m, shell_dedicated());
+}
+
+/// Does the shell itself (the compositor) draw on the dedicated card? Read once, when the session starts.
+pub fn shell_dedicated() -> bool {
+    std::fs::read_to_string(path()).ok().and_then(|t| t.parse::<toml::Table>().ok()).and_then(|t| t.get("shell").and_then(|v| v.as_str()).map(|v| v == "dedicated")).unwrap_or(false)
+}
+
+pub fn save_shell_dedicated(on: bool) {
+    write(load_mode(), on);
+}
+
+fn write(m: Mode, shell: bool) {
     let p = path();
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&p, format!("# written by the shell (Settings > Power & Battery)\nmode = \"{}\"\n", m.key()));
+    let _ = std::fs::write(&p, format!("# written by the shell (Settings > Power & Battery)\nmode = \"{}\"\nshell = \"{}\"\n", m.key(), if shell { "dedicated" } else { "integrated" }));
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -117,9 +130,21 @@ pub fn detect() -> Vec<Gpu> {
     out
 }
 
+/// The NVIDIA card's model name. Reading the driver's information file wakes a sleeping card and can take seconds (the
+/// shell froze for 2 s when a program was started), so it is read once on a thread of its own; None until it is known.
 fn nvidia_model() -> Option<String> {
-    let dir = std::fs::read_dir("/proc/driver/nvidia/gpus").ok()?.flatten().next()?.path();
-    read(dir.join("information")).lines().find_map(|l| l.strip_prefix("Model:").map(|m| m.trim().to_string()))
+    static MODEL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    static ASKED: std::sync::Once = std::sync::Once::new();
+    ASKED.call_once(|| {
+        std::thread::spawn(|| {
+            let dir = std::fs::read_dir("/proc/driver/nvidia/gpus").ok().and_then(|d| d.flatten().next()).map(|e| e.path());
+            let name = dir.and_then(|d| read(d.join("information")).lines().find_map(|l| l.strip_prefix("Model:").map(|m| m.trim().to_string())));
+            if let Ok(mut g) = MODEL.lock() {
+                *g = name;
+            }
+        });
+    });
+    MODEL.lock().ok()?.clone()
 }
 
 /// Is there a dedicated card next to an integrated one?
@@ -172,9 +197,32 @@ pub fn discrete_env() -> Vec<(String, String)> {
     env
 }
 
+/// Which card each program started from the shell was given (by desktop id), for the Dock's mark.
+fn launched() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> = std::sync::OnceLock::new();
+    MAP.get_or_init(Default::default)
+}
+
+pub fn note_launch(app_id: &str, discrete: bool) {
+    if let Ok(mut m) = launched().lock() {
+        m.insert(app_id.to_string(), discrete);
+    }
+}
+
+/// Did the shell start this program on the dedicated card? (None: it did not start it.)
+pub fn launched_on(app_id: &str) -> Option<bool> {
+    launched().lock().ok()?.get(app_id).copied()
+}
+
+/// Does this machine have both cards? Looked up once (the sysfs scan is not free, and the Dock asks every rebuild).
+pub fn is_hybrid() -> bool {
+    static HYBRID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HYBRID.get_or_init(|| hybrid(&detect()))
+}
+
 /// The extra environment for a program started now whose rule says `rule`: empty on a machine with one card.
 pub fn launch_env(rule: Option<bool>) -> Vec<(String, String)> {
-    if !hybrid(&detect()) || !wants_discrete(load_mode(), rule, on_ac()) {
+    if !is_hybrid() || !wants_discrete(load_mode(), rule, on_ac()) {
         return Vec::new();
     }
     discrete_env()

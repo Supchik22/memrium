@@ -174,7 +174,7 @@ impl State {
             if let Ok(found) = rx.try_recv() {
                 self.gtk_rx = None;
                 if let Some(look) = found.filter(|l| self.gtk_last.as_ref() != Some(l)) {
-                    let mut t = self.theme.clone();
+                    let mut t = self.base_theme.clone();
                     if memrium_de::gtk::apply(&mut t, &look) {
                         self.apply_theme(t);
                     }

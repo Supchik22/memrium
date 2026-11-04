@@ -5,5 +5,8 @@
 here=$(dirname "$(readlink -f "$0")")
 root=$(dirname "$here")
 cd "$root" || exit 1
+# frame statistics (fps, render+copy ms every 5 s) go to the log: that is what a lag report needs
+export MEMRIUM_STATS=1
+export NIX_PATH="${NIX_PATH:-nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos}"
 [ -x "$root/target/release/memrium_compositor" ] || { echo "build first: nix-shell --run 'cargo build --release'"; exit 1; }
 exec nix-shell "$root/shell.nix" --run "MEMRIUM_COMPOSITOR='$root/target/release/memrium_compositor' '$here/memrium-session' 2>&1 | tee \"\$HOME/memrium-session.log\""

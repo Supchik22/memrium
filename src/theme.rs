@@ -129,6 +129,8 @@ pub enum GlassMode {
     Paper,
     /// varnished wooden boards with grain, rings and knots
     Wood,
+    /// clear, neutral glass lit from above: a thin bright rim, a narrow lens at the edge, little frost (macOS Tahoe)
+    Liquid,
     #[default]
     Custom,
 }
@@ -157,6 +159,8 @@ pub struct GlassStyle {
     pub adapt: f32,
     /// rgb tint + strength
     pub tint: [f32; 4],
+    /// the tint colour follows the system accent (only its strength is kept from `tint`)
+    pub tint_accent: bool,
     /// rgb + opacity of a 1px inner border
     pub border: [f32; 4],
     /// opacity, blur px, y offset
@@ -164,6 +168,15 @@ pub struct GlassStyle {
 }
 
 impl GlassStyle {
+    /// Tint the glass with the system accent (a little washed towards white so it stays glass, not paint).
+    pub fn follow_accent(&mut self, accent: [f32; 3]) {
+        if self.tint_accent && self.mode == GlassMode::Custom {
+            for i in 0..3 {
+                self.tint[i] = accent[i] * 0.85 + 0.15;
+            }
+        }
+    }
+
     /// Smooth Jelly Glass lettering: hardly any bending, a soft frosted fill that glows from the edge.
     pub fn lettering_liquid(&self) -> GlassStyle {
         GlassStyle { bezel: 22.0, refraction: 7.0, blur: 16.0, dispersion: 0.0, rim: 0.9, rim_sharp: 0.55, gloss: 0.0, saturation: 1.05, adapt: 0.0, border: [1.0, 1.0, 1.0, 0.0], shadow: [0.0, 0.0, 0.0], ..self.clone() }
@@ -177,7 +190,7 @@ impl GlassStyle {
 
 impl Default for GlassStyle {
     fn default() -> Self {
-        GlassStyle { mode: GlassMode::Custom, amount: 1.0, custom: None, rim_sharp: 0.7842, blur: 5.9902, refraction: 30.5948, bezel: 90.0, dispersion: 0.0469, rim: 0.5293, gloss: 0.0694, saturation: 1.2873, adapt: 0.1203, tint: [0.7336, 0.84, 0.92, 0.1109], border: [0.0, 0.0, 0.0, 0.0325], shadow: [0.1836, 22.0, 8.0] }
+        GlassStyle { mode: GlassMode::Custom, amount: 1.0, custom: None, rim_sharp: 0.7842, blur: 5.9902, refraction: 30.5948, bezel: 90.0, dispersion: 0.0469, rim: 0.5293, gloss: 0.0694, saturation: 1.2873, adapt: 0.1203, tint: [0.7336, 0.84, 0.92, 0.1109], tint_accent: true, border: [0.0, 0.0, 0.0, 0.0325], shadow: [0.1836, 22.0, 8.0] }
     }
 }
 
@@ -203,6 +216,17 @@ impl GlassStyle {
     /// the varnish.
     pub fn wood(dark: bool) -> GlassStyle {
         GlassStyle { blur: 1.0, refraction: 0.0, bezel: 0.0, dispersion: 0.6, rim: 0.7, rim_sharp: 0.0, gloss: 0.3, saturation: 1.0, adapt: 0.0, tint: Self::wood_tint(dark), border: [0.0; 4], shadow: [0.34, 18.0, 8.0], ..GlassStyle::default() }
+    }
+
+    /// Liquid glass: clear and neutral, frosted a little, bending the scene only in a thin band at the edge, with a
+    /// crisp specular rim from above (the shader's own lighting for this mode) and no gloss or colour split to speak of.
+    pub fn liquid(dark: bool) -> GlassStyle {
+        GlassStyle { blur: 5.0, refraction: 26.0, bezel: 24.0, dispersion: 0.012, rim: 0.85, rim_sharp: 1.0, gloss: 0.0, saturation: 1.22, adapt: 0.22, tint: Self::liquid_tint(dark), tint_accent: false, border: [0.0; 4], shadow: [0.16, 26.0, 9.0], ..GlassStyle::default() }
+    }
+
+    /// A breath of white by day, smoky grey by night.
+    pub fn liquid_tint(dark: bool) -> [f32; 4] {
+        if dark { [0.08, 0.08, 0.09, 0.55] } else { [1.0, 1.0, 1.0, 0.12] }
     }
 
     /// Light oak by day, dark walnut by night.
@@ -253,6 +277,10 @@ impl GlassStyle {
                 *self = GlassStyle { mode: GlassMode::Wood, amount: self.amount, custom: self.custom.take(), ..GlassStyle::wood(false) };
                 return;
             }
+            GlassMode::Liquid => {
+                *self = GlassStyle { mode: GlassMode::Liquid, amount: self.amount, custom: self.custom.take(), ..GlassStyle::liquid(false) };
+                return;
+            }
             GlassMode::Flat => 0.0,
             GlassMode::Glass => self.amount.clamp(0.0, 1.0),
         };
@@ -279,6 +307,14 @@ impl GlassStyle {
         let mut p = Panel::glass(cx, cy, w, h, r);
         p.params[2] = self.bezel.min(w.min(h) / 2.0);
         p.params[3] = self.refraction;
+        if self.mode != GlassMode::Clay {
+            // Liquid Glass bends the scene only in a narrow band at the rim. A band as wide as half the panel, with a
+            // bend longer than the panel is tall, fills a dock with a mirrored, squeezed copy of the backdrop from
+            // beyond its far side: a thick ring of foreign colour instead of clear glass. So the band is at most a
+            // quarter of the short side and the bend at most three quarters of it (the rim looks no further in than the band).
+            p.params[2] = p.params[2].min(w.min(h) * 0.25);
+            p.params[3] = p.params[3].min(p.params[2] * 0.75);
+        }
         p.tint = self.tint;
         p.fx = [self.blur, self.dispersion, self.rim, self.gloss];
         // the shader reads the edge sharpness from the fractional part of the kind (glass = 0)
@@ -296,6 +332,10 @@ impl GlassStyle {
             p.params[1] = 14.0;
             p.fx = [0.0, self.dispersion, self.rim, self.gloss];
         }
+        // liquid glass is lit by its own part of the shader, told by a negative sheen (it has no Aero sheen)
+        if self.mode == GlassMode::Liquid {
+            p.fx[3] = -1.0;
+        }
         p.color2 = self.border;
         p.extra = [self.shadow[0], self.shadow[1], self.shadow[2], self.saturation];
         p
@@ -312,6 +352,14 @@ pub struct WindowStyle {
     /// focused / unfocused shadow: opacity, blur, y offset
     pub shadow: [f32; 3],
     pub shadow_idle: [f32; 3],
+    /// the tight, darker part of the shadow close round the edge, focused / unfocused: opacity, blur
+    pub shadow_near: [f32; 2],
+    pub shadow_near_idle: [f32; 2],
+    /// the hairline round a window, one device pixel just outside its edge: how dark it is (0 = none; the dark look
+    /// doubles it, black shows less on dark backdrops)
+    pub outline: f32,
+    /// in the dark look, a light line inside the dark one (macOS's inner highlight): its opacity
+    pub outline_light: f32,
     /// how opaque the content area of shell windows (Files, Settings) is, 0 .. 1
     pub client_opacity: f32,
     /// the parts of a window frame, used when `decoration` is `Custom`
@@ -451,7 +499,8 @@ impl FrameStyle {
 
 impl Default for WindowStyle {
     fn default() -> Self {
-        WindowStyle { decoration: DecoKind::Mac, radius: 26.0, titlebar: 40.0, title_align: TitleAlign::Center, shadow: [0.42, 46.0, 22.0], shadow_idle: [0.22, 30.0, 12.0], client_opacity: 0.80, frame: FrameStyle::default(), max_gap: 0.0, adapt: true, hide_title_max: false }
+        // a macOS window: large round corners, a wide soft shadow with a darker tight one under it, a faint hairline
+        WindowStyle { decoration: DecoKind::Mac, radius: 16.0, titlebar: 40.0, title_align: TitleAlign::Center, shadow: [0.30, 56.0, 20.0], shadow_idle: [0.16, 36.0, 10.0], shadow_near: [0.16, 5.0], shadow_near_idle: [0.10, 4.0], outline: 0.12, outline_light: 0.12, client_opacity: 0.80, frame: FrameStyle::default(), max_gap: 0.0, adapt: true, hide_title_max: false }
     }
 }
 
@@ -582,6 +631,60 @@ pub struct NotifyPrefs {
     pub max_shown: u32,
 }
 
+/// How the indicator of a volume / brightness / media key looks (see the compositor's `flyout.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OsdStyle {
+    /// a glass strip: the icon, a thin bar and the percentage
+    #[default]
+    Bar,
+    /// a big glass pill that fills from the left, the icon on the filled end
+    Pill,
+    /// a tall glass pill that fills from the bottom (like the Quick Settings sliders of a phone)
+    Vertical,
+}
+
+/// Where the indicator appears on the main monitor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OsdPlace {
+    #[default]
+    Bottom,
+    Top,
+    Left,
+    Right,
+    Centre,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OsdPrefs {
+    /// shown at all when a key changes the volume or the brightness
+    pub show: bool,
+    pub style: OsdStyle,
+    pub place: OsdPlace,
+    /// 0.7 .. 1.6
+    pub scale: f32,
+    /// how long it stays after the last key (s)
+    pub seconds: f32,
+    /// the number next to the bar
+    pub percent: bool,
+    /// the fill in the accent colour (else white, like a phone's)
+    pub accent: bool,
+    /// 0 .. 1: how much the glass is tinted (0 clear liquid glass, 1 nearly solid)
+    pub tint: f32,
+    /// a tick each time the volume changes
+    pub sound: bool,
+    /// also for play / pause / next / previous
+    pub media: bool,
+}
+
+impl Default for OsdPrefs {
+    fn default() -> Self {
+        OsdPrefs { show: true, style: OsdStyle::Bar, place: OsdPlace::Bottom, scale: 1.0, seconds: 1.6, percent: true, accent: true, tint: 0.45, sound: true, media: true }
+    }
+}
+
 impl Default for NotifyPrefs {
     fn default() -> Self {
         NotifyPrefs { dnd: false, corner: Corner::Auto, seconds: 5.0, max_shown: 5 }
@@ -610,17 +713,19 @@ pub struct ControlStyle {
     pub accent_pick: bool,
     /// several accent colours by context, the main one staying the accent
     pub multi: bool,
+    /// 0 .. 1: slim (flattened) switches and sliders .. the full round size
+    pub thickness: f32,
 }
 
 impl Default for ControlStyle {
     fn default() -> Self {
-        ControlStyle { look: ControlLook::Keys, depth: 1.0, round: 1.0, accent_pick: false, multi: false }
+        ControlStyle { look: ControlLook::Keys, depth: 1.0, round: 1.0, accent_pick: false, multi: false, thickness: 0.0 }
     }
 }
 
 impl ControlStyle {
     pub fn to_chebrium(&self) -> chebrium::style::Controls {
-        chebrium::style::Controls { kind: if self.look == ControlLook::Flat { chebrium::style::ControlKind::Flat } else { chebrium::style::ControlKind::Keys }, depth: self.depth, round: self.round, accent_pick: self.accent_pick, multi: self.multi }
+        chebrium::style::Controls { kind: if self.look == ControlLook::Flat { chebrium::style::ControlKind::Flat } else { chebrium::style::ControlKind::Keys }, depth: self.depth, round: self.round, accent_pick: self.accent_pick, multi: self.multi, thickness: self.thickness }
     }
 }
 
@@ -782,11 +887,13 @@ pub struct DockStyle {
     pub magnify: bool,
     pub radius: f32,
     pub gap: f32,
+    /// Bloom: a soft, blurred copy of every icon under the icon itself, inside the Dock's glass (0 = off, 1 = the strongest)
+    pub bloom: f32,
 }
 
 impl Default for DockStyle {
     fn default() -> Self {
-        DockStyle { icon_size: 64.0, magnify: true, radius: 36.0, gap: 14.0 }
+        DockStyle { icon_size: 64.0, magnify: true, radius: 36.0, gap: 14.0, bloom: 0.0 }
     }
 }
 
@@ -973,6 +1080,43 @@ impl Default for Theme {
     }
 }
 
+impl Theme {
+    /// The theme as the maximum-efficiency mode shows it (see `efficiency`): every surface opaque and flat, windows square without
+    /// shadows, no blur, no animations. Nothing here is saved; the theme it came from is.
+    pub fn efficient(&self) -> Theme {
+        let mut t = self.clone();
+        let g = &mut t.glass;
+        g.mode = GlassMode::Custom;
+        g.custom = None;
+        g.blur = 0.0;
+        g.refraction = 0.0;
+        g.bezel = 0.0;
+        g.dispersion = 0.0;
+        g.rim = 0.0;
+        g.gloss = 0.0;
+        g.saturation = 1.0;
+        g.adapt = 0.0;
+        g.tint_accent = false;
+        // a solid surface colour by day / night; alpha 1 makes the glass shader draw it opaque
+        g.tint = if t.dark { [0.16, 0.17, 0.19, 1.0] } else { [0.94, 0.95, 0.96, 1.0] };
+        g.shadow = [0.0; 3];
+        t.window.radius = 0.0;
+        t.window.shadow = [0.0; 3];
+        t.window.shadow_idle = [0.0; 3];
+        t.window.shadow_near = [0.0; 2];
+        t.window.shadow_near_idle = [0.0; 2];
+        t.window.client_opacity = 1.0;
+        t.window.max_gap = 0.0;
+        t.menubar.kind = MenubarKind::Solid;
+        t.menubar.opacity = 1.0;
+        t.menubar.blur = 0.0;
+        t.dock.magnify = false;
+        t.dock.bloom = 0.0;
+        t.animations.enabled = false;
+        t
+    }
+}
+
 impl IconStyle {
     fn shape_id(&self) -> f32 {
         match self.shape {
@@ -1112,12 +1256,13 @@ impl Theme {
 
 // ------------------------------------------------------------------ presets and config
 
-pub const PRESETS: [(&str, &str); 5] = [
+pub const PRESETS: [(&str, &str); 6] = [
     ("macos", include_str!("../themes/macos.toml")),
     ("unity", include_str!("../themes/unity.toml")),
     ("gnome", include_str!("../themes/gnome.toml")),
     ("windows11", include_str!("../themes/windows11.toml")),
     ("windows7", include_str!("../themes/windows7.toml")),
+    ("plasma", include_str!("../themes/plasma.toml")),
 ];
 
 fn parse_theme(text: &str) -> Result<Theme, toml::de::Error> {
@@ -1143,8 +1288,8 @@ pub fn appearance_text(theme: &Theme, language: &str) -> String {
     };
     let g = &theme.glass;
     format!(
-        "# written by the shell: the look the programs follow\ndark = {}\naccent = [{:.4}, {:.4}, {:.4}]\nradius = {:.1}\ntitlebar = {:.1}\ndecoration = \"{deco}\"\nopacity = {:.3}\nlanguage = \"{}\"\nglass_tint = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_border = [{:.4}, {:.4}, {:.4}, {:.4}]\ncontrols = \"{}\"\ncontrols_depth = {:.3}\ncontrols_round = {:.3}\ncontrols_accent = {}\ncontrols_multi = {}\nmenubar = {}\npopup_opacity = {:.3}\nslide = {}\n",
-        theme.dark, theme.accent[0], theme.accent[1], theme.accent[2], theme.window.radius, theme.window.titlebar, theme.window.client_opacity, language, g.tint[0], g.tint[1], g.tint[2], g.tint[3], g.border[0], g.border[1], g.border[2], g.border[3], if theme.ui.controls.look == ControlLook::Flat { "flat" } else { "keys" }, theme.ui.controls.depth, theme.ui.controls.round, theme.ui.controls.accent_pick, theme.ui.controls.multi, theme.bars.iter().any(|b| b.left.iter().chain(&b.center).chain(&b.right).any(|w| w.kind == "app-menu")), theme.ui.popup_opacity, theme.ui.slide
+        "# written by the shell: the look the programs follow\ndark = {}\naccent = [{:.4}, {:.4}, {:.4}]\nradius = {:.1}\ntitlebar = {:.1}\ndecoration = \"{deco}\"\nopacity = {:.3}\nlanguage = \"{}\"\nglass_tint = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_border = [{:.4}, {:.4}, {:.4}, {:.4}]\ncontrols = \"{}\"\ncontrols_depth = {:.3}\ncontrols_round = {:.3}\ncontrols_accent = {}\ncontrols_multi = {}\ncontrols_thickness = {:.3}\nmenubar = {}\npopup_opacity = {:.3}\nslide = {}\n",
+        theme.dark, theme.accent[0], theme.accent[1], theme.accent[2], theme.window.radius, theme.window.titlebar, theme.window.client_opacity, language, g.tint[0], g.tint[1], g.tint[2], g.tint[3], g.border[0], g.border[1], g.border[2], g.border[3], if theme.ui.controls.look == ControlLook::Flat { "flat" } else { "keys" }, theme.ui.controls.depth, theme.ui.controls.round, theme.ui.controls.accent_pick, theme.ui.controls.multi, theme.ui.controls.thickness, theme.bars.iter().any(|b| b.left.iter().chain(&b.center).chain(&b.right).any(|w| w.kind == "app-menu")), theme.ui.popup_opacity, theme.ui.slide
     )
 }
 
@@ -1206,11 +1351,13 @@ pub struct Config {
     pub cc_tiles: Vec<crate::cctiles::CcTile>,
     /// how notifications are shown
     pub notifications: NotifyPrefs,
+    /// the indicator of volume / brightness / media keys
+    pub osd: OsdPrefs,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { theme: "macos".into(), overrides: toml::Table::new(), pinned: Vec::new(), files: Default::default(), desktop: Default::default(), input: Default::default(), screenshots: Default::default(), power: Default::default(), keys: Default::default(), weather_city: String::new(), display: Default::default(), desk_widgets: Vec::new(), language: "auto".into(), cc_tiles: Vec::new(), notifications: NotifyPrefs::default() }
+        Config { theme: "macos".into(), overrides: toml::Table::new(), pinned: Vec::new(), files: Default::default(), desktop: Default::default(), input: Default::default(), screenshots: Default::default(), power: Default::default(), keys: Default::default(), weather_city: String::new(), display: Default::default(), desk_widgets: Vec::new(), language: "auto".into(), cc_tiles: Vec::new(), notifications: NotifyPrefs::default(), osd: OsdPrefs::default() }
     }
 }
 
@@ -1280,18 +1427,53 @@ fn base_table(theme_id: &str) -> toml::Table {
     }
 }
 
+/// The macOS template's glass before it became liquid glass (2026-11-03), for configs tuned on top of it.
+const OLD_MACOS_GLASS: &str = r#"
+mode = "custom"
+amount = 1.0
+tint_accent = true
+blur = 18.1091
+refraction = 145.2542
+bezel = 90.0
+dispersion = 0.2677
+rim = 0.5293
+rim_sharp = 0.7842
+gloss = 0.0694
+saturation = 1.2873
+adapt = 0.4418
+tint = [0.0, 1.0, 0.5625, 0.1776]
+border = [0.0, 0.0, 0.0, 0.0325]
+shadow = [0.1836, 22.0, 8.0]
+"#;
+
 impl Config {
     /// The resolved theme: preset + overrides. A broken config falls back to the macOS preset.
     pub fn resolve(&self) -> Theme {
         let mut t = base_table(&self.theme);
+        let base_liquid = t.get("glass").and_then(|g| g.get("mode")).and_then(|m| m.as_str()) == Some("liquid");
         merge(&mut t, &self.overrides);
-        match toml::Value::Table(t).try_into::<Theme>() {
+        // glass tuned by hand before the macOS template became liquid glass was saved without its mode (it was the
+        // template's, custom): keep it custom, or its values would be read as liquid glass and mix with that look
+        if base_liquid {
+            let tuned = self.overrides.get("glass").and_then(|g| g.as_table()).is_some_and(|g| !g.contains_key("mode") && g.keys().any(|k| k != "custom"));
+            if tuned {
+                // (what the template said then, under the user's own changes)
+                let mut old: toml::Table = toml::from_str(OLD_MACOS_GLASS).unwrap_or_default();
+                if let Some(toml::Value::Table(over)) = self.overrides.get("glass") {
+                    merge(&mut old, over);
+                }
+                t.insert("glass".into(), toml::Value::Table(old));
+            }
+        }
+        let mut theme = match toml::Value::Table(t).try_into::<Theme>() {
             Ok(theme) => theme,
             Err(e) => {
                 eprintln!("theme: {e}; using the built-in Jelly Glass theme");
                 preset("macos").unwrap_or_default()
             }
-        }
+        };
+        theme.glass.follow_accent(theme.accent);
+        theme
     }
 
     /// Choose another base theme and forget overrides (a clean template switch).
@@ -1305,6 +1487,10 @@ impl Config {
         let base = base_table(&self.theme);
         if let Ok(toml::Value::Table(cur)) = toml::Value::try_from(current) {
             self.overrides = diff(&base, &cur);
+            // changed glass always says its mode, so that glass without one can be told to come from older builds
+            if let (Some(toml::Value::Table(g)), Some(mode)) = (self.overrides.get_mut("glass"), cur.get("glass").and_then(|g| g.get("mode")).cloned()) {
+                g.entry("mode").or_insert(mode);
+            }
         }
     }
 
@@ -1388,6 +1574,29 @@ pub fn available_themes() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_tuned_glass_stays_custom_on_the_liquid_template() {
+        let mut cfg = Config::default();
+        cfg.overrides = toml::from_str("[glass]\nblur = 3.5\ngloss = 0.4\n").unwrap();
+        let t = cfg.resolve();
+        assert_eq!(t.glass.mode, GlassMode::Custom);
+        assert_eq!((t.glass.blur, t.glass.gloss), (3.5, 0.4));
+        // what the user did not touch is the template's glass as it was then
+        assert_eq!(t.glass.rim, 0.5293);
+        assert!(t.glass.tint_accent);
+        // saved again, it says its mode, and reads back the same
+        cfg.set_from(&t);
+        assert_eq!(cfg.overrides["glass"]["mode"].as_str(), Some("custom"));
+        assert_eq!(cfg.resolve().glass, t.glass);
+        // the template untouched is liquid glass
+        assert_eq!(Config::default().resolve().glass.mode, GlassMode::Liquid);
+        // and liquid glass picked by the user stays liquid
+        let mut l = t.clone();
+        l.glass.set_mode(GlassMode::Liquid);
+        cfg.set_from(&l);
+        assert_eq!(cfg.resolve().glass.mode, GlassMode::Liquid);
+    }
 
     #[test]
     fn template_names_become_file_names() {

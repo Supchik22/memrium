@@ -279,6 +279,16 @@ pub fn push_badge(out: &mut Drawn, count: u32, cx: f32, cy: f32, s: f32, measure
     out.labels.push(Label::new(text, bx, by + 4.0, 11.0, true, [1.0; 3], 1.0, Align::Center));
 }
 
+/// A small pill at the bottom right of a running app's icon: which card it draws on (dGPU / iGPU).
+pub fn push_gpu_mark(out: &mut Drawn, discrete: bool, cx: f32, cy: f32, s: f32, measure: &dyn Fn(&str, f32, bool) -> f32) {
+    let text = if discrete { "dGPU" } else { "iGPU" };
+    let w = measure(text, 9.0, true) + 8.0;
+    let (bx, by) = (cx + s / 2.0 - w + 2.0, cy + s / 2.0 - 12.0);
+    let (top, bot) = if discrete { ([0.45, 0.85, 0.40], [0.20, 0.62, 0.25]) } else { ([0.62, 0.66, 0.74], [0.38, 0.42, 0.52]) };
+    out.panels.push(Panel::solid(bx, by, w, 13.0, 6.5, top, bot).shadow(0.25, 4.0, 1.0));
+    out.labels.push(Label::new(text.to_string(), bx + w / 2.0, by + 1.5, 9.0, true, [1.0; 3], 1.0, Align::Center));
+}
+
 impl Default for DockWidget {
     fn default() -> Self {
         Self::new()
@@ -327,6 +337,23 @@ impl Widget for DockWidget {
         let slots = self.slots(c, r);
         let dh = r[3];
         let dcy = r[1] + dh / 2.0;
+        // Bloom: a soft, blurred copy of each icon, over the glass and under the icons (all copies first, so one never lies on
+        // its neighbour's sharp icon). The bigger the setting, the wider and stronger the glow; it is cut to the Dock.
+        let bloom = c.theme.dock.bloom.clamp(0.0, 1.0);
+        if bloom > 0.01 {
+            let spread = 0.18 + 0.30 * bloom;
+            for (slot, e) in slots.iter().zip(&self.entries) {
+                if let DockIcon::App(cell) = &e.item.icon {
+                    let cy = slot.cy - self.lift * e.hover.x;
+                    let size = (slot.s + e.press.x) * (1.0 + 2.0 * spread);
+                    let mut p = Panel::app_icon(slot.cx, cy, size, *cell, (0.45 + 0.55 * bloom).min(1.0));
+                    // the picture fills the middle of the (bigger) panel, the blur reaches into the margin
+                    p.fx[0] = 2.0 * spread / (1.0 + 2.0 * spread);
+                    p.fx[3] = spread;
+                    out.panels.push(p.cut_to(r));
+                }
+            }
+        }
         for (i, (slot, e)) in slots.iter().zip(&self.entries).enumerate() {
             let (cx, s) = (slot.cx, slot.s);
             let cy = slot.cy - self.lift * e.hover.x;
@@ -395,6 +422,11 @@ impl Widget for DockWidget {
         if self.badges {
             for (slot, e) in slots.iter().zip(&self.entries) {
                 push_badge(out, e.item.badge, slot.cx, slot.cy - self.lift * e.hover.x, slot.s + e.press.x, c.measure);
+            }
+        }
+        for (slot, e) in slots.iter().zip(&self.entries) {
+            if let Some(discrete) = e.item.gpu {
+                push_gpu_mark(out, discrete, slot.cx, slot.cy - self.lift * e.hover.x, slot.s + e.press.x, c.measure);
             }
         }
         // tooltip with the app name above the hovered icon

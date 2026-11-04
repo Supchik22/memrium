@@ -276,6 +276,7 @@ pub fn launch(app: &AppEntry, socket: &str) -> std::io::Result<()> {
 /// Like `launch`, in a given working directory.
 pub fn launch_in(app: &AppEntry, socket: &str, dir: Option<&Path>) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
+    let started = std::time::Instant::now();
     let mut cmd = std::process::Command::new("sh");
     let line = if app.terminal {
         match memrium_term() {
@@ -291,17 +292,29 @@ pub fn launch_in(app: &AppEntry, socket: &str, dir: Option<&Path>) -> std::io::R
     let rule = rules.find(&[app.id.as_str(), app.wm_class.as_str(), exe.as_str()]);
     let mut launch = rule.map(|r| r.launch(&line)).unwrap_or_default();
     // the graphics card: the preset in Settings > Power & Battery, and the program's own rule
-    launch.env.extend(crate::gpu::launch_env(rule.and_then(|r| r.gpu)));
+    let gpu_env = crate::gpu::launch_env(rule.and_then(|r| r.gpu));
+    if !app.id.is_empty() {
+        crate::gpu::note_launch(&app.id, !gpu_env.is_empty());
+    }
+    launch.env.extend(gpu_env);
     // one pointer for every program (a Flatpak does not inherit the environment: `with_launch` turns these into `--env=`)
     launch.env.extend(crate::cursor_theme::env(&crate::theme::Config::load().input.cursor));
     // the window system: GTK 3 programs cannot draw for a fractional scale on Wayland (soft), on X11 they can
-    if rule.and_then(|r| r.x11).unwrap_or_else(|| crate::apprules::gtk3_program(&[app.id.as_str(), app.wm_class.as_str(), exe.as_str()])) {
+    let names = [app.id.as_str(), app.wm_class.as_str(), exe.as_str()];
+    // a program with its own HiDPI switch gets it set; one seen stretched before starts on X11
+    let own_switch = crate::softapps::prepare(&names, crate::softapps::scale());
+    if rule.and_then(|r| r.x11).unwrap_or_else(|| crate::apprules::gtk3_program(&names) || (!own_switch && crate::softapps::is_soft(&names))) {
         launch.env.push(("GDK_BACKEND".into(), "x11".into()));
         launch.env.push(("QT_QPA_PLATFORM".into(), "xcb".into()));
+        launch.env.push(("SDL_VIDEODRIVER".into(), "x11".into()));
+        launch.env.push(("ELECTRON_OZONE_PLATFORM_HINT".into(), "x11".into()));
     }
     let (line, rule_env) = with_launch(&line, launch);
     cmd.arg("-c").arg(format!("exec {line}"));
     cmd.env("WAYLAND_DISPLAY", socket).env("XDG_SESSION_TYPE", "wayland").env("MOZ_ENABLE_WAYLAND", "1").env("QT_QPA_PLATFORM", "wayland;xcb").env("GDK_BACKEND", "wayland,x11");
+    // the file dialog is the portal's (Memrium Files) in every toolkit; Electron draws on Wayland (see session/memrium-session)
+    cmd.env("GTK_USE_PORTAL", "1").env("GDK_DEBUG", "portals").env("QT_QPA_PLATFORMTHEME", "xdgdesktopportal");
+    cmd.env("ELECTRON_OZONE_PLATFORM_HINT", "auto").env("NIXOS_OZONE_WL", "1");
     cmd.envs(rule_env);
     // new session so closing the compositor does not take the apps with it
     cmd.process_group(0);
@@ -309,7 +322,11 @@ pub fn launch_in(app: &AppEntry, socket: &str, dir: Option<&Path>) -> std::io::R
         cmd.current_dir(d);
     }
     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let before_spawn = std::time::Instant::now();
     cmd.spawn()?;
+    if std::env::var_os("MEMRIUM_STATS").is_some() {
+        eprintln!("stats: launch_in {}: prepare {:.1} ms, spawn {:.1} ms", app.name, (before_spawn - started).as_secs_f64() * 1e3, before_spawn.elapsed().as_secs_f64() * 1e3);
+    }
     Ok(())
 }
 
@@ -596,6 +613,17 @@ impl IconIndex {
         IconIndex { files, order, names: Default::default() }
     }
 
+    /// Every icon of one pack in every category (apps, places, mimetypes, actions, devices...), for the icon composer, which can
+    /// redraw any of them.
+    pub fn build_pack_all(pack: &str) -> IconIndex {
+        let mut files: HashMap<String, Vec<(u32, PathBuf)>> = HashMap::new();
+        let order: Vec<PathBuf> = icon_dirs().into_iter().map(|b| b.join(pack)).collect();
+        for theme in &order {
+            walk_all(theme, 0, &mut files);
+        }
+        IconIndex { files, order, names: Default::default() }
+    }
+
     /// The small icons of actions and states ("actions", "status": document-open, edit-copy...) that menus show beside their
     /// entries, from the installed icon themes.
     pub fn build_actions() -> IconIndex {
@@ -688,6 +716,24 @@ fn walk_filtered(dir: &Path, depth: u32, out: &mut HashMap<String, Vec<(u32, Pat
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     out.entry(stem.to_string()).or_default().push((size_of_path(&path), path.clone()));
                 }
+            }
+        }
+    }
+}
+
+/// Every icon file below `dir`, whatever its category.
+fn walk_all(dir: &Path, depth: u32, out: &mut HashMap<String, Vec<(u32, PathBuf)>>) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            walk_all(&path, depth + 1, out);
+        } else if path.extension().and_then(|x| x.to_str()).is_some_and(|x| x == "svg" || x == "png") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                out.entry(stem.to_string()).or_default().push((size_of_path(&path), path.clone()));
             }
         }
     }

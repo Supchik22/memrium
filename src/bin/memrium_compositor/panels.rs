@@ -38,7 +38,7 @@ fn inside(p: [f32; 2], r: [f32; 4]) -> bool {
 
 impl State {
     fn edit_theme(&mut self, f: impl FnOnce(&mut memrium_de::theme::Theme)) {
-        let mut t = self.theme.clone();
+        let mut t = self.base_theme.clone();
         f(&mut t);
         self.apply_theme(t);
     }

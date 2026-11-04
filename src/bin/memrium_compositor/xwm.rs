@@ -106,6 +106,13 @@ impl State {
             Ok(s) => eprintln!("session: dbus-update-activation-environment failed ({s})"),
             Err(e) => eprintln!("session: dbus-update-activation-environment is not available ({e}); screen sharing may not find this session"),
         }
+        Self::stop_portals();
+    }
+
+    /// A running xdg-desktop-portal keeps the desktop it started under and goes on choosing that desktop's backends, so a portal
+    /// left over from the previous session breaks screen sharing in the next one. Stopped, it is started on demand with the new environment.
+    fn stop_portals() {
+        let _ = std::process::Command::new("systemctl").args(["--user", "stop", "xdg-desktop-portal.service", "xdg-desktop-portal-gtk.service"]).status();
     }
 
     /// Put the shared environment back as it was before this session changed it.
@@ -122,6 +129,7 @@ impl State {
         if !unset.is_empty() {
             let _ = std::process::Command::new("systemctl").args(["--user", "unset-environment"]).args(&unset).status();
         }
+        Self::stop_portals();
         eprintln!("session: the shared environment is back as it was");
     }
 

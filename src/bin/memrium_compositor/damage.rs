@@ -4,7 +4,7 @@
 
 use memrium_de::renderer::{panel_box, Item, Panel};
 use std::collections::HashMap;
-use std::hash::Hasher;
+use std::hash::{BuildHasher, Hasher};
 
 /// One window-layer item of a frame: a frame (window chrome, a shell window) with the panels it holds, or a surface.
 enum Sig {
@@ -31,7 +31,7 @@ pub struct DamageTracker {
 }
 
 fn hash_bytes(b: &[u8]) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = foldhash::fast::FixedState::default().build_hasher();
     h.write(b);
     h.finish()
 }
@@ -81,7 +81,7 @@ impl DamageTracker {
                     }
                 }
                 Item::Frame { panels, bbox, fade } => {
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    let mut h = foldhash::fast::FixedState::default().build_hasher();
                     h.write_u32(fade.to_bits());
                     h.write_u64(warp_hash);
                     h.write(bytemuck::cast_slice(bbox));
@@ -93,7 +93,7 @@ impl DamageTracker {
                     cur_items.push(Sig::Frame { meta: h.finish(), bbox: b, panels: sigs });
                 }
                 Item::Layer { panels, bbox } => {
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    let mut h = foldhash::fast::FixedState::default().build_hasher();
                     h.write_u8(3);
                     h.write_u64(warp_hash);
                     h.write(bytemuck::cast_slice(bbox));
@@ -107,7 +107,7 @@ impl DamageTracker {
                 // only says what need not be drawn: the picture is the same either way
                 Item::Opaque(_) => {}
                 Item::Surface { tex, rect, clip, frosted, alpha, veil } => {
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    let mut h = foldhash::fast::FixedState::default().build_hasher();
                     h.write_usize(*tex as *const _ as usize);
                     h.write_u64(tex.generation());
                     h.write(bytemuck::cast_slice(rect));

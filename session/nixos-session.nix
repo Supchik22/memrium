@@ -23,8 +23,24 @@ let
     Exec=${pkgs.coreutils}/bin/env LD_LIBRARY_PATH=${libs} ${root}/target/release/memrium_portal
     SERVICE
   '';
+  # "Files" as the program that opens folders (xdg-open, browsers, Telegram's "show in folder" fallback)
+  memriumFiles = pkgs.writeTextDir "share/applications/memrium-files.desktop" ''
+    [Desktop Entry]
+    Name=Memrium Files
+    Comment=Browse files and folders
+    Exec=${pkgs.coreutils}/bin/env LD_LIBRARY_PATH=${libs} ${root}/target/release/memrium_files %U
+    Icon=system-file-manager
+    Terminal=false
+    Type=Application
+    Categories=System;FileManager;
+    MimeType=inode/directory;
+    StartupWMClass=memrium-files
+  '';
 in
 {
+  environment.systemPackages = [ memriumFiles ];
+  xdg.mime.defaultApplications."inode/directory" = "memrium-files.desktop";
+
   services.displayManager.sessionPackages = [
     ((pkgs.writeTextDir "share/wayland-sessions/memrium-de.desktop" ''
       [Desktop Entry]

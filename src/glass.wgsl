@@ -172,13 +172,11 @@ fn shade_glass(px: vec2<f32>, pn: Panel, sd: f32, n: vec2<f32>, base: vec3<f32>)
     let dsp = pn.fx.y;
 
     let br = pn.fx.x;
-    var col: vec3<f32>;
-    if (k2 <= 0.0001 || dsp < 0.001) {
-        // no refraction here (or no dispersion): one blurred sample instead of three
-        col = blur_bg(px + disp, br);
-    } else {
+    // no refraction here (or no dispersion): one blurred sample instead of three (green is that one sample either way;
+    // written with three calls, not four, as each call is inlined whole)
+    var col = blur_bg(px + disp, br);
+    if (!(k2 <= 0.0001 || dsp < 0.001)) {
         col.r = blur_bg(px + disp * (1.0 + dsp), br).r;
-        col.g = blur_bg(px + disp, br).g;
         col.b = blur_bg(px + disp * (1.0 - dsp), br).b;
     }
 
@@ -191,13 +189,25 @@ fn shade_glass(px: vec2<f32>, pn: Panel, sd: f32, n: vec2<f32>, base: vec3<f32>)
     // slightly cooler and more saturated version of the colour, not a plain grey multiply.
     if (pn.params.z < 0.0) {
         let k = bitcast<f32>(g.flags.z) * smoothstep(0.38, 0.85, luma(col));
-        let shade = col * mix(vec3(1.0), vec3(0.50, 0.57, 0.66), k);
+        let shade = col * mix(vec3(1.0), vec3(0.62, 0.68, 0.78), k);
         col = mix(vec3(luma(shade)), shade, 1.0 + 0.25 * k);
     }
 
     // Rim lighting: bright at top-left and bottom-right, fading inward (Apple-style). Deep inside the shape the
     // terms are far below what an 8-bit picture can show: skipped (a big panel is mostly deep inside).
-    if (depth < 40.0) {
+    // Liquid glass (a negative fx.w, see `GlassStyle::panel`): lit from above. A crisp bright line along the top edge,
+    // a fainter one along the bottom where the light comes out again, the sides almost dark, no shaded inner edge:
+    // clear glass with a thin specular rim instead of a glowing frame.
+    let liquid = pn.fx.w < 0.0;
+    if (depth < 40.0 && liquid) {
+        let nd = dot(n, normalize(vec2(-0.22, -1.0)));
+        let edge = exp(-depth / 0.6);
+        let inner = exp(-depth / 3.2);
+        let top = pow(max(nd, 0.0), 2.2);
+        let bottom = pow(max(-nd, 0.0), 3.0) * 0.42;
+        let rim_k = mix(1.0, 0.45, smoothstep(0.45, 0.9, luma(col)));
+        col += vec3(1.0) * rim_k * (edge * (0.10 + 0.85 * (top + bottom)) + inner * 0.10 * top) * pn.fx.z;
+    } else if (depth < 40.0) {
         let L = normalize(vec2(-0.6, -0.8));
         let nd = dot(n, L);
         // edge sharpness rides in the fractional part of the kind: 0 = soft, 1 = a crisp hairline
@@ -412,6 +422,10 @@ fn shade_clay(i: u32, px: vec2<f32>, pn: Panel, sd: f32, n: vec2<f32>) -> vec3<f
 // Specialised pipelines: a draw whose panels hold no paper, wood, clay, vinyl or glass lettering is compiled without them
 // (those branches make the shader's registers so many that fewer pixels run at once, even when never taken).
 override EXOTIC: bool = true;
+// slim: also without the painted app tiles (kind 3, `icon_paint`) and the edge blur (kind 8). The shell's usual glass,
+// solids, text and icons then fit a shader a fraction of the size: the full one did not fit the instruction cache of a
+// small integrated GPU and ran as SIMD8 only. The renderer picks it for draws without those kinds (`is_slim`).
+override SLIM: bool = false;
 
 fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
     if (EXOTIC && u32(g.panels[i].params.y + 0.5) == 12u) {
@@ -495,7 +509,9 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
         // params.w = shape mask (1 squircle, 2 circle, 3 rounded), fx.x = padding, fx.y > 0.5 = one-colour tint (color2.rgb)
         let u = local / pn.rect.zw;
         let uu = u / max(1.0 - pn.fx.x, 0.2);
-        if (abs(uu.x) <= 1.0 && abs(uu.y) <= 1.0) {
+        // a soft copy of the picture (the Dock's bloom) reaches past the icon's edge: fx.w is how far, as a share of the icon's size
+        let lim = 1.0 + 2.0 * max(pn.fx.w, 0.0);
+        if (abs(uu.x) <= lim && abs(uu.y) <= lim) {
             let id = u32(pn.params.z + 0.5);
             let cell = vec2(f32(id % 24u), f32(id / 24u));
             // fx.z turns the picture (a record label); the mask below stays put
@@ -505,6 +521,18 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
             let uv = (cell + clamp(ur * 0.5 + vec2(0.5), vec2(0.004), vec2(0.996))) / 24.0;
             let lod = clamp(log2(128.0 / max(2.0 * pn.rect.z * g.scale, 1.0)), 0.0, 2.0);
             var t = textureSampleLevel(app_atlas, bgs, uv, lod);
+            if (pn.fx.w > 0.0) {
+                // bloom: 16 taps on a spiral round this point, from a coarse level of the picture, so the copy is smooth
+                var sum = vec4<f32>(0.0);
+                for (var k = 0; k < 16; k = k + 1) {
+                    let ang = f32(k) * 2.399963;
+                    let rad = sqrt((f32(k) + 0.5) / 16.0) * pn.fx.w * 2.0;
+                    let q = ur + vec2(cos(ang), sin(ang)) * rad;
+                    let uvk = (cell + clamp(q * 0.5 + vec2(0.5), vec2(0.004), vec2(0.996))) / 24.0;
+                    sum += textureSampleLevel(app_atlas, bgs, uvk, max(lod, 1.0));
+                }
+                t = sum / 16.0;
+            }
             if (pn.fx.y > 0.5) {
                 let lum = luma(t.rgb / max(t.a, 0.0001));
                 t = vec4(pn.color2.rgb * lum * t.a, t.a);
@@ -530,35 +558,30 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
         }
         return acc;
     }
-    if (kind == 6u) {
-        // UI text: 1:1 texel lookup in the text atlas
+    if (kind == 6u || kind == 5u) {
+        // 6: UI text, 1:1 texel lookup in the text atlas; 5: Lucide glyph, tinted, the atlas alpha is the coverage
+        // (one branch: `auto_ink` is inlined once, not twice)
         let u = local / (2.0 * pn.rect.zw) + vec2(0.5);
         if (u.x >= 0.0 && u.x <= 1.0 && u.y >= 0.0 && u.y <= 1.0) {
-            let ext = select(2.0 * pn.rect.zw, 2.0 * pn.color2.xy, pn.color2.x > 0.0);
-            let texel = vec2(pn.params.z, pn.params.w) + u * (ext * g.scale);
-            let a = textureSampleLevel(text_atlas, bgs, texel / vec2(2048.0, 1024.0), 0.0).r;
+            var a: f32;
+            if (kind == 6u) {
+                let ext = select(2.0 * pn.rect.zw, 2.0 * pn.color2.xy, pn.color2.x > 0.0);
+                let texel = vec2(pn.params.z, pn.params.w) + u * (ext * g.scale);
+                a = textureSampleLevel(text_atlas, bgs, texel / vec2(2048.0, 1024.0), 0.0).r;
+            } else {
+                let id = u32(pn.params.z + 0.5);
+                let cell = vec2(f32(id % 16u), f32(id / 16u));
+                let uv = (cell + clamp(u, vec2(0.003), vec2(0.997))) / 16.0;
+                let lod = clamp(log2(64.0 / max(2.0 * pn.rect.z * g.scale, 1.0)), 0.0, 3.0);
+                a = textureSampleLevel(atlas, bgs, uv, lod).a;
+            }
             var ink = pn.tint.rgb;
             if (a > 0.01) { ink = auto_ink(pn, ink, acc); }
             acc = over_rgb(acc, ink, a * pn.tint.a);
         }
         return acc;
     }
-    if (kind == 5u) {
-        // Lucide glyph: tinted, with the atlas alpha as coverage
-        let u = local / (2.0 * pn.rect.zw) + vec2(0.5);
-        if (u.x >= 0.0 && u.x <= 1.0 && u.y >= 0.0 && u.y <= 1.0) {
-            let id = u32(pn.params.z + 0.5);
-            let cell = vec2(f32(id % 16u), f32(id / 16u));
-            let uv = (cell + clamp(u, vec2(0.003), vec2(0.997))) / 16.0;
-            let lod = clamp(log2(64.0 / max(2.0 * pn.rect.z * g.scale, 1.0)), 0.0, 3.0);
-            let a = textureSampleLevel(atlas, bgs, uv, lod).a;
-            var ink = pn.tint.rgb;
-            if (a > 0.01) { ink = auto_ink(pn, ink, acc); }
-            acc = over_rgb(acc, ink, a * pn.tint.a);
-        }
-        return acc;
-    }
-    if (kind == 8u) {
+    if (!SLIM && kind == 8u) {
         // blur + tint that fade out away from the screen edge (params.w = +1 strongest at the top, -1 at the bottom)
         let h2 = 2.0 * pn.rect.w;
         var ty = (px.y - (pn.rect.y - pn.rect.w)) / h2;
@@ -580,7 +603,32 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
             acc = dim_acc(acc, pn.extra.x * exp(-2.0 * sds * sds / (bl * bl)) * outside);
         }
     }
-    if (kind == 3u) {
+    // A window's edge (`Panel::window_edge`, solid fills only), drawn in the same band round the outside of the shape:
+    // the tight, darker part of its shadow (params.z opacity, params.w blur, a quarter of the blur down) and a hairline
+    // one device pixel wide just outside the edge (extra.w = 1000 * dark + light: a dark line, with a light one inside
+    // it when `light` > 0)
+    if (kind == 1u && sd * g.scale > -0.5 && (pn.params.z > 0.0 || pn.extra.w > 0.0)) {
+        let outside = clamp(0.5 + sd * g.scale, 0.0, 1.0);
+        let nb = pn.params.w;
+        if (pn.params.z > 0.0 && nb > 0.0) {
+            let sdn = max(sd_shape(local - vec2(0.0, nb * 0.25), pn.rect.zw, pn.params.x), 0.0);
+            if (sdn < nb * 1.6) {
+                acc = dim_acc(acc, pn.params.z * exp(-2.0 * sdn * sdn / (nb * nb)) * outside);
+            }
+        }
+        if (pn.extra.w > 0.0) {
+            let dd = sd * g.scale;
+            let dark = floor(pn.extra.w) / 1000.0;
+            let light = fract(pn.extra.w);
+            let lw = select(0.0, 1.0, light > 0.0);
+            // how much of this pixel ([dd - 0.5, dd + 0.5]) each line covers
+            let c_light = clamp(min(lw, dd + 0.5) - max(0.0, dd - 0.5), 0.0, 1.0);
+            let c_dark = clamp(min(lw + 1.0, dd + 0.5) - max(lw, dd - 0.5), 0.0, 1.0);
+            acc = dim_acc(acc, dark * c_dark);
+            acc = over_rgb(acc, vec3(1.0), light * c_light);
+        }
+    }
+    if (!SLIM && kind == 3u) {
         // Apple-style continuous-corner "squircle" (superellipse, n = 5)
         let u = local / pn.rect.zw;
         sd = (pow(pow(abs(u.x), 5.0) + pow(abs(u.y), 5.0), 0.2) - 1.0) * pn.rect.z;
@@ -600,7 +648,7 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
         p = shade_wood(i, px, pn, sd, n);
     } else if (EXOTIC && kind == 14u) {
         p = shade_clay(i, px, pn, sd, n);
-    } else if (kind == 3u) {
+    } else if (!SLIM && kind == 3u) {
         p = shade_solid(px, pn, sd, n);
         let aa = 1.0 / (pn.rect.z * g.scale);
         p = icon_paint(u32(pn.params.z + 0.5), local / pn.rect.zw, aa, p);
@@ -707,7 +755,12 @@ fn glass_glyph(px: vec2<f32>, pn: Panel, acc: vec4<f32>, liquid: bool) -> vec4<f
 
 fn compose(px: vec2<f32>, start: vec4<f32>) -> vec4<f32> {
     var acc = start;
-    if (g.grid.w > 0.5) {
+    // one loop for both ways (each loop gets the whole of `apply_panel` inlined: two of them doubled the shader)
+    let binned = g.grid.w > 0.5;
+    var first = 0u;
+    var last = g.count;
+    var base = 0u;
+    if (binned) {
         // binned: this pixel's tile lists the panels that can touch it (built on the CPU per draw)
         let tiles_x = u32(g.grid.w);
         let tiles_y = g.flags.w;
@@ -715,16 +768,14 @@ fn compose(px: vec2<f32>, start: vec4<f32>) -> vec4<f32> {
         let tx = u32(clamp(floor(tp.x), 0.0, f32(tiles_x) - 1.0));
         let ty = u32(clamp(floor(tp.y), 0.0, f32(tiles_y) - 1.0));
         let t = ty * tiles_x + tx;
-        let first = tiles[t];
-        let last = tiles[t + 1u];
-        let base = tiles_x * tiles_y + 1u;
-        for (var j = first; j < last; j = j + 1u) {
-            acc = apply_panel(tiles[base + j], px, acc);
-        }
-    } else {
-        for (var i = 0u; i < g.count; i = i + 1u) {
-            acc = apply_panel(i, px, acc);
-        }
+        first = tiles[t];
+        last = tiles[t + 1u];
+        base = tiles_x * tiles_y + 1u;
+    }
+    for (var j = first; j < last; j = j + 1u) {
+        var i = j;
+        if (binned) { i = tiles[base + j]; }
+        acc = apply_panel(i, px, acc);
     }
     return acc;
 }
@@ -748,6 +799,14 @@ fn fs_down(in: VOut) -> @location(0) vec4<f32> {
 fn fs(in: VOut) -> @location(0) vec4<f32> {
     let r = compose(in.px, vec4(sample_bg(in.px), 1.0));
     return vec4(r.rgb, 1.0);
+}
+
+// One colour over what is there (premultiplied blending): the inside of a flat veil (`split_flat_fills`). The panel's
+// tint is the colour and its opacity, as `apply_panel` would blend a flat solid of that tint.
+@fragment
+fn fs_fill(in: VOut) -> @location(0) vec4<f32> {
+    let t = g.panels[0].tint;
+    return vec4(t.rgb * t.a, t.a);
 }
 
 // The scene as it is, where no shell panel is: `fs` with no panels gives the same, at a fraction of the cost.

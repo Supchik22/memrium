@@ -180,13 +180,14 @@ pub(super) fn page_appearance(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32
 
     // ---- how the controls look, and the GTK theme
     let cy = sy + 232.0 + 16.0;
-    group(ui, [x, cy, cw, 418.0 + 3.0 * 46.0]);
+    group(ui, [x, cy, cw, 418.0 + 4.0 * 46.0]);
     ui.section(px, cy + 26.0, "CONTROLS");
     let c = &mut ctx.theme.ui.controls;
     let mut f = Form::new(px, cy + 60.0, pw, 46.0);
     f.pick(ui, "Style", &mut c.look, &[(ControlLook::Keys, "Keys"), (ControlLook::Flat, "Flat")]);
     f.slider(ui, "Depth", &mut c.depth, 0.0, 1.5, "");
     f.slider(ui, "Roundness", &mut c.round, 0.0, 1.0, "");
+    f.slider(ui, "Thickness", &mut c.thickness, 0.0, 1.0, "");
     f.pick(ui, "Chosen segment", &mut c.accent_pick, &[(false, "Light"), (true, "Accent")]);
     f.toggle(ui, "Several accent colours", &mut c.multi);
     separator(ui, x, f.y - 14.0, cw);
@@ -440,38 +441,152 @@ pub(super) fn page_keys(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: 
     ui.text(x, by + 30.0 + 3.0 * 38.0, "Shortcut on the left, command on the right.", 12.0, false, ui.ink, 0.55, Align::Left);
 }
 
+/// A settings row whose slider track shows the colours it goes through (lined up with the Form's plain sliders).
+fn colour_row(ui: &mut Ui, f: &mut Form, label: &str, v: &mut f32, colour: &dyn Fn(f32) -> [f32; 3]) {
+    ui.row(f.x, f.y, label);
+    ui.gradient_slider([f.x + 150.0, f.y - 6.0, f.cw - 230.0, 12.0], v, colour);
+    f.skip(f.pitch);
+}
+
+/// One drawn cursor shape with these preferences, in `r` (logical px). The picture lives in the shell's icon atlas: the
+/// shell draws it when a page asks for it (`want`), the next frame shows it.
+fn cursor_preview(ui: &mut Ui, r: [f32; 4], shape: crate::cursor::Shape, prefs: &crate::cursor::CursorPrefs, cell: &dyn Fn(&str) -> Option<u32>, want: &mut Vec<String>) {
+    let key = crate::cursor::preview_key(shape, prefs, ui.accent);
+    match cell(&key) {
+        Some(c) => ui.d.image(r, 0.0, c),
+        None => want.push(key),
+    }
+}
+
 pub(super) fn page_mouse(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
-    use crate::cursor::{CursorLook, LOOKS};
+    use crate::cursor::{CursorLook, LaunchAnim, Shape, ARROWS, BEAMS, BUSY_STYLES, EDGES, HANDS, LAUNCH_ANIMS, LOOKS, RESIZES};
     use crate::input::Accel;
     ui.text(x, y + 52.0, "Mouse", 22.0, true, ui.ink, 0.97, Align::Left);
     let input = &mut ctx.cfg.input;
-    let mut changed = false;
+    const PITCH: f32 = 46.0;
+    // a card of `rows` rows under a small heading, with lines between the rows; the Form that fills it, and where the
+    // next heading goes
+    let card = |ui: &mut Ui, top: f32, heading: &str, rows: usize| -> (Form, f32) {
+        ui.section(x, top, heading);
+        let h = rows as f32 * PITCH + 12.0;
+        group(ui, [x, top + 12.0, cw, h]);
+        for i in 1..rows {
+            separator(ui, x, top + 18.0 + i as f32 * PITCH, cw);
+        }
+        (Form::new(x + 16.0, top + 18.0 + PITCH / 2.0, cw - 32.0, PITCH), top + 12.0 + h + 34.0)
+    };
 
-    // ---- the cursor
-    ui.section(x, y + 94.0, "CURSOR");
-    let gy = y + 106.0;
-    group(ui, [x, gy, cw, 168.0]);
-    let (px, rx) = (x + 16.0, x + cw - 16.0);
-    ui.row(px, gy + 30.0, "Size");
-    let mut size = input.cursor.size;
-    ui.slider([rx - 300.0, gy + 20.0, 240.0, 20.0], &mut size, 16.0, 64.0, " px");
-    changed |= size != input.cursor.size;
-    input.cursor.size = size.round();
-    separator(ui, x, gy + 58.0, cw);
-    ui.row(px, gy + 88.0, "Colour");
-    let mut sel = LOOKS.iter().position(|(l, _)| *l == input.cursor.look).unwrap_or(0);
-    let names: Vec<&str> = LOOKS.iter().map(|(_, n)| *n).collect();
-    if ui.segmented([rx - 252.0, gy + 74.0, 252.0, 28.0], &names, &mut sel) {
-        input.cursor.look = LOOKS[sel].0;
-        changed = true;
+    // ---- which cursor, and how big
+    let c = &mut input.cursor;
+    let (mut f, mut next) = card(ui, y + 94.0, "CURSOR", 5);
+    let mut themes = vec![String::new()];
+    themes.extend(crate::cursor_theme::installed());
+    let missing = !c.theme.is_empty() && !themes.contains(&c.theme);
+    if missing {
+        // a theme that went away stays in the list until another is picked, so the setting is not lost by a glance
+        themes.insert(1, c.theme.clone());
     }
-    separator(ui, x, gy + 116.0, cw);
-    ui.row(px, gy + 142.0, "Change the cursor over edges, buttons and while a program starts");
-    ui.toggle(rx - 44.0, gy + 130.0, &mut input.cursor.dynamic);
+    let at = themes.iter().position(|t| *t == c.theme).unwrap_or(0);
+    let shown = if c.theme.is_empty() { "Memrium (drawn)".to_string() } else { c.theme.clone() };
+    let step = f.stepper(ui, "Theme", &shown);
+    if step != 0 {
+        c.theme = themes[(at as i32 + step).rem_euclid(themes.len() as i32) as usize].clone();
+    }
+    f.slider(ui, "Size", &mut c.size, 16.0, 64.0, " px");
+    c.size = c.size.round();
+    f.toggle(ui, "Change the cursor over edges, buttons and while a program starts", &mut c.dynamic);
+    f.toggle(ui, "Shake the mouse to make the cursor bigger for a moment", &mut c.shake_to_find);
+    f.toggle(ui, "Hide the cursor while typing", &mut c.hide_typing);
+    let drawn = c.theme.is_empty() || missing;
+    if !c.theme.is_empty() {
+        let note = if missing { "This theme is not installed any more: the drawn cursor is shown." } else { "The theme's own pictures are shown, and programs are told to use it too." };
+        ui.text(x + 4.0, next - 14.0, note, 12.0, false, ui.ink, 0.55, Align::Left);
+        next += 14.0;
+    }
+
+    // ---- the look of the drawn cursor
+    if drawn {
+        let custom = c.look == CursorLook::Custom;
+        let (mut f, n) = card(ui, next, "LOOK", if custom { 12 } else { 9 });
+        next = n;
+        // every drawn shape with the choices below, so a change is seen at once
+        ui.row(f.x, f.y, "Preview");
+        let shapes = crate::cursor::PREVIEW_SHAPES;
+        let room = f.cw - 150.0;
+        let pitch = (room / shapes.len() as f32).min(40.0);
+        for (i, s) in shapes.iter().enumerate() {
+            cursor_preview(ui, [f.x + f.cw - pitch * (shapes.len() - i) as f32 + (pitch - 32.0) / 2.0, f.y - 16.0, 32.0, 32.0], *s, c, ctx.app_icon, ctx.want_icons);
+        }
+        f.skip(f.pitch);
+        f.pick(ui, "Colour", &mut c.look, &LOOKS);
+        if custom {
+            let mut hue = c.hue / 360.0;
+            colour_row(ui, &mut f, "Hue", &mut hue, &|t| theme::hsv_to_rgb(t, 1.0, 1.0));
+            c.hue = (hue * 360.0).round();
+            let (h, s, v) = (c.hue / 360.0, c.sat, c.bright);
+            colour_row(ui, &mut f, "Saturation", &mut c.sat, &|t| theme::hsv_to_rgb(h, t, v.max(0.5)));
+            colour_row(ui, &mut f, "Brightness", &mut c.bright, &|t| theme::hsv_to_rgb(h, s, t));
+        }
+        f.slider(ui, "Outline", &mut c.outline, 0.0, 3.0, "");
+        c.outline = (c.outline * 10.0).round() / 10.0;
+        f.pick(ui, "Outline colour", &mut c.edge, &EDGES);
+        let mut shadow = (c.shadow * 100.0).round();
+        f.slider(ui, "Shadow", &mut shadow, 0.0, 100.0, "%");
+        c.shadow = shadow.round() / 100.0;
+        // each shape's own choice, with that shape drawn beside it
+        let beside = |ui: &mut Ui, f: &Form, n: usize, shape: Shape, c: &crate::cursor::CursorPrefs, want: &mut Vec<String>| {
+            let w = (f.cw - 150.0).min(120.0 * n as f32);
+            cursor_preview(ui, [f.x + f.cw - w - 44.0, f.y - 16.0, 32.0, 32.0], shape, c, ctx.app_icon, want);
+        };
+        beside(ui, &f, ARROWS.len(), Shape::Default, c, ctx.want_icons);
+        f.pick(ui, "Arrow", &mut c.arrow, &ARROWS);
+        beside(ui, &f, HANDS.len(), Shape::Pointer, c, ctx.want_icons);
+        f.pick(ui, "Over links", &mut c.hand, &HANDS);
+        beside(ui, &f, BEAMS.len(), Shape::Text, c, ctx.want_icons);
+        f.pick(ui, "Over text", &mut c.beam, &BEAMS);
+        beside(ui, &f, RESIZES.len(), Shape::ResizeNwse, c, ctx.want_icons);
+        f.pick(ui, "Over edges", &mut c.resize, &RESIZES);
+    }
+
+    // ---- the busy cursor
+    let (mut f, n) = card(ui, next, "LOADING", if drawn { 2 } else { 1 });
+    if drawn {
+        f.pick(ui, "Style", &mut c.busy, &BUSY_STYLES);
+    }
+    f.slider(ui, "Speed", &mut c.busy_speed, 0.25, 3.0, "×");
+    c.busy_speed = (c.busy_speed * 20.0).round() / 20.0;
+
+    // ---- the starting program's icon beside the busy cursor
+    let rows = match (c.launch_icon, c.launch_anim) {
+        (false, _) => 1,
+        (true, LaunchAnim::Still) => 5,
+        (true, LaunchAnim::Pulse) => 6,
+        (true, LaunchAnim::Bounce) => 7,
+    };
+    let (mut f, n) = card(ui, n, "STARTING PROGRAM", rows);
+    f.toggle(ui, "Show the program's icon beside the cursor while it starts", &mut c.launch_icon);
+    if c.launch_icon {
+        f.pick(ui, "Animation", &mut c.launch_anim, &LAUNCH_ANIMS);
+        f.slider(ui, "Icon size", &mut c.launch_size, 12.0, 48.0, " px");
+        c.launch_size = c.launch_size.round();
+        f.slider(ui, "Distance", &mut c.launch_dx, 0.0, 24.0, " px");
+        c.launch_dx = c.launch_dx.round();
+        f.slider(ui, "Up / down", &mut c.launch_dy, -24.0, 24.0, " px");
+        c.launch_dy = c.launch_dy.round();
+        if c.launch_anim == LaunchAnim::Bounce {
+            f.slider(ui, "Bounce height", &mut c.launch_height, 0.0, 32.0, " px");
+            c.launch_height = c.launch_height.round();
+        }
+        if c.launch_anim != LaunchAnim::Still {
+            f.slider(ui, "Speed", &mut c.launch_speed, 0.25, 3.0, "×");
+            c.launch_speed = (c.launch_speed * 20.0).round() / 20.0;
+        }
+    }
 
     // ---- the pointer
-    ui.section(x, gy + 200.0, "POINTER");
-    let py = gy + 212.0;
+    let (px, rx) = (x + 16.0, x + cw - 16.0);
+    ui.section(x, n, "POINTER");
+    let py = n + 12.0;
     group(ui, [x, py, cw, 232.0]);
     ui.row(px, py + 30.0, "Speed");
     ui.slider([rx - 300.0, py + 20.0, 240.0, 20.0], &mut input.pointer_speed, -1.0, 1.0, "");
@@ -488,7 +603,6 @@ pub(super) fn page_mouse(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw:
     ui.toggle(rx - 44.0, py + 166.0, &mut input.tap_to_click);
     ui.row(px, py + 214.0, "Left-handed");
     ui.toggle(rx - 44.0, py + 202.0, &mut input.left_handed);
-    let _ = (changed, CursorLook::Light);
 }
 
 pub(super) fn page_themes(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, actions: &mut Vec<SettingsAction>, share: &mut (String, String)) {

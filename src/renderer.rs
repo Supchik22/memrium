@@ -15,7 +15,7 @@ mod dmabuf;
 mod scanout;
 mod tile;
 pub use tile::TileStyle;
-pub use scanout::{create_scanout, primary_dev, scanout_modifiers, ScanoutImage};
+pub use scanout::{create_scanout, primary_dev, scanout_modifiers, DoneFence, ScanoutImage};
 pub use dmabuf::{create_device, DmaPlane, DmabufCaps, FOURCC_ABGR8888, FOURCC_ARGB8888, FOURCC_XBGR8888, FOURCC_XRGB8888};
 
 pub const MAX_PANELS: usize = 576;
@@ -106,6 +106,17 @@ impl Panel {
 
     pub fn shadow(mut self, opacity: f32, blur: f32, dy: f32) -> Self {
         self.extra = [opacity, blur, dy, 0.0];
+        self
+    }
+
+    /// The edge of a window (a solid panel; call it after `shadow`, which resets it): the tight, darker part of the
+    /// shadow close round the edge (`near` = opacity, blur px) and a hairline one device pixel wide just outside the edge,
+    /// `dark` its opacity (black), `light` the opacity of a white line inside it (0 = none). The shader draws them in the
+    /// band round the shape it already walks for the shadow (see `apply_panel_raw`).
+    pub fn window_edge(mut self, near: [f32; 2], dark: f32, light: f32) -> Self {
+        self.params[2] = near[0].max(0.0);
+        self.params[3] = near[1].max(0.0);
+        self.extra[3] = (dark.clamp(0.0, 1.0) * 1000.0).round() + light.clamp(0.0, 0.99);
         self
     }
 
@@ -427,6 +438,8 @@ const SLOTS: u64 = 128;
 /// slots 2..WINDOW_SLOTS: window items; SHELL_SLOT0.. : spatial groups of the shell; MIP_SLOT0.. : mip-chain passes
 const WINDOW_SLOTS: u64 = 96;
 const SHELL_SLOT0: u64 = 100;
+/// slots of the flat fills (`split_flat_fills`), up to SHELL_SLOT0
+const FILL_SLOT0: u64 = 96;
 const MAX_SHELL_GROUPS: usize = 20;
 const MIP_SLOT0: u64 = 120;
 /// levels of the backdrop pyramid (level n is 2^n times smaller)
@@ -696,6 +709,11 @@ pub struct Renderer {
     /// the same without the rarely used kinds of panel (see `EXOTIC` in the shader), for draws that have none
     p_frame_lean: wgpu::RenderPipeline,
     p_glass_lean: wgpu::RenderPipeline,
+    /// the same without the painted app tiles and the edge blur (see `SLIM` in glass.wgsl)
+    p_frame_slim: wgpu::RenderPipeline,
+    p_glass_slim: wgpu::RenderPipeline,
+    /// one colour, blended (premultiplied) over the target: the inside of a flat veil
+    p_fill: wgpu::RenderPipeline,
     /// the scene copied to the target, under the shell's glass
     p_copy: wgpu::RenderPipeline,
     p_surf: wgpu::RenderPipeline,
@@ -809,8 +827,8 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(concat!(include_str!("glass.wgsl"), "\n", include_str!("icons.wgsl")).into()),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
-        let pipe_x = |entry: &str, fmt: wgpu::TextureFormat, blend: Option<wgpu::BlendState>, exotic: bool| {
-            let consts: &[(&str, f64)] = &[("EXOTIC", if exotic { 1.0 } else { 0.0 })];
+        let pipe_v = |entry: &str, fmt: wgpu::TextureFormat, blend: Option<wgpu::BlendState>, exotic: bool, slim: bool| {
+            let consts: &[(&str, f64)] = &[("EXOTIC", if exotic { 1.0 } else { 0.0 }), ("SLIM", if slim { 1.0 } else { 0.0 })];
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(entry),
                 layout: Some(&layout),
@@ -828,9 +846,13 @@ impl Renderer {
                 cache: None,
             })
         };
+        let pipe_x = |entry: &str, fmt: wgpu::TextureFormat, blend: Option<wgpu::BlendState>, exotic: bool| pipe_v(entry, fmt, blend, exotic, false);
         let pipe = |entry: &str, fmt: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| pipe_x(entry, fmt, blend, true);
         let p_frame_lean = pipe_x("fs_frame", WALL_FMT, Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), false);
         let p_glass_lean = pipe_x("fs", format, None, false);
+        let p_frame_slim = pipe_v("fs_frame", WALL_FMT, Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), false, true);
+        let p_glass_slim = pipe_v("fs", format, None, false, true);
+        let p_fill = pipe_x("fs_fill", format, Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), false);
         let p_copy = pipe_x("fs_copy", format, None, false);
         let p_wall = pipe("fs_wall", WALL_FMT, None);
         let p_frame = pipe("fs_frame", WALL_FMT, Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING));
@@ -925,6 +947,9 @@ impl Renderer {
             p_frame,
             p_frame_lean,
             p_glass_lean,
+            p_frame_slim,
+            p_glass_slim,
+            p_fill,
             p_copy,
             p_surf,
             p_glass,
@@ -1069,6 +1094,14 @@ impl Renderer {
         t.read.unmap();
         let ms = |a: u64, b: u64| (b.saturating_sub(a)) as f32 * t.period / 1e6;
         Some((ms(v[0], v[1]), ms(v[2], v[3]), ms(v[4], v[5])))
+    }
+
+    fn frame_pipe(&self, tier: u8) -> &wgpu::RenderPipeline {
+        match tier {
+            0 => &self.p_frame_slim,
+            1 => &self.p_frame_lean,
+            _ => &self.p_frame,
+        }
     }
 
     fn mip0(tex: &wgpu::Texture) -> wgpu::TextureView {
@@ -1357,7 +1390,7 @@ impl Renderer {
     pub fn app_icon_free(&mut self, key: &str) -> bool {
         match self.app_cells.remove(key) {
             Some(id) => {
-                self.app_sources.remove(key);
+                        self.app_sources.remove(key);
                 self.app_free.push(id);
                 true
             }
@@ -1532,6 +1565,8 @@ impl Renderer {
                 g.params[1] += if liquid { 10.0 } else { 9.0 };
                 // a soft, wide bevel: about a seventh of the letter height
                 g.params[2] = (sizes.get(i).copied().unwrap_or(60.0) * 0.14).max(8.0);
+                // lettering keeps its own strong bend (`GlassStyle::panel` limits it to suit flat panels)
+                g.params[3] = glass.refraction;
                 g.tint = tint;
                 g.extra = [PAD, t.params[2], t.params[3], glass.saturation];
                 g.fx[0] = g.fx[0].max(5.0);
@@ -1791,7 +1826,7 @@ impl Renderer {
 
         // 2. window layer: every item is one draw with its own uniform slot, blended over the scene
         let scene_view = Self::mip0(&self.scene);
-        let mut draws: Vec<(bool, Option<wgpu::BindGroup>, [u32; 2], (u32, u32, u32, u32), bool)> = Vec::new();
+        let mut draws: Vec<(bool, Option<wgpu::BindGroup>, [u32; 2], (u32, u32, u32, u32), u8)> = Vec::new();
         let skip_win = skip_flags().contains("win");
         let mut slot = 2u64;
         let skip_frames = skip_flags().contains("frame");
@@ -1877,7 +1912,7 @@ impl Renderer {
                             self.warp.set(w0);
                             self.genie.set(g0);
                             self.fade.set(f0);
-                            let lean = !panels.iter().any(is_exotic);
+                            let pipe = self.frame_pipe(tier_of(panels)).clone();
                             if let Some(c) = &mut self.layer {
                                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                                     label: Some("layer cache"),
@@ -1886,7 +1921,7 @@ impl Renderer {
                                     timestamp_writes: None,
                                     occlusion_query_set: None,
                                 });
-                                pass.set_pipeline(if lean { &self.p_frame_lean } else { &self.p_frame });
+                                pass.set_pipeline(&pipe);
                                 pass.set_bind_group(0, &self.bg_frame, &Self::offsets(slot));
                                 pass.draw(0..3, 0..1);
                                 c.key = key;
@@ -1900,7 +1935,7 @@ impl Renderer {
                             self.fade.set(f0);
                             let g = self.surface_group(&c.surf);
                             for &sc in &scs {
-                                draws.push((false, Some(g.clone()), Self::offsets(slot + 1), sc, false));
+                                draws.push((false, Some(g.clone()), Self::offsets(slot + 1), sc, 2));
                             }
                             slot += 2;
                             continue;
@@ -1909,14 +1944,18 @@ impl Renderer {
                     // not steady yet (or not cacheable): drawn like any frame
                     self.write_slot_binned(slot, panels, Some(*bbox));
                     for &sc in &scs {
-                        draws.push((true, None, Self::offsets(slot), sc, !panels.iter().any(is_exotic)));
+                        draws.push((true, None, Self::offsets(slot), sc, tier_of(panels)));
                     }
                 }
                 Item::Frame { panels, bbox, fade } => {
                     if *fade < 0.005 {
                         continue;
                     }
-                    let scs = pieces(self.scissor(widen(*bbox, &cur)), idx);
+                    let mut scs = pieces(self.scissor(widen(*bbox, &cur)), idx);
+                    // the inside of a frame that is only a shadow draws nothing: the frame shader is not run there
+                    if let Some(hole) = frame_hollow(panels, &cur).and_then(|b| self.inner_px(b)).filter(|_| !skip_flags().contains("hollow")) {
+                        scs = scs.into_iter().flat_map(|s| cut(s, hole)).collect();
+                    }
                     if scs.is_empty() {
                         continue;
                     }
@@ -1924,7 +1963,7 @@ impl Renderer {
                     self.write_slot_binned(slot, panels, Some(*bbox));
                     self.fade.set(1.0);
                     for &sc in &scs {
-                        draws.push((true, None, Self::offsets(slot), sc, !panels.iter().any(is_exotic)));
+                        draws.push((true, None, Self::offsets(slot), sc, tier_of(panels)));
                     }
                 }
                 Item::Surface { tex, rect, clip, frosted, alpha, veil } => {
@@ -1950,7 +1989,7 @@ impl Renderer {
                     self.fade.set(1.0);
                     let g = self.surface_group(tex);
                     for &sc in &scs {
-                        draws.push((false, Some(g.clone()), Self::offsets(slot), sc, false));
+                        draws.push((false, Some(g.clone()), Self::offsets(slot), sc, 2));
                     }
                 }
             }
@@ -1966,8 +2005,8 @@ impl Renderer {
                 timestamp_writes: self.gpu_timer.as_ref().map(|t| wgpu::RenderPassTimestampWrites { query_set: &t.set, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1) }),
                 occlusion_query_set: None,
             });
-            for (is_frame, group, off, sc, lean) in &draws {
-                pass.set_pipeline(if *is_frame { if *lean { &self.p_frame_lean } else { &self.p_frame } } else { &self.p_surf });
+            for (is_frame, group, off, sc, tier) in &draws {
+                pass.set_pipeline(if *is_frame { self.frame_pipe(*tier) } else { &self.p_surf });
                 pass.set_bind_group(0, if *is_frame { &self.bg_frame } else { group.as_ref().unwrap() }, off);
                 pass.set_scissor_rect(sc.0, sc.1, sc.2, sc.3);
                 pass.draw(0..3, 0..1);
@@ -1978,6 +2017,9 @@ impl Renderer {
         // target and each spatial group of shell panels is drawn inside its own scissor rect (so the per-pixel
         // panel loop only runs where panels are, not over the whole screen).
         let skip = skip_flags();
+        // a big flat veil (the snap preview) is filled by a trivial shader inside; only its rim goes through the glass shader
+        let (split, fills) = if skip.contains("fill") { (std::borrow::Cow::Borrowed(shell), Vec::new()) } else { split_flat_fills(shell, self.scale) };
+        let shell: &[Panel] = &split;
         let groups = if skip.contains("shell") { Vec::new() } else { cluster_panels(shell, self.size, MAX_SHELL_GROUPS) };
         // the pyramid is only read by glass: with none on the screen (a game in front of everything) it is not built, and
         // the first frame with glass again builds all of it
@@ -1988,16 +2030,29 @@ impl Renderer {
             self.mips_stale = true;
         }
         self.write_slot(1, &[]);
-        let mut shell_draws: Vec<([u32; 2], (u32, u32, u32, u32), bool)> = Vec::new();
+        let mut shell_draws: Vec<([u32; 2], (u32, u32, u32, u32), u8)> = Vec::new();
         for (i, (panels, bbox)) in groups.iter().enumerate() {
             let slot = SHELL_SLOT0 + i as u64;
-            let scs = pieces(self.scissor(*bbox), usize::MAX);
-            if scs.is_empty() {
-                continue;
-            }
+            // a sparse group (a veil's rim: four corners and four thin strips round an empty middle) is drawn where its panels
+            // are, not over the whole box round them
+            let boxes = sparse_boxes(panels, *bbox).and_then(|bs| bs.into_iter().map(|b| self.scissor(b)).collect::<Option<Vec<_>>>());
+            let scs: Vec<(u32, u32, u32, u32)> = match boxes {
+                Some(bs) => {
+                    let mut out: Vec<(u32, u32, u32, u32)> = Vec::new();
+                    for b in bs {
+                        let mut new = vec![b];
+                        for o in &out {
+                            new = new.into_iter().flat_map(|n| cut(n, *o)).collect();
+                        }
+                        out.extend(new);
+                    }
+                    out.into_iter().flat_map(|r| pieces(Some(r), usize::MAX)).collect()
+                }
+                None => pieces(self.scissor(*bbox), usize::MAX),
+            };
             self.write_slot_binned(slot, panels, Some(*bbox));
             for sc in scs {
-                shell_draws.push((Self::offsets(slot), sc, !panels.iter().any(is_exotic)));
+                shell_draws.push((Self::offsets(slot), sc, tier_of(panels)));
             }
         }
         {
@@ -2017,11 +2072,32 @@ impl Renderer {
                 pass.set_scissor_rect(x, y, w, h);
                 pass.draw(0..3, 0..1);
             }
-            for (off, sc, lean) in &shell_draws {
-                pass.set_pipeline(if *lean { &self.p_glass_lean } else { &self.p_glass });
+            for (off, sc, tier) in &shell_draws {
+                pass.set_pipeline(match tier {
+                    0 => &self.p_glass_slim,
+                    1 => &self.p_glass_lean,
+                    _ => &self.p_glass,
+                });
                 pass.set_bind_group(0, &self.bg_shell, off);
                 pass.set_scissor_rect(sc.0, sc.1, sc.2, sc.3);
                 pass.draw(0..3, 0..1);
+            }
+            for (k, (rect, colour)) in fills.iter().enumerate() {
+                let slot = FILL_SLOT0 + k as u64;
+                if slot >= SHELL_SLOT0 {
+                    break;
+                }
+                let scs = pieces(Some(*rect), usize::MAX);
+                if scs.is_empty() {
+                    continue;
+                }
+                self.write_slot(slot, &[Panel { tint: *colour, ..Default::default() }]);
+                pass.set_pipeline(&self.p_fill);
+                pass.set_bind_group(0, &self.bg_shell, &Self::offsets(slot));
+                for sc in scs {
+                    pass.set_scissor_rect(sc.0, sc.1, sc.2, sc.3);
+                    pass.draw(0..3, 0..1);
+                }
             }
         }
         if let Some(r) = &self.reveal {
@@ -2145,6 +2221,129 @@ fn layer_key(panels: &[Panel], bbox: &[f32; 4], epoch: u64, generation: u64, siz
     h.finish()
 }
 
+/// The part of a window frame (logical px box) where it draws nothing at all. A client-decorated window's frame is one
+/// invisible solid panel with a shadow, and the shadow is not drawn under the shape itself; yet every pixel of the
+/// window ran the whole frame shader (most of the GPU time of a frame on a small integrated GPU). The box keeps clear
+/// of the rounded corners and the anti-aliased edge; under a jelly warp it shrinks by the most a pixel can move (the
+/// shader looks up `px - off * weight`, weight <= 1); under a genie warp there is no such box.
+fn frame_hollow(panels: &[Panel], warp: &Option<Warp>) -> Option<[f32; 4]> {
+    let slack = match warp {
+        None => 0.0,
+        Some(w) => {
+            let j = w.jelly?;
+            j[0].hypot(j[1])
+        }
+    };
+    let [p] = panels else { return None };
+    // kind 1 (solid; the fraction of params.y is a fade, see `apply_panel`), fully transparent, no clip of its own
+    if (p.params[1] + 0.5) as u32 != 1 || p.tint[3] > 0.0 || p.clip[2] > 0.0 {
+        return None;
+    }
+    let m = p.params[0].max(0.0) + 2.0 + slack;
+    let b = [p.rect[0] - p.rect[2] + m, p.rect[1] - p.rect[3] + m, p.rect[0] + p.rect[2] - m, p.rect[1] + p.rect[3] - m];
+    (b[2] > b[0] && b[3] > b[1]).then_some(b)
+}
+
+/// Take big flat veils out of the shell's glass pass. A flat, see-through solid of one colour with no shadow, no ink, no
+/// clip and nothing drawn over it later is the same colour blended over whatever is under it, everywhere inside its
+/// rounded rim. The shell shader ran over every pixel of such a veil (the snap preview: the whole work area, ~10 ms a
+/// frame on a small integrated GPU). The inside becomes fills (device px rect, premultiplied-ready tint) for a trivial
+/// shader; the rim stays a panel, as copies clipped to the four corners and four edge strips, with every boundary on a
+/// whole device pixel so the clipped copies and the fills meet without a seam or an overlap.
+fn split_flat_fills(shell: &[Panel], scale: f32) -> (std::borrow::Cow<'_, [Panel]>, Vec<((u32, u32, u32, u32), [f32; 4])>) {
+    let flat_veil = |p: &Panel| {
+        p.params[1] == 1.0
+            && p.fx[2] == 0.0
+            && p.fx[0] < 0.5
+            && (p.extra[0] <= 0.0 || p.extra[1] <= 0.0)
+            && p.clip[2] <= 0.0
+            && p.tint[3] > 0.0
+            && p.tint[3] < 1.0
+            && p.tint[0] == p.color2[0]
+            && p.tint[1] == p.color2[1]
+            && p.tint[2] == p.color2[2]
+            && p.rect[2] * p.rect[3] * 4.0 * scale * scale > 150_000.0
+    };
+    let mut out: Option<Vec<Panel>> = None;
+    let mut fills = Vec::new();
+    for (i, p) in shell.iter().enumerate() {
+        if !flat_veil(p) || fills.len() + 3 > (SHELL_SLOT0 - FILL_SLOT0) as usize {
+            continue;
+        }
+        // the shape in whole device px; R keeps clear of the rounded corners, E of the anti-aliased straight edges (and of
+        // a thin outline drawn along them)
+        let (x0, y0) = (((p.rect[0] - p.rect[2]) * scale).round(), ((p.rect[1] - p.rect[3]) * scale).round());
+        let (x1, y1) = (((p.rect[0] + p.rect[2]) * scale).round(), ((p.rect[1] + p.rect[3]) * scale).round());
+        let e = (8.0 * scale).ceil();
+        let r = (p.params[0].max(0.0) * scale).ceil() + e;
+        if x1 - x0 < 2.0 * r + 4.0 || y1 - y0 < 2.0 * r + 4.0 || x0 < 0.0 || y0 < 0.0 {
+            continue;
+        }
+        let cross = [[x0 + r, y0 + e, x1 - r, y1 - e], [x0 + e, y0 + r, x0 + r, y1 - r], [x1 - r, y0 + r, x1 - e, y1 - r]];
+        // what is drawn after it may lie on its rim (an outline), never over the filled inside
+        let over = |q: &Panel| {
+            let b = panel_box(q).map(|v| v * scale);
+            cross.iter().any(|c| boxes_touch(&b, c))
+        };
+        if shell[i + 1..].iter().any(over) {
+            continue;
+        }
+        let list = out.get_or_insert_with(|| shell.to_vec());
+        let rim = |c: [f32; 4]| {
+            let mut q = *p;
+            q.clip = [(c[0] + c[2]) / 2.0 / scale, (c[1] + c[3]) / 2.0 / scale, (c[2] - c[0]) / 2.0 / scale, (c[3] - c[1]) / 2.0 / scale];
+            q
+        };
+        let (o0, o1, p0, p1) = (x0 - 2.0, x1 + 2.0, y0 - 2.0, y1 + 2.0);
+        let pieces = [
+            [o0, p0, x0 + r, y0 + r],
+            [x1 - r, p0, o1, y0 + r],
+            [o0, y1 - r, x0 + r, p1],
+            [x1 - r, y1 - r, o1, p1],
+            [x0 + r, p0, x1 - r, y0 + e],
+            [x0 + r, y1 - e, x1 - r, p1],
+            [o0, y0 + r, x0 + e, y1 - r],
+            [x1 - e, y0 + r, o1, y1 - r],
+        ];
+        // the panel itself is replaced, in place, by its rim (nothing after it touches it, so order is kept)
+        let idx = i + (list.len() - shell.len());
+        list.splice(idx..idx + 1, pieces.iter().map(|c| rim(*c)));
+        for c in cross {
+            fills.push(((c[0] as u32, c[1] as u32, (c[2] - c[0]) as u32, (c[3] - c[1]) as u32), p.tint));
+        }
+    }
+    match out {
+        Some(v) => (std::borrow::Cow::Owned(v), fills),
+        None => (std::borrow::Cow::Borrowed(shell), fills),
+    }
+}
+
+/// The boxes of a group's panels when they cover much less than the box round them all (and are few): drawing only
+/// there skips the empty middle. None: draw the whole box.
+fn sparse_boxes(panels: &[Panel], bbox: [f32; 4]) -> Option<Vec<[f32; 4]>> {
+    if panels.len() > 16 {
+        return None;
+    }
+    let boxes: Vec<[f32; 4]> = panels.iter().map(panel_box).collect();
+    let sum: f32 = boxes.iter().map(|b| (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)).sum();
+    let all = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]);
+    (sum * 2.0 < all).then_some(boxes)
+}
+
+/// The smallest shader that draws all of these panels: 0 slim, 1 lean (no exotic kinds), 2 full. `MEMRIUM_SKIP=slim`
+/// keeps to the lean one.
+fn tier_of(panels: &[Panel]) -> u8 {
+    if panels.iter().any(is_exotic) {
+        return 2;
+    }
+    let fat = |p: &Panel| matches!((p.params[1] + 0.5) as u32, 3 | 8);
+    if skip_flags().contains("slim") || panels.iter().any(fat) {
+        1
+    } else {
+        0
+    }
+}
+
 fn is_exotic(p: &Panel) -> bool {
     matches!(p.params[1].floor() as u32, 9 | 10 | 12 | 13 | 14 | 15)
 }
@@ -2216,7 +2415,14 @@ fn panel_reach(p: &Panel) -> f32 {
 
 pub fn panel_box(p: &Panel) -> [f32; 4] {
     let r = panel_reach(p) + 1.0;
-    [p.rect[0] - p.rect[2] - r, p.rect[1] - p.rect[3] - r, p.rect[0] + p.rect[2] + r, p.rect[1] + p.rect[3] + r]
+    let b = [p.rect[0] - p.rect[2] - r, p.rect[1] - p.rect[3] - r, p.rect[0] + p.rect[2] + r, p.rect[1] + p.rect[3] + r];
+    if p.clip[2] <= 0.0 {
+        return b;
+    }
+    // nothing is drawn outside its clip (but for the half pixel of its anti-aliased edge)
+    let c = [p.clip[0] - p.clip[2] - 1.0, p.clip[1] - p.clip[3] - 1.0, p.clip[0] + p.clip[2] + 1.0, p.clip[1] + p.clip[3] + 1.0];
+    let o = [b[0].max(c[0]), b[1].max(c[1]), b[2].min(c[2]), b[3].min(c[3])];
+    if o[2] > o[0] && o[3] > o[1] { o } else { [c[0], c[1], c[0], c[1]] }
 }
 
 fn boxes_touch(a: &[f32; 4], b: &[f32; 4]) -> bool {

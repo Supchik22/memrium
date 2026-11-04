@@ -153,7 +153,18 @@ impl Role {
         }
     }
 
-    /// A top-level window with one fixed size and no parent: a splash screen, which has no use for a title bar.
+    /// An X11 window with no frame asked for (a game in "borderless"): if it is as large as a monitor, it is a fullscreen one.
+    pub fn borderless(&self) -> bool {
+        match self {
+            Role::Xdg(_) => false,
+            Role::X11(x) => !x.is_decorated() && !x.is_override_redirect(),
+        }
+    }
+
+    /// A top-level window with one fixed size, no parent and no title: a splash screen, which has no use for a title bar.
+    /// A titled one is a dialog shown before its program's main window exists (Qt's QMessageBox at start, as LMMS's
+    /// "Project recovery"): it keeps the frame it asked for. (Frameless toolkits' splashes — Qt's FramelessWindowHint —
+    /// never ask for a server-side frame in the first place.)
     pub fn is_splash(&self) -> bool {
         match self {
             Role::Xdg(t) => {
@@ -161,9 +172,13 @@ impl Role {
                     return false;
                 }
                 smithay::wayland::compositor::with_states(t.wl_surface(), |st| {
+                    let untitled = st
+                        .data_map
+                        .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                        .is_none_or(|a| a.lock().unwrap().title.as_deref().is_none_or(|s| s.trim().is_empty()));
                     let mut c = st.cached_state.get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
                     let c = c.current();
-                    c.min_size.w > 0 && c.min_size == c.max_size
+                    untitled && c.min_size.w > 0 && c.min_size == c.max_size
                 })
             }
             Role::X11(_) => false,

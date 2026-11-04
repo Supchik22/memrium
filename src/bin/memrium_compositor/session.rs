@@ -102,23 +102,88 @@ struct Output {
     /// top-left on the renderer's canvas, device px
     pos: (i32, i32),
     flip_pending: bool,
-    /// which of the two buffers is on screen
+    /// which buffer is on screen
     front: usize,
+    /// the buffer the pending flip puts on screen
+    queued: usize,
+    /// the buffer written last (the next frame goes into the one after it)
+    back: usize,
+    /// `back` holds a finished frame that waits for the pending flip to end before it is flipped to
+    ready: bool,
     cursor_on: bool,
     /// the cursor picture's hot spot, device px
     cursor_hot: (i32, i32),
+    /// the side of the hardware cursor plane's buffer (64, 128 or 256: what the driver takes, see `cursor_plane_dim`)
+    cursor_dim: u32,
+    /// how much of that buffer (rows and columns from the top left) the last picture filled: only that is cleared again
+    cursor_extent: u32,
 }
 
-/// Two renderer-allocated images and their framebuffers.
+/// Renderer-allocated images (ZC_IMAGES) and their framebuffers.
 struct Zc {
-    imgs: [memrium_de::renderer::ScanoutImage; 2],
-    fbs: [framebuffer::Handle; 2],
+    imgs: Vec<memrium_de::renderer::ScanoutImage>,
+    fbs: Vec<framebuffer::Handle>,
 }
+
+/// Scan-out images per monitor: three, so a frame finished while a flip is still pending waits in the third one and is
+/// flipped to at the very next vblank (with two the GPU copy could only start after the flip, and a frame that took a
+/// little long missed a whole refresh: 144 Hz fell to 72).
+const ZC_IMAGES: usize = 3;
 
 impl Output {
     /// The framebuffer of buffer `i`.
     fn fb(&self, i: usize) -> framebuffer::Handle {
-        self.zc.as_ref().map_or(self.bufs[i].1, |z| z.fbs[i])
+        // (not `map_or`: its fallback is evaluated first, and there are only two dumb buffers)
+        match &self.zc {
+            Some(z) => z.fbs[i],
+            None => self.bufs[i].1,
+        }
+    }
+
+    /// How many buffers it cycles through.
+    fn count(&self) -> usize {
+        self.zc.as_ref().map_or(self.bufs.len(), |z| z.fbs.len())
+    }
+
+    /// A new frame may be written now: into the buffer after `back`, which is then neither on screen nor about to be.
+    fn writable(&self) -> bool {
+        if self.count() >= 3 { !self.ready } else { !self.flip_pending }
+    }
+
+    /// The buffer the next frame goes into.
+    fn next(&self) -> usize {
+        (self.back + 1) % self.count()
+    }
+
+    /// Back to the buffer on screen, nothing in flight (after a mode set or a VT switch).
+    fn settle(&mut self) {
+        self.flip_pending = false;
+        self.ready = false;
+        self.back = self.front;
+        self.queued = self.front;
+    }
+}
+
+/// Ask for buffer `idx` of `o` to be shown at the next vblank.
+fn flip_to(o: &mut Output, idx: usize, failures: &mut u32) {
+    match o.card.page_flip(o.crtc, o.fb(idx), PageFlipFlags::EVENT, None) {
+        Ok(()) => {
+            o.flip_pending = true;
+            o.queued = idx;
+            o.ready = false;
+            *failures = 0;
+        }
+        Err(e) => {
+            // usually we are not the DRM master (VT switch in progress): log once, retry the modeset gently
+            if *failures == 0 {
+                eprintln!("page_flip: {e} (retrying)");
+            }
+            *failures += 1;
+            let _ = o.card.acquire_master_lock();
+            let _ = o.card.set_crtc(o.crtc, Some(o.fb(o.front)), (0, 0), &[o.conn], Some(o.mode));
+            o.settle();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
 
@@ -158,7 +223,9 @@ fn try_zero_copy(o: &mut Output, device: &wgpu::Device, queue: &wgpu::Queue, mod
     let mut imgs = Vec::new();
     let mut fbs: Vec<framebuffer::Handle> = Vec::new();
     let result = (|| -> Result<(), String> {
-        for _ in 0..2 {
+        // `MEMRIUM_DOUBLE_BUFFER=1`: two images, as before
+        let count = if std::env::var_os("MEMRIUM_DOUBLE_BUFFER").is_some() { 2 } else { ZC_IMAGES };
+        for _ in 0..count {
             let img = memrium_de::renderer::create_scanout(device, w, h, modifier)?;
             let handle = o.card.prime_fd_to_buffer(img.fd.as_fd()).map_err(|e| format!("prime import: {e}"))?;
             let planar = Planar { size: (w, h), modifier: img.modifier, pitch: img.pitch, offset: img.offset, handle };
@@ -179,9 +246,9 @@ fn try_zero_copy(o: &mut Output, device: &wgpu::Device, queue: &wgpu::Queue, mod
     })();
     match result {
         Ok(()) => {
-            let (i1, i0) = (imgs.pop().unwrap(), imgs.pop().unwrap());
-            o.zc = Some(Zc { imgs: [i0, i1], fbs: [fbs[0], fbs[1]] });
+            o.zc = Some(Zc { imgs, fbs });
             o.front = 0;
+            o.settle();
             Ok(())
         }
         Err(e) => {
@@ -350,9 +417,10 @@ fn build_screens(gpus: &[Gpu], found: &[Found], prefs: &memrium_de::display::Dis
                 bufs.push((db, fb));
             }
             gpu.card.set_crtc(crtc, Some(bufs[0].1), (0, 0), &[f.conn.handle()], Some(mode)).map_err(|e| format!("set_crtc: {e}"))?;
-            let cursor = gpu.card.create_dumb_buffer((64, 64), DrmFourcc::Argb8888, 32).map_err(|e| format!("cursor buffer: {e}"))?;
+            let cursor_dim = cursor_plane_dim(&gpu.card);
+            let cursor = gpu.card.create_dumb_buffer((cursor_dim, cursor_dim), DrmFourcc::Argb8888, 32).map_err(|e| format!("cursor buffer: {e}"))?;
             used.push((f.gpu, crtc));
-            Ok(Output { card: gpu.card.dup(), gpu: f.gpu, crtc, conn: f.conn.handle(), mode, bufs, maps: [None, None], zc: None, cursor, size: (w, h), name: p.name.clone(), pos: (p.x - x0, p.y - y0), flip_pending: false, front: 0, cursor_on: false, cursor_hot: (0, 0) })
+            Ok(Output { card: gpu.card.dup(), gpu: f.gpu, crtc, conn: f.conn.handle(), mode, bufs, maps: [None, None], zc: None, cursor, size: (w, h), name: p.name.clone(), pos: (p.x - x0, p.y - y0), flip_pending: false, front: 0, queued: 0, back: 0, ready: false, cursor_on: false, cursor_hot: (0, 0), cursor_dim, cursor_extent: cursor_dim })
         })();
         match result {
             Ok(o) => {
@@ -367,6 +435,7 @@ fn build_screens(gpus: &[Gpu], found: &[Found], prefs: &memrium_de::display::Dis
             }
         }
     }
+    CURSOR_PLANE.store(outs.iter().map(|o| o.cursor_dim).min().unwrap_or(64), std::sync::atomic::Ordering::Relaxed);
     // a monitor that failed to start is not part of the desktop
     let placed: Vec<Placed> = placed.into_iter().filter(|p| outs.iter().any(|o| o.name == p.name)).collect();
     let main = infos.iter().find(|i| placed.iter().any(|p| p.primary && p.name == i.name)).cloned().ok_or("no main display")?;
@@ -415,7 +484,6 @@ fn make_canvas(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u3
     (target, staging, padded)
 }
 
-/// The cursor picture for the current shape: its size follows the preference and the monitors' scale.
 /// The desktop's secret service (`memrium_secrets`, built next to this program): programs that use libsecret and
 /// NetworkManager find their passwords there. It asks for a passphrase through `memrium_askpass`. A keyring that is
 /// already running (KWallet, GNOME's) keeps the bus name and the service steps aside by itself.
@@ -438,6 +506,8 @@ fn start_secrets() {
     }
 }
 
+/// The cursor picture for the current shape: its size follows the preference and the monitors' scale (times the growth of
+/// "shake to find"); drawn, or taken from the installed cursor theme picked in Settings.
 fn cursor_picture(state: &State, scale: f32, phase: f32) -> memrium_de::cursor::CursorImage {
     let prefs = &state.config.input.cursor;
     if state.cursor_shape == memrium_de::cursor::Shape::Client {
@@ -445,24 +515,77 @@ fn cursor_picture(state: &State, scale: f32, phase: f32) -> memrium_de::cursor::
             return c.image(scale);
         }
     }
-    memrium_de::cursor::render(state.cursor_shape, (prefs.size * scale).round().max(1.0) as u32, prefs.look, state.theme.accent, phase)
+    let img = memrium_de::cursor_theme::picture(state.cursor_shape, (prefs.size * scale).round().max(1.0) as u32, prefs, state.theme.accent, phase);
+    match &state.busy_icon {
+        Some(icon) if state.cursor_shape == memrium_de::cursor::Shape::Progress && prefs.launch_icon => with_app_icon(state, img, icon, scale),
+        _ => img,
+    }
 }
 
-/// Put a cursor picture on the monitor's hardware cursor plane (a 64 x 64 buffer).
+/// The side of the hardware cursor buffer for a GPU: the driver's largest cursor (DRM_CAP_CURSOR_WIDTH/HEIGHT), as the
+/// square power of two the planes take (i915 takes 64, 128 and 256), at most 256; 64 when the driver does not say.
+fn cursor_plane_dim(card: &Card) -> u32 {
+    let cap = |c| DrmDevice::get_driver_capability(card, c).ok().filter(|&v| v > 0).unwrap_or(64);
+    let most = cap(drm::DriverCapability::CursorWidth).min(cap(drm::DriverCapability::CursorHeight));
+    [256u32, 128, 64].into_iter().find(|&d| d as u64 <= most).unwrap_or(64)
+}
+
+/// The smallest hardware cursor buffer of all monitors (the one picture is put on each of them).
+static CURSOR_PLANE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(64);
+
+/// Seconds since the program that the busy cursor waits for was launched.
+fn launch_time(state: &State) -> f32 {
+    state.busy_until.map_or(0.0, |until| crate::pointer::BUSY_FOR.saturating_sub(until.saturating_duration_since(Instant::now())).as_secs_f32())
+}
+
+/// The busy cursor shows a launch icon that moves (it needs drawing again many times a second).
+fn launch_moving(state: &State) -> bool {
+    let prefs = &state.config.input.cursor;
+    state.busy_icon.is_some() && state.cursor_shape == memrium_de::cursor::Shape::Progress && prefs.launch_icon && prefs.launch_anim != memrium_de::cursor::LaunchAnim::Still
+}
+
+/// Like `cursor_theme::animation` (loops per second, pictures per loop), with enough pictures for a moving launch icon
+/// (about 60 a second; the loop draws one when it turns, at least every 16 ms while it moves, see `launch_moving`).
+fn cursor_animation(state: &State) -> Option<(f32, u32)> {
+    let base = memrium_de::cursor_theme::animation(state.cursor_shape, &state.config.input.cursor);
+    if !launch_moving(state) {
+        return base;
+    }
+    // (whole multiples of the loop's own pictures, so the ring or the theme's frames still change where they did)
+    let (rate, steps) = base.unwrap_or((1.0, 1));
+    let more = (60.0 / (rate * steps as f32).max(0.01)).ceil().clamp(1.0, 1000.0) as u32;
+    Some((rate, steps * more))
+}
+
+/// The starting program's icon beside the busy cursor (like KDE's launch feedback), moving as the preferences say, on a
+/// larger picture that still fits the cursor planes.
+fn with_app_icon(state: &State, img: memrium_de::cursor::CursorImage, icon: &image::RgbaImage, scale: f32) -> memrium_de::cursor::CursorImage {
+    let max = CURSOR_PLANE.load(std::sync::atomic::Ordering::Relaxed);
+    memrium_de::cursor::with_launch_icon(img, icon, &state.config.input.cursor, scale, launch_time(state), max)
+}
+
+/// Put a cursor picture on the monitor's hardware cursor plane (a `cursor_dim` square buffer; a larger picture is cut).
 fn draw_cursor(out: &mut Output, img: &memrium_de::cursor::CursorImage) {
+    let dim = out.cursor_dim as usize;
+    let n = img.size as usize;
+    let pitch = out.cursor.pitch() as usize;
     if let Ok(mut map) = out.card.map_dumb_buffer(&mut out.cursor) {
-        let pitch = 64 * 4;
-        let n = img.size as usize;
-        for y in 0..64usize {
-            for x in 0..64usize {
+        // only the corner the last picture or this one covers: the rest of the buffer is clear already
+        let reach = n.min(dim).max(out.cursor_extent as usize).min(dim);
+        for y in 0..reach {
+            for x in 0..reach {
                 let px = if x < n && y < n { img.argb[y * n + x] } else { 0 };
                 let i = y * pitch + x * 4;
                 map[i..i + 4].copy_from_slice(&px.to_le_bytes());
             }
         }
+        out.cursor_extent = n.min(dim) as u32;
     }
     out.cursor_hot = img.hot;
-    let _ = out.card.set_cursor(out.crtc, Some(&out.cursor));
+    // a plane that is off stays off (the pointer is on another monitor, or typing hid it): the loop turns it on
+    if out.cursor_on {
+        let _ = out.card.set_cursor(out.crtc, Some(&out.cursor));
+    }
 }
 
 /// Pointer speed, acceleration, scrolling and tapping for one device (config, or KDE's values for it).
@@ -536,7 +659,7 @@ pub fn run(args: Args) {
 
     // --- GPU renderer (headless wgpu)
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: if std::env::var("MEMRIUM_GPU").as_deref() == Ok("high") { wgpu::PowerPreference::HighPerformance } else { wgpu::PowerPreference::LowPower }, ..Default::default() })).expect("no GPU adapter");
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: if std::env::var("MEMRIUM_GPU").map_or_else(|_| memrium_de::gpu::shell_dedicated(), |v| v == "high") { wgpu::PowerPreference::HighPerformance } else { wgpu::PowerPreference::LowPower }, ..Default::default() })).expect("no GPU adapter");
     eprintln!("adapter: {}", adapter.get_info().name);
     let (device, queue) = memrium_de::renderer::create_device(&adapter, &wgpu::DeviceDescriptor { required_features: if std::env::var_os("MEMRIUM_STATS").is_some() { adapter.features() & wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() }, ..Default::default() }).expect("GPU device");
     let format = wgpu::TextureFormat::Bgra8Unorm; // byte order B,G,R,A = DRM XRGB8888
@@ -586,6 +709,9 @@ pub fn run(args: Args) {
         }
     }
     let (mut drawn_gen, mut drawn_step, mut drawn_prefs) = (u32::MAX, u32::MAX, state.config.input.cursor.clone());
+    // "shake to find": how much bigger the cursor is drawn now, and the growth it was last drawn at
+    let mut shake = memrium_de::cursor::Shake::default();
+    let mut drawn_zoom = 1.0f32;
     {
         let img = cursor_picture(&state, scale, 0.0);
         for o in &mut screens.outs {
@@ -608,15 +734,20 @@ pub fn run(args: Args) {
     let mut flip_failures = 0u32;
     let mut last = Instant::now();
     // what the frame before the last one left to be copied into the next back buffer (see `render_to_dumb`)
-    let mut dumb_prev: Option<Option<(u32, u32, u32, u32)>> = None;
+    let mut dumb_prev: Vec<Option<(u32, u32, u32, u32)>> = Vec::new();
     // a frame already drawn and read back into `staging`, waiting for the flip in flight to finish so it can be copied into
     // the back buffer: the GPU works on the next frame while the display waits for its vblank
     let mut ahead: Option<Ahead> = None;
     // a frame whose copy into the scan-out images the GPU is still doing (`waiter` says when it is done; the flip waits
     // for it, input does not): the request number (None: the copy was waited for on the spot), when the copy began, and the
     // client buffers that go back once it is done
-    let mut copying: Option<(Ahead, Option<u64>, Instant, Vec<crate::state::Held>)> = None;
-    let waiter = GpuWaiter::new(&device);
+    let mut copying: Option<(Ahead, Done, Instant, Vec<crate::state::Held>)> = None;
+    // the kernel tells when the GPU is done (a sync file polled with the rest); without it, a thread that waits
+    let done_fence = memrium_de::renderer::DoneFence::new(&device);
+    let waiter = if done_fence.is_none() { GpuWaiter::new(&device) } else { None };
+    if done_fence.is_some() {
+        eprintln!("gpu: frames are waited for with sync files");
+    }
     let no_ahead = std::env::var_os("MEMRIUM_NO_AHEAD").is_some();
     let mut idle = false;
     // frames in a row that came out the same as the one before: the longer the desktop stays still, the less often it is
@@ -635,14 +766,42 @@ pub fn run(args: Args) {
     let mut stages = [0.0f32; 4];
     state.allow_skip = true;
     state.persistent_target = true;
+    let mut laps = Laps::default();
+    if stats_on {
+        watch_stalls();
+    }
+    // when the next frame is begun (see `Pacer`); `MEMRIUM_NO_PACE=1`: at once, as before
+    let pace_on = std::env::var_os("MEMRIUM_NO_PACE").is_none();
+    let mut pacer = Pacer::default();
+    pacer.reset(screens.outs.first().map_or(0, |o| mode_period_us(&o.mode)));
+    // a frame start put off until this moment (µs of CLOCK_MONOTONIC)
+    let mut due: Option<u64> = None;
+    // when the GPU was last seen done with our frame, and when it should be done with the one in `copying` (µs)
+    let (mut gpu_free_us, mut gpu_due_us) = (0u64, 0u64);
+    // where each monitor's hardware cursor was put last: moving it to the same place again is a wasted ioctl (and one that
+    // may wait for the display)
+    let mut cursor_at: Vec<Option<(i32, i32)>> = Vec::new();
+    // MEMRIUM_STATS: the oldest pointer motion not yet on the cursor plane (libinput's CLOCK_MONOTONIC stamp, µs), how long
+    // motions took to reach the cursor plane, the slowest cursor ioctl, and the frame starts put off by the pacer
+    let mut motion_since: Option<u64> = None;
+    let (mut lat_n, mut lat_sum, mut lat_max, mut ioctl_max) = (0u32, 0u64, 0u64, 0u64);
+    let (mut put_off_n, mut put_off_sum) = (0u32, 0u64);
     loop {
+        // a pass of the loop that held everything up (input waited meanwhile) is named in the log, phase by phase
+        if stats_on {
+            laps.report();
+        }
         // wait for something to do: events, or a vblank when a flip is in flight
         let flip_pending = screens.outs.iter().any(|o| o.flip_pending);
         {
             let seat_fd = seat.borrow_mut().get_fd().map(|f| f.as_raw_fd()).ok();
             let wl_fd = display.backend().poll_fd().as_raw_fd();
             let calloop_fd = std::os::fd::AsFd::as_fd(&calloop).as_raw_fd();
-            let mut raw: Vec<Option<RawFd>> = vec![Some(wl_fd), Some(libinput.as_raw_fd()), Some(listener.as_raw_fd()), seat_fd, Some(calloop_fd), hotplug.as_ref().map(|h| h.fd()), waiter.as_ref().map(|w| w.fd())];
+            let fence_fd = match &copying {
+                Some((_, Done::Fence(fd), ..)) => Some(fd.as_raw_fd()),
+                _ => None,
+            };
+            let mut raw: Vec<Option<RawFd>> = vec![Some(wl_fd), Some(libinput.as_raw_fd()), Some(listener.as_raw_fd()), seat_fd, Some(calloop_fd), hotplug.as_ref().map(|h| h.fd()), waiter.as_ref().map(|w| w.fd()), fence_fd];
             // one fd per DRM device, for the vblank events
             let mut seen_gpu = Vec::new();
             for o in &screens.outs {
@@ -655,12 +814,21 @@ pub fn run(args: Args) {
             // not waiting for a flip (or inactive) means there is a frame to draw right now
             // idle (the last frame was identical): wake now and then for the clock, the widgets and what other threads
             // bring (less often the longer nothing changes); input and client commits wake the poll at once
-            let timeout: i32 = if flip_pending || copying.is_some() || !active { 100 } else if idle { idle_wait(idle_streak, state.screen_off).min(if state.recording.is_some() { 8 } else { i32::MAX }) } else { 0 };
-            // SAFETY: `fds` is a valid array of `fds.len()` pollfd structs
+            let timeout: i32 = if flip_pending || copying.is_some() || !active { 100 } else if idle { idle_wait(idle_streak, state.screen_off).min(if state.recording.is_some() { 8 } else if launch_moving(&state) { 16 } else { i32::MAX }) } else { 0 };
+            // a frame start put off by the pacer: wake for it (to the microsecond; poll's milliseconds would lose most of
+            // what putting it off gains)
+            let mut wait_us = timeout as i64 * 1000;
+            if let Some(d) = due.filter(|_| active) {
+                let left = d.saturating_sub(mono_us()) as i64;
+                wait_us = if timeout == 0 { left } else { wait_us.min(left) };
+            }
+            let ts = libc::timespec { tv_sec: (wait_us / 1_000_000) as libc::time_t, tv_nsec: ((wait_us % 1_000_000) * 1000) as libc::c_long };
+            // SAFETY: `fds` is a valid array of `fds.len()` pollfd structs, `ts` outlives the call, no signal mask
             unsafe {
-                libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout);
+                libc::ppoll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, &ts, std::ptr::null());
             }
         }
+        laps.start();
 
         // nothing of ours in flight on the GPU (every frame so far was waited for): replaced buffers go back at once
         if copying.is_none() && ahead.is_none() && !state.retired.is_empty() {
@@ -676,11 +844,13 @@ pub fn run(args: Args) {
                 for o in &mut screens.outs {
                     let _ = o.card.acquire_master_lock();
                     let _ = o.card.set_crtc(o.crtc, Some(o.fb(o.front)), (0, 0), &[o.conn], Some(o.mode));
+                    o.cursor_on = false;
                     draw_cursor(o, &cursor_picture(&state, scale, 0.0));
-                    o.flip_pending = false;
-                    o.cursor_on = true;
+                    o.settle();
                 }
-                dumb_prev = None;
+                dumb_prev.clear();
+                cursor_at.clear();
+                due = None;
                 drop_ahead(&mut ahead, &staging);
                 if let Some((.., held)) = copying.take() {
                     let _ = device.poll(wgpu::PollType::Wait);
@@ -690,6 +860,7 @@ pub fn run(args: Args) {
                 idle = false;
             } else {
                 active = false;
+                due = None;
                 libinput.suspend();
                 for o in &screens.outs {
                     let _ = o.card.release_master_lock();
@@ -697,6 +868,7 @@ pub fn run(args: Args) {
             }
         }
 
+        laps.mark("seat");
         // input
         let _ = libinput.dispatch();
         let mut had_input = false;
@@ -731,12 +903,19 @@ pub fn run(args: Args) {
                 }
                 InputEvent::Keyboard(KeyboardEvent::Key(k)) => state.key(k.key(), k.key_state() == KeyState::Pressed),
                 InputEvent::Pointer(PointerEvent::Motion(m)) => {
+                    if stats_on {
+                        use input::event::pointer::PointerEventTrait as _;
+                        motion_since.get_or_insert(m.time_usec());
+                    }
                     // programs that asked for raw motion get it; a locked pointer (a game) stays where it is
                     state.pointer_relative(m.dx_unaccelerated() as f64 / scale as f64, m.dy_unaccelerated() as f64 / scale as f64);
                     if !state.pointer_locked() {
                         // the pointer moves over the whole desktop, from one monitor to the next
                         cursor = state.clamp_to_monitors([cursor[0] + m.dx() as f32 / scale, cursor[1] + m.dy() as f32 / scale]);
                         state.pointer_motion(cursor[0], cursor[1]);
+                        if state.config.input.cursor.shake_to_find {
+                            shake.motion(m.dx() as f32 / scale, Instant::now());
+                        }
                     }
                 }
                 InputEvent::Pointer(PointerEvent::MotionAbsolute(m)) => {
@@ -780,37 +959,70 @@ pub fn run(args: Args) {
             }
         }
         state.flush_relative();
+        laps.mark("input");
         if active {
-            // the picture changes with the shape (and turns, for the busy ring)
-            let step = if state.cursor_shape.animated() { ((state.start.elapsed().as_secs_f32() * 1.1).fract() * 14.0) as u32 } else { 0 };
-            if state.cursor_gen != drawn_gen || step != drawn_step || state.config.input.cursor != drawn_prefs {
+            // the picture changes with the shape (and turns, for the busy ring or a theme's animated cursor)
+            let (step, phase) = match cursor_animation(&state) {
+                Some((rate, steps)) => {
+                    let step = ((state.start.elapsed().as_secs_f32() * rate).fract() * steps as f32) as u32;
+                    (step, step as f32 / steps as f32)
+                }
+                None => (0, 0.0),
+            };
+            // (in steps of 1/16, so a growing cursor is drawn again only a few times)
+            let now = Instant::now();
+            let zoom = (shake.zoom(now) * 16.0).round() / 16.0;
+            if shake.moving(now) || launch_moving(&state) {
+                // keep the loop turning at the quick rate until it has shrunk back, even with the mouse still
+                idle_streak = 0;
+            }
+            if state.cursor_gen != drawn_gen || step != drawn_step || zoom != drawn_zoom || state.config.input.cursor != drawn_prefs {
                 drawn_gen = state.cursor_gen;
                 drawn_step = step;
+                drawn_zoom = zoom;
                 drawn_prefs = state.config.input.cursor.clone();
-                let img = cursor_picture(&state, scale, step as f32 / 14.0);
+                let img = cursor_picture(&state, scale * zoom, phase);
                 for o in &mut screens.outs {
                     draw_cursor(o, &img);
                 }
             }
             // the hardware cursor lives on the monitor under the pointer and is hidden on the others
             let (wx, wy) = (state.world[0], state.world[1]);
-            for o in &mut screens.outs {
+            cursor_at.resize(screens.outs.len(), None);
+            // typing hid it: off everywhere until the mouse moves
+            let hidden = state.typing_hid_cursor;
+            for (i, o) in screens.outs.iter_mut().enumerate() {
                 let cx = ((cursor[0] - wx) * scale) as i32 - o.pos.0 - o.cursor_hot.0;
                 let cy = ((cursor[1] - wy) * scale) as i32 - o.pos.1 - o.cursor_hot.1;
-                let on = cx >= -63 && cy >= -63 && cx < o.size.0 as i32 && cy < o.size.1 as i32;
+                let on = !hidden && cx > -(o.cursor_dim as i32) && cy > -(o.cursor_dim as i32) && cx < o.size.0 as i32 && cy < o.size.1 as i32;
                 if on {
                     if !o.cursor_on {
                         let _ = o.card.set_cursor(o.crtc, Some(&o.cursor));
                         o.cursor_on = true;
                     }
-                    let _ = o.card.move_cursor(o.crtc, (cx, cy));
+                    if cursor_at[i] != Some((cx, cy)) {
+                        let t = Instant::now();
+                        let _ = o.card.move_cursor(o.crtc, (cx, cy));
+                        cursor_at[i] = Some((cx, cy));
+                        if stats_on {
+                            ioctl_max = ioctl_max.max(t.elapsed().as_micros() as u64);
+                        }
+                    }
                 } else if o.cursor_on {
                     let _ = o.card.set_cursor(o.crtc, None::<&DumbBuffer>);
                     o.cursor_on = false;
+                    cursor_at[i] = None;
                 }
+            }
+            if let Some(t0) = motion_since.take() {
+                let l = mono_us().saturating_sub(t0);
+                lat_n += 1;
+                lat_sum += l;
+                lat_max = lat_max.max(l);
             }
         }
 
+        laps.mark("cursor");
         // page flips that completed (events of one device may belong to several of its monitors)
         let mut done_gpu = Vec::new();
         for i in 0..screens.outs.len() {
@@ -822,28 +1034,42 @@ pub fn run(args: Args) {
             if let Ok(events) = screens.outs[i].card.receive_events() {
                 for e in events {
                     if let DrmEvent::PageFlip(ev) = e {
+                        // the pacer keeps to the first monitor's refresh
+                        if screens.outs.first().is_some_and(|o| o.gpu == gi && o.crtc == ev.crtc) {
+                            pacer.vblank_seen(ev.duration.as_micros() as u64, ev.frame);
+                        }
                         if let Some(o) = screens.outs.iter_mut().find(|o| o.gpu == gi && o.crtc == ev.crtc) {
                             o.flip_pending = false;
-                            o.front = 1 - o.front;
+                            o.front = o.queued;
+                            // a frame finished meanwhile: on screen at the next vblank
+                            if o.ready {
+                                let b = o.back;
+                                flip_to(o, b, &mut flip_failures);
+                            }
                         }
-                        if !screens.outs.iter().any(|o| o.flip_pending) {
-                            state.send_frame_callbacks();
-                        }
+                        // a frame reached the screen: the programs may draw their next one (also when the third buffer was
+                        // flipped to right away and a flip is pending again)
+                        state.send_frame_callbacks();
                     }
                 }
             }
         }
 
+        laps.mark("flip events");
         // wayland clients
         while let Ok(Some(stream)) = listener.accept() {
             let _ = dh.clone().insert_client(stream, Arc::new(ClientState { compositor: CompositorClientState::default() }));
         }
         let _ = calloop.dispatch(Some(std::time::Duration::ZERO), &mut state);
+        laps.mark("timers and services");
         let _ = display.dispatch_clients(&mut state);
         let _ = display.flush_clients();
+        laps.mark("clients");
 
         if let Some(vt) = state.pending_vt.take() {
-            let _ = seat.borrow_mut().switch_session(vt);
+            if let Err(e) = seat.borrow_mut().switch_session(vt) {
+                eprintln!("vt: could not switch to tty{vt}: {e}");
+            }
         }
         if state.quit {
             break;
@@ -888,13 +1114,16 @@ pub fn run(args: Args) {
                         let (t, st, pd) = make_canvas(&device, format, cw, ch);
                         go_zero_copy(&mut screens.outs, &device, &queue);
                         target = t;
-                        dumb_prev = None;
+                        dumb_prev.clear();
+                        cursor_at.clear();
+                        due = None;
+                        pacer.reset(screens.outs.first().map_or(0, |o| mode_period_us(&o.mode)));
                         ahead = None;
                         staging = st;
                         padded = pd;
                         for o in &mut screens.outs {
+                            o.cursor_on = false;
                             draw_cursor(o, &cursor_picture(&state, scale, 0.0));
-                            o.cursor_on = true;
                         }
                         cursor = state.clamp_to_monitors(cursor);
                         state.pointer_motion(cursor[0], cursor[1]);
@@ -922,15 +1151,55 @@ pub fn run(args: Args) {
         // draw the next frame (also while the last flip is in flight) and, once the back buffers are free, copy it in and flip
         if active {
             // `MEMRIUM_NO_AHEAD=1`: draw only when no flip is in flight, as before
-            if ahead.is_none() && !(no_ahead && screens.outs.iter().any(|o| o.flip_pending)) {
+            // (not while a finished frame still waits for its flip: one more in the queue would only show the input later)
+            let can_draw = ahead.is_none() && !screens.outs.iter().any(|o| o.ready) && !(no_ahead && screens.outs.iter().any(|o| o.flip_pending));
+            // begun as late as it can be while still in time for the first vblank it can reach, the frame shows the newest
+            // input (one monitor only: with more, their vblanks do not line up)
+            let start = match screens.outs.as_slice() {
+                [o] if can_draw && pace_on => {
+                    let now_us = mono_us();
+                    let next_v = pacer.vblank_from(now_us + 1);
+                    let taken = match (&copying, o.flip_pending) {
+                        (Some(_), pending) => {
+                            let v = pacer.vblank_from(gpu_due_us + PACE_MARGIN);
+                            Some(if pending { v.max(next_v + pacer.period) } else { v })
+                        }
+                        (None, true) => Some(next_v),
+                        (None, false) => None,
+                    };
+                    let gpu_free = if copying.is_some() { gpu_due_us.max(now_us) } else { now_us };
+                    pacer.start(now_us, taken, gpu_free)
+                }
+                _ => 0,
+            };
+            if !can_draw {
+                // a frame already waits: nothing to wake for (a stale moment would spin the loop)
+                due = None;
+            } else if start > mono_us() + 200 {
+                if due.is_none() && stats_on {
+                    put_off_n += 1;
+                    put_off_sum += start.saturating_sub(mono_us());
+                }
+                due = Some(start);
+            } else {
+                due = None;
+                let began_us = mono_us();
                 let now = Instant::now();
                 let dt = (now - last).as_secs_f32().min(0.1);
                 last = now;
+                laps.mark("displays");
                 state.update(dt);
+                laps.mark("update");
                 let (cw, ch) = screens.canvas;
                 let readback = screens.outs.iter().any(|o| o.zc.is_none());
-                match render_ahead(&mut state, &target, &staging, cw, ch, padded, &mut dumb_prev, readback) {
-                    Some(a) => ahead = Some(a),
+                let age = screens.outs.iter().map(Output::count).max().unwrap_or(2);
+                let drawn = render_ahead(&mut state, &target, &staging, cw, ch, padded, &mut dumb_prev, age, readback);
+                laps.mark("render");
+                match drawn {
+                    Some(a) => {
+                        pacer.learn_build(mono_us().saturating_sub(began_us));
+                        ahead = Some(a);
+                    }
                     None => {
                         idle = true;
                         idle_streak = idle_streak.saturating_add(1);
@@ -939,31 +1208,46 @@ pub fn run(args: Args) {
                     }
                 }
             }
-            if !screens.outs.iter().any(|o| o.flip_pending) && copying.is_none() {
+            if screens.outs.iter().all(Output::writable) && copying.is_none() {
                 if let Some(a) = ahead.take() {
                     let (cw, ch) = screens.canvas;
                     let began = Instant::now();
-                    let sub = scan_out(&staging, &target, &state.renderer, &a, cw, ch, padded, &mut screens.outs);
+                    let (sub, armed) = scan_out(&staging, &target, &state.renderer, &a, cw, ch, padded, &mut screens.outs, done_fence.as_ref());
                     // the picture must be complete before the display is told to show it: waited for off the loop, so the
                     // input that comes meanwhile reaches the programs at once (a game no longer gets the mouse in lumps)
-                    let ask = match (sub, &waiter) {
-                        (Some(i), Some(w)) => Some(w.start(i)),
-                        (Some(i), None) => {
-                            let _ = state.renderer.device().poll(wgpu::PollType::wait_for(i));
-                            None
-                        }
-                        (None, _) => None,
+                    let fenced = match (armed, &done_fence) {
+                        (true, Some(f)) => f.export().ok(),
+                        _ => None,
                     };
-                    copying = Some((a, ask, began, state.take_retired()));
+                    let done = match (sub, fenced, &waiter) {
+                        (None, ..) => Done::Now,
+                        (Some(_), Some(Some(fd)), _) => Done::Fence(fd),
+                        (Some(_), Some(None), _) => Done::Now,
+                        (Some(i), None, Some(w)) => Done::Ask(w.start(i)),
+                        (Some(i), None, None) => {
+                            let _ = state.renderer.device().poll(wgpu::PollType::wait_for(i));
+                            Done::Now
+                        }
+                    };
+                    gpu_due_us = a.submit_us.max(gpu_free_us) + pacer.gpu as u64;
+                    copying = Some((a, done, began, state.take_retired()));
+                    laps.mark("scan out");
                 }
             }
             let copied = match &copying {
-                Some((_, Some(n), ..)) => waiter.as_ref().is_none_or(|w| w.finished(*n)),
-                Some((_, None, ..)) => true,
+                Some((_, Done::Ask(n), ..)) => waiter.as_ref().is_none_or(|w| w.finished(*n)),
+                Some((_, Done::Fence(fd), ..)) => fence_signalled(fd),
+                Some((_, Done::Now, ..)) => true,
                 None => false,
             };
             if copied {
+                let gpu_work = matches!(&copying, Some((_, Done::Ask(_) | Done::Fence(_), ..)));
                 let (a, _, began, held) = copying.take().unwrap();
+                let now_us = mono_us();
+                if gpu_work {
+                    pacer.learn_gpu(now_us.saturating_sub(a.submit_us.max(gpu_free_us)));
+                }
+                gpu_free_us = now_us;
                 held.into_iter().for_each(crate::state::Held::done);
                 if stats_on {
                     let ms = a.started.elapsed().as_secs_f32() * 1000.0;
@@ -981,6 +1265,9 @@ pub fn run(args: Args) {
                             eprintln!("stats: gpu passes of the last frame: windows {win:.1} ms, shell {shell:.1} ms, whole frame {all:.1} ms");
                         }
                         eprintln!("stats: {}", state.scale_report());
+                        let ms = |us: u64| us as f32 / 1000.0;
+                        eprintln!("stats: pointer: motion to cursor plane avg {:.2} ms, max {:.2} ms over {} moves, slowest cursor ioctl {:.2} ms | pacer: build {:.1} + gpu {:.1} ms expected, refresh {:.2} ms, {} frame starts put off by {:.1} ms on average", ms(lat_sum / lat_n.max(1) as u64), ms(lat_max), lat_n, ms(ioctl_max), pacer.build / 1000.0, pacer.gpu / 1000.0, ms(pacer.period), put_off_n, ms(put_off_sum / put_off_n.max(1) as u64));
+                        (lat_n, lat_sum, lat_max, ioctl_max, put_off_n, put_off_sum) = (0, 0, 0, 0, 0, 0);
                         (st_n, st_sum, st_max, st_since) = (0, 0.0, 0.0, Instant::now());
                         stages = [0.0; 4];
                     }
@@ -988,22 +1275,12 @@ pub fn run(args: Args) {
                 idle = false;
                 idle_streak = 0;
                 for o in &mut screens.outs {
-                    let fb = o.fb(1 - o.front);
-                    match o.card.page_flip(o.crtc, fb, PageFlipFlags::EVENT, None) {
-                        Ok(()) => {
-                            o.flip_pending = true;
-                            flip_failures = 0;
-                        }
-                        Err(e) => {
-                            // usually we are not the DRM master (VT switch in progress): log once, retry the modeset gently
-                            if flip_failures == 0 {
-                                eprintln!("page_flip: {e} (retrying)");
-                            }
-                            flip_failures += 1;
-                            let _ = o.card.acquire_master_lock();
-                            let _ = o.card.set_crtc(o.crtc, Some(o.fb(o.front)), (0, 0), &[o.conn], Some(o.mode));
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                        }
+                    if o.flip_pending {
+                        // the third buffer: flipped to as soon as the pending flip ends
+                        o.ready = true;
+                    } else {
+                        let b = o.back;
+                        flip_to(o, b, &mut flip_failures);
                     }
                 }
             }
@@ -1073,6 +1350,112 @@ impl HotplugWatch {
             changed |= buf[..n as usize].split(|&b| b == 0).any(|f| f == b"SUBSYSTEM=drm");
         }
     }
+}
+
+/// How long each phase of one pass of the main loop took (after the wait for events); `report` logs a pass that took
+/// long, so a stall can be pinned on what caused it.
+#[derive(Default)]
+struct Laps {
+    at: Option<Instant>,
+    began: Option<Instant>,
+    marks: Vec<(&'static str, f32)>,
+}
+
+/// What the watchdog (`watch_stalls`) reads: when the pass in progress began (ms on `WATCH_EPOCH`, 0: none) and the
+/// last phase it finished.
+static PASS_BEGAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASS_PHASE: std::sync::Mutex<&'static str> = std::sync::Mutex::new("start");
+static WATCH_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn watch_ms() -> u64 {
+    WATCH_EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// A thread that looks at the main thread while a pass of the loop hangs: what system call it sits in, on what file,
+/// in which kernel function. Logged at 0.4 s, 1 s and 1.8 s into a stall (`stall in progress: ...`).
+fn watch_stalls() {
+    // SAFETY: plain syscall
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    let _ = WATCH_EPOCH.get_or_init(Instant::now);
+    let _ = std::thread::Builder::new().name("stall watch".into()).spawn(move || {
+        let mut seen = (0u64, 0usize);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let began = PASS_BEGAN.load(std::sync::atomic::Ordering::Relaxed);
+            if began == 0 {
+                continue;
+            }
+            let ms = watch_ms().saturating_sub(began);
+            if seen.0 != began {
+                seen = (began, 0);
+            }
+            let marks = [400u64, 1000, 1800];
+            if seen.1 >= marks.len() || ms < marks[seen.1] {
+                continue;
+            }
+            seen.1 += 1;
+            let task = format!("/proc/self/task/{tid}");
+            let wchan = std::fs::read_to_string(format!("{task}/wchan")).unwrap_or_default();
+            let sys = std::fs::read_to_string(format!("{task}/syscall")).unwrap_or_default();
+            let mut words = sys.split_whitespace();
+            let nr = words.next().unwrap_or("?").to_string();
+            let fd = words.next().and_then(|a| i64::from_str_radix(a.trim_start_matches("0x"), 16).ok());
+            let file = fd.filter(|f| (0..65536).contains(f)).and_then(|f| std::fs::read_link(format!("/proc/self/fd/{f}")).ok()).map(|p| p.display().to_string()).unwrap_or_default();
+            let phase = PASS_PHASE.lock().map(|p| *p).unwrap_or("?");
+            eprintln!("stall in progress: {ms} ms, after phase '{phase}', syscall {nr} (fd {} {file}), kernel wait '{}'", fd.unwrap_or(-1), wchan.trim());
+        }
+    });
+}
+
+impl Laps {
+    fn start(&mut self) {
+        let now = Instant::now();
+        self.at = Some(now);
+        self.began = Some(now);
+        self.marks.clear();
+        PASS_BEGAN.store(watch_ms(), std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut p) = PASS_PHASE.lock() {
+            *p = "wait";
+        }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        if let Some(at) = self.at {
+            self.marks.push((phase, (now - at).as_secs_f32() * 1000.0));
+        }
+        self.at = Some(now);
+        if let Ok(mut p) = PASS_PHASE.lock() {
+            *p = phase;
+        }
+    }
+
+    fn report(&mut self) {
+        PASS_BEGAN.store(0, std::sync::atomic::Ordering::Relaxed);
+        let Some(began) = self.began.take() else { return };
+        let total = began.elapsed().as_secs_f32() * 1000.0;
+        if total > 40.0 {
+            let parts: Vec<String> = self.marks.iter().filter(|(_, ms)| *ms >= 1.0).map(|(p, ms)| format!("{p} {ms:.0}")).collect();
+            eprintln!("stall: one pass of the loop took {total:.0} ms ({})", parts.join(", "));
+        }
+    }
+}
+
+/// How the loop learns that the copy into the scan-out images has finished.
+enum Done {
+    /// it was waited for on the spot, or there was no GPU work
+    Now,
+    /// a request to `GpuWaiter`
+    Ask(u64),
+    /// a sync file that turns readable
+    Fence(OwnedFd),
+}
+
+/// The sync file is signalled (the GPU work behind it is done).
+fn fence_signalled(fd: &OwnedFd) -> bool {
+    let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    // SAFETY: one valid pollfd, no waiting
+    unsafe { libc::poll(&mut p, 1, 0) > 0 && p.revents & libc::POLLIN != 0 }
 }
 
 /// Waits for the GPU off the main loop: the loop hands over the work that must finish before a flip and goes on reading
@@ -1159,6 +1542,8 @@ struct Ahead {
     mapped: bool,
     built: f32,
     gpu: f32,
+    /// when its drawing was handed to the GPU (µs of CLOCK_MONOTONIC)
+    submit_us: u64,
 }
 
 /// Let go of a frame that will not be shown (the staging buffer is mapped while it waits).
@@ -1169,24 +1554,33 @@ fn drop_ahead(ahead: &mut Option<Ahead>, staging: &wgpu::Buffer) {
 }
 
 /// Render the whole desktop offscreen and read the changed part back into `staging`. None: nothing changed.
-fn render_ahead(state: &mut State, target: &wgpu::Texture, staging: &wgpu::Buffer, w: u32, h: u32, padded: usize, prev: &mut Option<Option<(u32, u32, u32, u32)>>, readback: bool) -> Option<Ahead> {
+/// `prev` holds what the frames before it redrew (newest last); a buffer about to be filled holds the frame `age` frames
+/// back, so it lacks what the `age - 1` frames since then changed as well as this one.
+fn render_ahead(state: &mut State, target: &wgpu::Texture, staging: &wgpu::Buffer, w: u32, h: u32, padded: usize, prev: &mut Vec<Option<(u32, u32, u32, u32)>>, age: usize, readback: bool) -> Option<Ahead> {
     let t_start = Instant::now();
     let view = target.create_view(&Default::default());
     let mut enc = state.render(&view);
     if state.frame_skipped {
         return None;
     }
-    // what this frame redrew (None: everything). The buffer we are about to fill held the frame before the last one, so
-    // it needs what the last frame changed as well as this one.
+    // what this frame redrew (None: everything), and what the buffer to fill lacks besides
     let cur = state.renderer.last_region();
-    let need = match (cur, *prev) {
-        (Some(a), Some(Some(b))) => {
-            let (x0, y0) = (a.0.min(b.0), a.1.min(b.1));
-            Some((x0, y0, (a.0 + a.2).max(b.0 + b.2) - x0, (a.1 + a.3).max(b.1 + b.3) - y0))
-        }
-        _ => None,
+    let older = age.saturating_sub(1);
+    let need = if prev.len() < older {
+        None
+    } else {
+        prev[prev.len() - older..].iter().fold(cur, |acc, r| match (acc, *r) {
+            (Some(a), Some(b)) => {
+                let (x0, y0) = (a.0.min(b.0), a.1.min(b.1));
+                Some((x0, y0, (a.0 + a.2).max(b.0 + b.2) - x0, (a.1 + a.3).max(b.1 + b.3) - y0))
+            }
+            _ => None,
+        })
     };
-    *prev = Some(cur);
+    prev.push(cur);
+    if prev.len() > 4 {
+        prev.remove(0);
+    }
     let (cx, cy, cw, ch) = cur.unwrap_or((0, 0, w, h));
     if readback {
         enc.copy_texture_to_buffer(
@@ -1197,25 +1591,30 @@ fn render_ahead(state: &mut State, target: &wgpu::Texture, staging: &wgpu::Buffe
     }
     state.renderer.queue().submit([enc.finish()]);
     let t_built = Instant::now();
+    let submit_us = mono_us();
     // with scan-out images only, the GPU keeps drawing while the display waits: the wait comes with the copy into the image
     if readback {
         staging.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
         state.renderer.device().poll(wgpu::PollType::Wait).unwrap();
     }
     let t_gpu = Instant::now();
-    Some(Ahead { cur, need, started: t_start, mapped: readback, built: (t_built - t_start).as_secs_f32() * 1000.0, gpu: (t_gpu - t_built).as_secs_f32() * 1000.0 })
+    Some(Ahead { cur, need, started: t_start, mapped: readback, built: (t_built - t_start).as_secs_f32() * 1000.0, gpu: (t_gpu - t_built).as_secs_f32() * 1000.0, submit_us })
 }
 
 /// Give every monitor its part of the frame in its back buffer (which the last flip has freed). Returns the GPU's part
 /// of the work when there is one (copies into scan-out images): the frame may be shown once it has finished.
-fn scan_out(staging: &wgpu::Buffer, target: &wgpu::Texture, renderer: &Renderer, a: &Ahead, w: u32, h: u32, padded: usize, outs: &mut [Output]) -> Option<wgpu::SubmissionIndex> {
+/// With `fence`, it is armed for that submit (the second value says so).
+fn scan_out(staging: &wgpu::Buffer, target: &wgpu::Texture, renderer: &Renderer, a: &Ahead, w: u32, h: u32, padded: usize, outs: &mut [Output], fence: Option<&memrium_de::renderer::DoneFence>) -> (Option<wgpu::SubmissionIndex>, bool) {
     let (nx, ny, nw, nh) = a.need.unwrap_or((0, 0, w, h));
     let mut enc = renderer.device().create_command_encoder(&Default::default());
     let mut gpu_copies = false;
     {
         let mapped = a.mapped.then(|| staging.slice(..).get_mapped_range());
         for o in outs.iter_mut() {
-            let idx = 1 - o.front;
+            // every monitor moves on to its next buffer, also one this frame does not touch: what that buffer lacks
+            // is all in `need`, and none of it falls on this monitor
+            let idx = o.next();
+            o.back = idx;
             let (ow, oh) = (o.size.0 as usize, o.size.1 as usize);
             let (px, py) = (o.pos.0.max(0) as usize, o.pos.1.max(0) as usize);
             // the part of the redone region that falls on this monitor, in its own columns and rows
@@ -1257,12 +1656,178 @@ fn scan_out(staging: &wgpu::Buffer, target: &wgpu::Texture, renderer: &Renderer,
     if a.mapped {
         staging.unmap();
     }
-    gpu_copies.then(|| renderer.queue().submit([enc.finish()]))
+    if !gpu_copies {
+        return (None, false);
+    }
+    if let Some(f) = fence {
+        f.arm(renderer.queue());
+    }
+    (Some(renderer.queue().submit([enc.finish()])), fence.is_some())
+}
+
+/// Microseconds of CLOCK_MONOTONIC: the clock DRM stamps vblanks with and libinput stamps events with.
+fn mono_us() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid timespec to write into
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
+}
+
+/// One refresh of a display mode, µs (0: unknown).
+fn mode_period_us(m: &control::Mode) -> u64 {
+    let (ht, vt) = (m.hsync().2 as u64, m.vsync().2 as u64);
+    if m.clock() == 0 || ht == 0 || vt == 0 {
+        return 0;
+    }
+    ht * vt * 1000 / m.clock() as u64
+}
+
+/// Slack between the expected end of a frame and the vblank it is meant for (the fence seen by the loop, the flip ioctl,
+/// the driver's vblank evasion), µs.
+const PACE_MARGIN: u64 = 1500;
+
+/// When to begin the next frame. Begun at once, a frame takes the input of that moment and then waits: behind the GPU's
+/// previous frame and for a vblank after the one already taken, so the pointer's position it shows is up to two
+/// refreshes old (the triple buffer made this worse for light frames: drawn right after a flip, shown two vblanks later).
+/// Begun as late as it can be while still in time for the first vblank it can reach, it shows the newest input; this is
+/// what KWin does. Times are µs of CLOCK_MONOTONIC.
+#[derive(Default)]
+struct Pacer {
+    /// one refresh (0: unknown, frames are begun at once)
+    period: u64,
+    /// the last vblank and its frame number
+    vblank: u64,
+    frame: u32,
+    /// what a frame is expected to cost: the loop's CPU part (update + render) and the GPU's (render + copy), µs
+    build: f64,
+    gpu: f64,
+}
+
+impl Pacer {
+    fn reset(&mut self, period: u64) {
+        *self = Pacer { period, ..Pacer::default() };
+    }
+
+    /// A page flip ended: the vblank's time stamp keeps the pacer's grid on the display's own clock.
+    fn vblank_seen(&mut self, t: u64, frame: u32) {
+        if self.vblank != 0 && frame > self.frame && t > self.vblank {
+            // the refresh measured over the frames between, to follow a mode the table rounds (143.98 Hz for "144")
+            let measured = (t - self.vblank) / (frame - self.frame) as u64;
+            if self.period == 0 {
+                self.period = measured;
+            } else if measured.abs_diff(self.period) * 10 < self.period {
+                self.period = (self.period * 7 + measured + 4) / 8;
+            }
+        }
+        self.vblank = t;
+        self.frame = frame;
+    }
+
+    /// The first vblank at or after `t`.
+    fn vblank_from(&self, t: u64) -> u64 {
+        if self.period == 0 || t <= self.vblank {
+            return self.vblank.max(t);
+        }
+        self.vblank + (t - self.vblank).div_ceil(self.period) * self.period
+    }
+
+    /// A cost seen: a dearer frame is believed at once, a cheaper one little by little (a miss costs a whole refresh, a
+    /// frame begun a little early costs only latency).
+    fn learn(est: &mut f64, us: u64) {
+        let x = us.min(50_000) as f64;
+        *est = if x > *est { x } else { *est + (x - *est) * 0.08 };
+    }
+
+    fn learn_build(&mut self, us: u64) {
+        Self::learn(&mut self.build, us);
+    }
+
+    fn learn_gpu(&mut self, us: u64) {
+        Self::learn(&mut self.gpu, us);
+    }
+
+    /// When to begin the next frame, given that the vblank `taken` already belongs to another frame and the GPU is busy
+    /// with ours until `gpu_free`.
+    fn start(&self, now: u64, taken: Option<u64>, gpu_free: u64) -> u64 {
+        // no grid yet, or a stale one (the desktop sat still): at once
+        if self.period == 0 || self.vblank == 0 || now.saturating_sub(self.vblank) > 250_000 {
+            return now;
+        }
+        let (b, g) = (self.build as u64, self.gpu as u64);
+        // a frame dearer than one refresh gains nothing by waiting: it misses the next vblank anyway, and putting it off
+        // only adds latency on top (the GPU estimate is the time to the sync file, which on a busy or clocked-down iGPU
+        // was 15-50 ms against 0.3-7 ms of our own passes: frames were put off 17-24 ms and lagged behind the cursor)
+        if b + g + PACE_MARGIN >= self.period {
+            return now;
+        }
+        let done = (now + b).max(gpu_free) + g + PACE_MARGIN;
+        let mut v = self.vblank_from(done);
+        if let Some(t) = taken {
+            v = v.max(self.vblank_from(t + self.period / 2));
+        }
+        v.saturating_sub(b + g + PACE_MARGIN).max(now)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::idle_wait;
+
+    #[test]
+    fn a_light_frame_is_begun_late_enough_to_show_the_newest_input() {
+        let mut p = super::Pacer::default();
+        p.reset(7000);
+        p.vblank_seen(1_000_000, 100);
+        p.learn_build(2000);
+        p.learn_gpu(2000);
+        // 1 ms after a vblank, a flip pending for the next one (1_007_000): aim for 1_014_000, begin 5.5 ms before it
+        let now = 1_001_000;
+        let s = p.start(now, Some(p.vblank_from(now + 1)), now);
+        assert_eq!(s, 1_014_000 - 2000 - 2000 - super::PACE_MARGIN);
+        // nothing taken: the next vblank is still reachable
+        assert_eq!(p.start(now, None, now), 1_007_000 - 5500);
+    }
+
+    #[test]
+    fn a_heavy_frame_is_begun_at_once() {
+        let mut p = super::Pacer::default();
+        p.reset(7000);
+        p.vblank_seen(1_000_000, 100);
+        p.learn_build(3000);
+        p.learn_gpu(12_000);
+        let now = 1_001_000;
+        // dearer than a refresh: never put off, whether the GPU is free, busy, or a vblank is taken
+        assert_eq!(p.start(now, None, now), now);
+        assert_eq!(p.start(now, Some(1_014_000), 1_010_000), now);
+        // a stale grid: at once
+        assert_eq!(p.start(2_000_000, None, 2_000_000), 2_000_000);
+    }
+
+    #[test]
+    fn a_frame_just_under_a_refresh_is_still_paced() {
+        let mut p = super::Pacer::default();
+        p.reset(16_700);
+        p.vblank_seen(1_000_000, 100);
+        p.learn_build(2000);
+        p.learn_gpu(4000);
+        // 1 ms after a vblank, nothing taken: aim for the next one, 7.5 ms before it
+        let now = 1_001_000;
+        assert_eq!(p.start(now, None, now), 1_016_700 - 2000 - 4000 - super::PACE_MARGIN);
+    }
+
+    #[test]
+    fn the_refresh_follows_the_flip_stamps_and_costs_fall_slowly() {
+        let mut p = super::Pacer::default();
+        p.reset(6944);
+        p.vblank_seen(1_000_000, 10);
+        p.vblank_seen(1_000_000 + 2 * 6950, 12);
+        assert!(p.period > 6944 && p.period <= 6950);
+        p.learn_gpu(10_000);
+        p.learn_gpu(1000);
+        assert!(p.gpu > 9000.0);
+    }
 
     #[test]
     fn a_still_desktop_is_looked_at_less_often_but_never_past_the_next_second() {

@@ -71,6 +71,10 @@ pub struct Desktop {
     grid: Option<([f32; 2], f32, f32, i32, i32)>,
     /// icons being carried over the empty desktop: (their paths, where they were picked up, where the pointer is now)
     pub drag: Option<(Vec<PathBuf>, [f32; 2], [f32; 2])>,
+    /// names already split into lines (`wrap2` measures every prefix of a long name, glyph by glyph: with a hundred icons
+    /// that was most of a frame's CPU time), for the line width and font in `wrap_for`
+    wraps: HashMap<String, Vec<String>>,
+    wrap_for: (u32, u32),
 }
 
 /// A cell of the icon grid: (column, row).
@@ -234,6 +238,8 @@ impl Desktop {
             placed: Vec::new(),
             grid: None,
             drag: None,
+            wraps: HashMap::new(),
+            wrap_for: (0, 0),
         }
     }
 
@@ -347,6 +353,7 @@ impl Desktop {
         self.dir = fsops::desktop_dir();
         self.entries = fsops::list_dir(&self.dir, self.prefs.show_hidden, self.prefs.sort, false, true).unwrap_or_default();
         self.entries.truncate(300);
+        self.wraps.clear();
         self.stamp = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
         self.sel.retain(|p| self.entries.iter().any(|e| &e.path == p));
         self.loaded = true;
@@ -719,6 +726,20 @@ impl Desktop {
 
     // ---------------------------------------------------------------- drawing
 
+    /// Read the folder again when it changed (looked at once a second).
+    pub fn refresh(&mut self, time: f32, fm_gen: u64) {
+        if !self.loaded || fm_gen != self.seen_gen {
+            self.seen_gen = fm_gen;
+            self.reload();
+        } else if time - self.last_poll > 1.0 {
+            self.last_poll = time;
+            let stamp = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
+            if stamp != self.stamp && self.edit.is_none() {
+                self.reload();
+            }
+        }
+    }
+
     pub fn draw(&mut self, cx: &DesktopCtx) -> (Vec<Panel>, Vec<Label>) {
         let (mut p, mut l) = (Vec::new(), Vec::new());
         self.wanted.clear();
@@ -726,16 +747,7 @@ impl Desktop {
             self.rects.clear();
             return (p, l);
         }
-        if !self.loaded || cx.fm.gen != self.seen_gen {
-            self.seen_gen = cx.fm.gen;
-            self.reload();
-        } else if cx.time - self.last_poll > 1.0 {
-            self.last_poll = cx.time;
-            let stamp = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
-            if stamp != self.stamp && self.edit.is_none() {
-                self.reload();
-            }
-        }
+        self.refresh(cx.time, cx.fm.gen);
         let theme = cx.theme;
         let accent = theme.accent;
         let area = cx.area;
@@ -750,6 +762,12 @@ impl Desktop {
         self.placed = arrange(&names, &self.cells, cols, rows);
         self.rects.clear();
         let mut wanted = Vec::new();
+        // the cached line splits hold for this cell width and this font (a probe width changes with the font)
+        let wrap_for = ((cw - 10.0).to_bits(), (cx.measure)("Mg", 12.5, false).to_bits());
+        if wrap_for != self.wrap_for {
+            self.wrap_for = wrap_for;
+            self.wraps.clear();
+        }
         let band = self.band.map(|s| [s[0].min(self.mouse[0]), s[1].min(self.mouse[1]), (s[0] - self.mouse[0]).abs(), (s[1] - self.mouse[1]).abs()]);
         for (i, e) in self.entries.iter().enumerate() {
             let (col, row) = self.placed[i];
@@ -797,7 +815,15 @@ impl Desktop {
                 let t = wrap2(&format!("{}{caret}", ed.text), 12.5, r[2] - 18.0, cx.measure);
                 l.push(Label::new(t.last().cloned().unwrap_or_default(), r[0] + r[2] / 2.0, ty + 1.5, 12.5, false, [0.08, 0.1, 0.15], 1.0, Align::Center).verbatim());
             } else {
-                for (k, line) in wrap2(e.title(), 12.5, r[2] - 10.0, cx.measure).into_iter().enumerate() {
+                let lines = match self.wraps.get(e.title()) {
+                    Some(l) => l.clone(),
+                    None => {
+                        let l = wrap2(e.title(), 12.5, r[2] - 10.0, cx.measure);
+                        self.wraps.insert(e.title().to_string(), l.clone());
+                        l
+                    }
+                };
+                for (k, line) in lines.into_iter().enumerate() {
                     let y = ty + k as f32 * 15.0;
                     // two shadows (a tight one and a wide faint one) keep white names readable on any wallpaper; every extra
                     // label eats into the 576-panel limit of one draw

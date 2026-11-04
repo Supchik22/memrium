@@ -237,6 +237,61 @@ fn body_dark(fs: &FrameStyle, theme_dark: bool) -> bool {
     }
 }
 
+/// Give a window's body panel (a solid one, already carrying the wide shadow) the theme's tight shadow and, when
+/// `outline`, its hairline (with the inner light line when `dark`, the window's look).
+pub fn window_edge(theme: &Theme, p: Panel, focused: bool, outline: bool, dark: bool) -> Panel {
+    let ws = &theme.window;
+    let near = if focused { ws.shadow_near } else { ws.shadow_near_idle };
+    let (line, light) = if !outline { (0.0, 0.0) } else if dark { ((ws.outline * 2.0).min(1.0), ws.outline_light) } else { (ws.outline, 0.0) };
+    p.window_edge(near, line, light)
+}
+
+/// The panel under a window whose program draws its own frame (or a full-screen one: `sh` all zero, nothing drawn):
+/// only the shadow, the tight shadow and the hairline round the shape `f` with corner radius `r`.
+pub fn client_shadow(theme: &Theme, f: [f32; 4], r: f32, sh: [f32; 3], focused: bool, outline: bool) -> Panel {
+    let p = Panel::solid(f[0] + f[2] / 2.0, f[1] + f[3] / 2.0, f[2], f[3], r, [0.97; 3], [0.95; 3]).flat().alpha(0.0).shadow(sh[0], sh[1], sh[2]);
+    if sh[0] <= 0.0 && !outline {
+        return p;
+    }
+    window_edge(theme, p, focused, outline, theme.dark)
+}
+
+/// Round the corners of a shell window's own content (Files, Settings) the way the window's are: a fill (solid or glass,
+/// square) that reaches a corner of `frame` gets that corner cut to the radius `r`. The fill is made bigger on its sides
+/// away from the frame's edges and cut back to where it was, so only its corners at the frame's corners round off.
+pub fn round_to_frame(panels: &mut [Panel], frame: [f32; 4], r: f32) {
+    if r < 0.5 {
+        return;
+    }
+    let [fx0, fy0] = [frame[0], frame[1]];
+    let [fx1, fy1] = [frame[0] + frame[2], frame[1] + frame[3]];
+    let e = 0.75;
+    for p in panels.iter_mut() {
+        // glass (0) and solid fills (1) only, and only square ones
+        if p.params[1] + 0.5 >= 2.0 || p.params[0].abs() > 0.5 {
+            continue;
+        }
+        let mut b = [p.rect[0] - p.rect[2], p.rect[1] - p.rect[3], p.rect[0] + p.rect[2], p.rect[1] + p.rect[3]];
+        if p.clip[2] > 0.0 {
+            b = [b[0].max(p.clip[0] - p.clip[2]), b[1].max(p.clip[1] - p.clip[3]), b[2].min(p.clip[0] + p.clip[2]), b[3].min(p.clip[1] + p.clip[3])];
+        }
+        // (a fill wider than the window counts as far as the window)
+        b = [b[0].max(fx0), b[1].max(fy0), b[2].min(fx1), b[3].min(fy1)];
+        if b[2] - b[0] < 1.0 || b[3] - b[1] < 1.0 {
+            continue;
+        }
+        let (l, t, rt, bt) = (b[0] <= fx0 + e, b[1] <= fy0 + e, b[2] >= fx1 - e, b[3] >= fy1 - e);
+        if !((l || rt) && (t || bt)) {
+            continue;
+        }
+        let k = 2.0 * r;
+        let n = [if l { b[0] } else { b[0] - k }, if t { b[1] } else { b[1] - k }, if rt { b[2] } else { b[2] + k }, if bt { b[3] } else { b[3] + k }];
+        p.rect = [(n[0] + n[2]) / 2.0, (n[1] + n[3]) / 2.0, (n[2] - n[0]) / 2.0, (n[3] - n[1]) / 2.0];
+        p.params[0] = r;
+        p.clip = [(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0, (b[2] - b[0]) / 2.0, (b[3] - b[1]) / 2.0];
+    }
+}
+
 /// Chrome panels (shadow, frame, titlebar, buttons) for a window frame. The client surface is drawn on top.
 pub fn frame_panels(theme: &Theme, frame: [f32; 4], focused: bool, maximized: bool, hover: Option<Btn>) -> Vec<Panel> {
     let [x, y, w, h] = frame;
@@ -244,12 +299,14 @@ pub fn frame_panels(theme: &Theme, frame: [f32; 4], focused: bool, maximized: bo
     let ws = &theme.window;
     let sh = if focused { ws.shadow } else { ws.shadow_idle };
     let r = if maximized && ws.max_gap < 0.5 { 0.0 } else { ws.radius };
+    // a maximized window that fills its area has no hairline round it (it would run along the bars)
+    let line = !(maximized && ws.max_gap < 0.5);
     let mut out = Vec::new();
     match ws.decoration {
         DecoKind::Mac => {
             // the title bar follows the light / dark look
             let (top, bot) = if theme.dark { ([0.19, 0.19, 0.21], [0.15, 0.15, 0.17]) } else { ([0.97, 0.97, 0.98], [0.93, 0.93, 0.95]) };
-            out.push(Panel::solid(cx, cy, w, h, r, top, bot).flat().shadow(sh[0], sh[1], sh[2]));
+            out.push(window_edge(theme, Panel::solid(cx, cy, w, h, r, top, bot).flat().shadow(sh[0], sh[1], sh[2]), focused, line, theme.dark));
             let tb = ws.titlebar;
             let lights: [[f32; 3]; 3] = if focused { [[1.0, 0.37, 0.34], [1.0, 0.75, 0.18], [0.16, 0.80, 0.26]] } else { [[0.74, 0.74, 0.76]; 3] };
             let glyphs = ["x", "minus", "plus"];
@@ -294,7 +351,7 @@ pub fn frame_panels(theme: &Theme, frame: [f32; 4], focused: bool, maximized: bo
             // Adwaita: a light (or dark) window, a slightly different header bar with square lower corners, a hairline
             let (body, head) = if theme.dark { ([0.141, 0.141, 0.141], [0.188, 0.188, 0.188]) } else { ([0.98, 0.98, 0.98], [0.922, 0.922, 0.922]) };
             let tb = ws.titlebar;
-            out.push(Panel::solid(cx, cy, w, h, r, body, body).flat().shadow(sh[0], sh[1], sh[2]));
+            out.push(window_edge(theme, Panel::solid(cx, cy, w, h, r, body, body).flat().shadow(sh[0], sh[1], sh[2]), focused, line, theme.dark));
             let head = if focused { head } else { body };
             // the header bar is rounded at the top only: draw it a corner-radius too tall and put the body over the excess
             out.push(Panel::solid(cx, y + (tb + r) / 2.0, w, tb + r, r, head, head).flat());
@@ -354,7 +411,7 @@ pub fn frame_panels(theme: &Theme, frame: [f32; 4], focused: bool, maximized: bo
             }
         }
         DecoKind::Minimal => {
-            out.push(Panel::solid(cx, cy, w, h, r, [0.97; 3], [0.95; 3]).flat().alpha(0.0).shadow(sh[0], sh[1], sh[2]));
+            out.push(client_shadow(theme, frame, r, sh, focused, line));
         }
         DecoKind::Custom => custom_panels(theme, frame, focused, maximized, hover, &mut out),
     }
@@ -369,6 +426,7 @@ fn custom_panels(theme: &Theme, frame: [f32; 4], focused: bool, maximized: bool,
     let fs = &ws.frame;
     let sh = if focused { ws.shadow } else { ws.shadow_idle };
     let r = if maximized && ws.max_gap < 0.5 { 0.0 } else { ws.radius };
+    let line = !(maximized && ws.max_gap < 0.5);
     let tb = ws.titlebar;
     let dark = body_dark(fs, theme.dark);
     let (body, tone) = if dark { ([0.141, 0.145, 0.165], [0.19, 0.195, 0.215]) } else { ([0.975, 0.977, 0.985], [0.92, 0.924, 0.935]) };
@@ -387,13 +445,8 @@ fn custom_panels(theme: &Theme, frame: [f32; 4], focused: bool, maximized: bool,
         let client = [x + ins[0], y + ins[1], w - ins[0] - ins[2], h - ins[1] - ins[3]];
         out.push(Panel::solid(client[0] + client[2] / 2.0, client[1] + client[3] / 2.0, client[2] + 2.0, client[3] + 2.0, 1.0, [0.0; 3], [0.0; 3]).flat().alpha(0.5));
     } else {
-        if fs.outline {
-            let border = if dark { 0.35 } else { 0.16 };
-            out.push(Panel::solid(cx, cy, w + 2.0, h + 2.0, r + 1.0, [0.0; 3], [0.0; 3]).flat().alpha(border).shadow(sh[0], sh[1], sh[2]));
-            out.push(Panel::solid(cx, cy, w, h, r, body, body).flat());
-        } else {
-            out.push(Panel::solid(cx, cy, w, h, r, body, body).flat().shadow(sh[0], sh[1], sh[2]));
-        }
+        // the body carries the shadows and the hairline (drawn in the band round its edge, no extra panel over the window)
+        out.push(window_edge(theme, Panel::solid(cx, cy, w, h, r, body, body).flat().shadow(sh[0], sh[1], sh[2]), focused, fs.outline && line, dark));
         let head = match fs.bar {
             BarMaterial::Tone => tone,
             BarMaterial::Accent => theme.accent,
@@ -481,6 +534,29 @@ fn custom_panels(theme: &Theme, frame: [f32; 4], focused: bool, maximized: bool,
     }
 }
 
+/// Take the window buttons out of `panels` (from `frame_panels` for the same theme and frame) and return them, for a
+/// window whose own content covers the title bar (the shell's unified toolbar): the content goes over the frame, the
+/// buttons over the content. A button's panels are the ones that sit inside its rectangle; the first panel (the
+/// window's body) always stays.
+pub fn take_buttons(theme: &Theme, frame: [f32; 4], panels: &mut Vec<Panel>) -> Vec<Panel> {
+    let rects = buttons(theme, frame);
+    let on_button = |p: &Panel| {
+        let [cx, cy, hw, hh] = p.rect;
+        rects.iter().any(|(_, r)| cx - hw >= r[0] - 1.5 && cx + hw <= r[0] + r[2] + 1.5 && cy - hh >= r[1] - 1.5 && cy + hh <= r[1] + r[3] + 1.5)
+    };
+    let mut out = Vec::new();
+    let mut keep = Vec::with_capacity(panels.len());
+    for (i, p) in panels.drain(..).enumerate() {
+        if i > 0 && on_button(&p) {
+            out.push(p);
+        } else {
+            keep.push(p);
+        }
+    }
+    *panels = keep;
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +600,20 @@ mod tests {
         assert!(title_menu_panels(&t, &rects, None, false).is_empty());
         assert_eq!(title_menu_panels(&t, &rects, Some(1), true).len(), 1);
         assert!(title_menu_panels(&t, &rects, Some(5), true).is_empty());
+    }
+
+    #[test]
+    fn the_buttons_come_out_of_the_frame_and_the_body_stays() {
+        let frame = [100.0, 50.0, 900.0, 500.0];
+        for deco in [DecoKind::Mac, DecoKind::Win11, DecoKind::Gnome, DecoKind::Custom] {
+            let t = with(deco);
+            let mut p = frame_panels(&t, frame, true, false, Some(Btn::Close));
+            let all = p.len();
+            let b = take_buttons(&t, frame, &mut p);
+            assert!(!b.is_empty(), "{deco:?}");
+            assert_eq!(p.len() + b.len(), all, "{deco:?}");
+            // the window's body (with its shadow) is not a button
+            assert!(p[0].rect[2] * 2.0 >= frame[2] - 1.0, "{deco:?}");
+        }
     }
 }

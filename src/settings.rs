@@ -14,6 +14,10 @@ use crate::theme::{self, GlassMode, MenubarKind, DecoKind, Edge, IconShape, Layo
 pub const WIN_W: f32 = 900.0;
 pub const WIN_H: f32 = 760.0;
 const SIDEBAR: f32 = 196.0;
+/// Height of the top row that holds the window buttons when the shell draws Settings without a title bar.
+pub const TOOLBAR_H: f32 = 48.0;
+/// The strip along the top of the page that moves the window in that look (the page scrolls under it).
+const PAGE_BAR: f32 = 30.0;
 
 #[path = "settings_general.rs"]
 mod general;
@@ -37,6 +41,7 @@ enum Page {
     Icons,
     About,
     Notifications,
+    Osd,
     DateTime,
     Sound,
     Network,
@@ -44,7 +49,7 @@ enum Page {
     Programs,
 }
 
-const PAGES: [(Page, &str, &str); 20] = [
+const PAGES: [(Page, &str, &str); 21] = [
     (Page::General, "General", "settings"),
     (Page::Themes, "Themes", "layers"),
     (Page::Displays, "Displays", "monitor"),
@@ -60,6 +65,7 @@ const PAGES: [(Page, &str, &str); 20] = [
     (Page::Icons, "Icons", "sticky-note"),
     (Page::About, "About", "monitor"),
     (Page::Notifications, "Notifications", "bell"),
+    (Page::Osd, "Indicator", "volume-2"),
     (Page::DateTime, "Date & Time", "clock"),
     (Page::Sound, "Sound", "volume-2"),
     (Page::Network, "Network", "wifi"),
@@ -81,6 +87,7 @@ fn page_tone(page: Page) -> chebrium::style::Tone {
         Page::Windows => Primary,
         Page::Animations => Pink,
         Page::Notifications => Danger,
+        Page::Osd => Info,
         Page::DateTime => Warning,
         Page::Sound => Pink,
         Page::Network => Primary,
@@ -123,6 +130,8 @@ pub enum SettingsAction {
     Sys(crate::sysctl::Cmd),
     /// show a notification, to see how they look
     TestNotification,
+    /// show the volume indicator, to see how it looks
+    TestOsd,
     Close,
 }
 
@@ -198,6 +207,13 @@ pub struct Settings {
     /// glass samples of the Glass page: they must be drawn in the shell layer, above the window, to refract the
     /// backdrop the page paints. (panels, labels)
     pub preview_shell: (Vec<Panel>, Vec<Label>),
+    /// The window has no title bar of its own: the room the window buttons take at the left and at the right of its
+    /// top row (set by the shell before `draw`). None = a separate title bar.
+    pub chrome: Option<[f32; 2]>,
+    /// the window's corner radius in that look (its content follows the rounded shape)
+    pub corner: f32,
+    /// the bare strips along the top that move the window in that look (see `drag_at`)
+    drag: Vec<[f32; 4]>,
 }
 
 /// What the Panels page has selected.
@@ -216,7 +232,7 @@ struct PanelsState {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { open: false, page: Page::Appearance, ui: State::default(), wall_row: 0, query: String::new(), side_scroll: Spring::new(0.0, 420.0, 1.0), side_hl: None, side_t: Vec::new(), side_max: 0.0, side_drag: None, over_side: false, scroll: Spring::new(0.0, 420.0, 1.0), max_scroll: 0.0, sb_drag: None, glass_target: 0, panels: PanelsState::default(), accent_hsv: None, accent_open: false, gtk_note: String::new(), anim_page: None, display_sel: 0, share: Default::default(), rules: crate::apprules::Rules::load(), rule_name: String::new(), preview_shell: (Vec::new(), Vec::new()) }
+        Settings { open: false, page: Page::Appearance, ui: State::default(), wall_row: 0, query: String::new(), side_scroll: Spring::new(0.0, 420.0, 1.0), side_hl: None, side_t: Vec::new(), side_max: 0.0, side_drag: None, over_side: false, scroll: Spring::new(0.0, 420.0, 1.0), max_scroll: 0.0, sb_drag: None, glass_target: 0, panels: PanelsState::default(), accent_hsv: None, accent_open: false, gtk_note: String::new(), anim_page: None, display_sel: 0, share: Default::default(), rules: crate::apprules::Rules::load(), rule_name: String::new(), preview_shell: (Vec::new(), Vec::new()), chrome: None, corner: 0.0, drag: Vec::new() }
     }
 }
 
@@ -253,6 +269,12 @@ impl Settings {
 
     pub fn set_mouse(&mut self, p: [f32; 2]) {
         self.ui.pointer_move(p);
+    }
+
+    /// A press at `p` lands on a bare strip along the top of a window without a title bar: it moves the window, as the
+    /// title bar would.
+    pub fn drag_at(&self, p: [f32; 2]) -> bool {
+        self.open && self.chrome.is_some() && self.drag.iter().any(|r| p[0] >= r[0] && p[0] < r[0] + r[2] && p[1] >= r[1] && p[1] < r[1] + r[3])
     }
 
     /// A press inside the content area (the compositor has already handled the window chrome).
@@ -309,7 +331,9 @@ impl Settings {
         let ink = if dark { [0.95, 0.96, 0.99] } else { [0.10, 0.12, 0.18] };
         let accent = ctx.theme.accent;
         // client background: frosted glass, calmer and more opaque than panels so text stays readable
-        let mut bg = ctx.theme.glass.panel(x + win_w / 2.0, y + win_h / 2.0, win_w, win_h, 0.0);
+        // (without a title bar the content is the whole window, so it follows the window's rounded corners)
+        let corner = if self.chrome.is_some() { self.corner } else { 0.0 };
+        let mut bg = ctx.theme.glass.panel(x + win_w / 2.0, y + win_h / 2.0, win_w, win_h, corner);
         bg.fx[0] = bg.fx[0].max(18.0);
         bg.extra[0] = 0.0;
         bg.params[3] = 0.0;
@@ -320,7 +344,7 @@ impl Settings {
         // the page itself is opaque; only the sidebar lets the glass show through
         let page = if dark { [0.12, 0.12, 0.12] } else { [0.97, 0.98, 1.0] };
         let (pw, ph) = (win_w - SIDEBAR, win_h);
-        p.push(Panel::solid(x + SIDEBAR + pw / 2.0, y + ph / 2.0, pw, ph, 0.0, page, page).flat());
+        p.push(crate::files::window_fill([x + SIDEBAR, y, pw, ph], [x, y, win_w, win_h], corner, page, 1.0));
 
         // animations run on real time; a page that has just opened shows its controls where they belong at once
         let dt = self.ui.begin_frame();
@@ -338,7 +362,16 @@ impl Settings {
             theme::SidebarSize::Large => (46.0, 19.0),
         };
         // search: pages whose name or settings match
-        let sf = [x + 14.0, y + 12.0, SIDEBAR - 28.0, 30.0];
+        // (without a title bar the window buttons sit above it, over the sidebar, as in System Settings)
+        let unified = self.chrome.is_some();
+        let sf_y = if unified { y + TOOLBAR_H + 2.0 } else { y + 12.0 };
+        self.drag.clear();
+        if unified {
+            let trail = self.chrome.map_or(0.0, |c| c[1]);
+            self.drag.push([x, y, SIDEBAR, sf_y - y - 2.0]);
+            self.drag.push([x + SIDEBAR, y, (win_w - SIDEBAR - trail).max(0.0), PAGE_BAR]);
+        }
+        let sf = [x + 14.0, sf_y, SIDEBAR - 28.0, 30.0];
         let mut q = std::mem::take(&mut self.query);
         ui.text_field(sf, "settings-search", &mut q);
         if q.is_empty() && !ui.editing() {
@@ -351,7 +384,7 @@ impl Settings {
             .iter()
             .filter(|(pg, name, _)| needle.is_empty() || name.to_lowercase().contains(&needle) || crate::i18n::tr(name).to_lowercase().contains(&needle) || page_keywords(*pg).contains(&needle))
             .collect();
-        let list_top = y + 52.0;
+        let list_top = sf_y + 40.0;
         let list_bot = y + win_h - 12.0;
         self.over_side = ui.mouse[0] >= x && ui.mouse[0] < x + SIDEBAR;
         self.side_scroll.update(dt);
@@ -359,7 +392,7 @@ impl Settings {
         // the pages in groups (a flat list while searching)
         const CATEGORIES: [(&str, &[Page]); 5] = [
             ("LOOK", &[Page::Themes, Page::Appearance, Page::Glass, Page::Wallpaper, Page::Icons, Page::Programs]),
-            ("DESKTOP", &[Page::Layout, Page::Panels, Page::Notifications, Page::DateTime]),
+            ("DESKTOP", &[Page::Layout, Page::Panels, Page::Notifications, Page::Osd, Page::DateTime]),
             ("WINDOWS", &[Page::Windows, Page::Animations]),
             ("DEVICES", &[Page::Displays, Page::Sound, Page::Network, Page::Power, Page::Mouse, Page::Keys]),
             ("SYSTEM", &[Page::General, Page::About]),
@@ -481,11 +514,12 @@ impl Settings {
         let scrolls = self.page != Page::Wallpaper;
         self.scroll.update(dt);
         let sy = if scrolls { self.scroll.x } else { 0.0 };
-        let (view_top, view_bot) = (y, y + win_h - 4.0);
+        // (without a title bar the page scrolls under a bare strip that moves the window)
+        let (view_top, view_bot) = (if unified { y + PAGE_BAR } else { y }, y + win_h - 4.0);
         let mark = ui.d.mark();
         // (room above the page: a maximized window starts right under the menu bar)
         const PAGE_TOP: f32 = 18.0;
-        let py = y - sy + PAGE_TOP;
+        let py = y - sy + PAGE_TOP + if unified { 8.0 } else { 0.0 };
         match self.page {
             Page::General => general::page_general(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions),
             Page::Themes => general::page_themes(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions, &mut self.share),
@@ -493,6 +527,7 @@ impl Settings {
             Page::Displays => general::page_displays(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions, &mut self.display_sel),
             Page::Keys => general::page_keys(&mut ui, ctx, cx0, py - 26.0, cw),
             Page::Notifications => more::page_notifications(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions),
+            Page::Osd => more::page_osd(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions),
             Page::DateTime => more::page_datetime(&mut ui, ctx, cx0, py - 26.0, cw),
             Page::Sound => more::page_sound(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions),
             Page::Network => more::page_network(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions),
@@ -769,6 +804,15 @@ fn mini_preview(ui: &mut Ui, r: [f32; 4], preset: &str) {
                 ui.fill([x + w * 0.5 - 28.0 + i as f32 * 12.0, y + h - 8.0, 7.0, 6.0], 2.0, if i == 0 { [0.0, 0.47, 0.84] } else { [0.4, 0.45, 0.55] }, 0.9);
             }
         }
+        "plasma" => {
+            // a dark full-width panel: the menu button (lit), the desktops, tasks, the tray
+            ui.fill([x, y + h - 10.0, w, 10.0], 0.0, [0.12, 0.14, 0.16], 0.96);
+            ui.fill([x + 2.0, y + h - 9.0, 8.0, 8.0], 2.0, [0.24, 0.68, 0.91], 0.95);
+            for i in 0..4 {
+                ui.fill([x + 14.0 + i as f32 * 10.0, y + h - 8.0, 7.0, 6.0], 1.5, [0.8, 0.84, 0.9], if i == 1 { 0.9 } else { 0.5 });
+            }
+            ui.fill([x + w - 16.0, y + h - 8.0, 12.0, 6.0], 1.5, [0.8, 0.84, 0.9], 0.5);
+        }
         "unity" => {
             // the panel on top and the Launcher down the left side
             ui.fill([x, y, w, 7.0], 0.0, [0.17, 0.04, 0.12], 0.95);
@@ -863,6 +907,7 @@ fn page_glass(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, targe
         GlassMode::Flat => base + 190.0,
         GlassMode::Paper | GlassMode::Wood | GlassMode::Clay => base + 310.0,
         GlassMode::Glass => base + 230.0,
+        GlassMode::Liquid => base + 430.0,
         GlassMode::Custom => base + 620.0,
     };
     if *target >= 1 {
@@ -941,7 +986,7 @@ fn glass_preview(ui: &mut Ui, r: [f32; 4], g: &theme::GlassStyle, sp: &mut Vec<P
 fn glass_editor(ui: &mut Ui, g: &mut theme::GlassStyle, x: f32, y: f32, cw: f32) {
     let mut f = Form::new(x, y + 86.0, cw, 54.0);
     let mut mode = g.mode;
-    if f.pick(ui, "Mode", &mut mode, &[(GlassMode::Flat, "Flat"), (GlassMode::Glass, "Glass"), (GlassMode::Clay, "Clay"), (GlassMode::Paper, "Paper"), (GlassMode::Wood, "Wood"), (GlassMode::Custom, "Custom")]) {
+    if f.pick(ui, "Mode", &mut mode, &[(GlassMode::Flat, "Flat"), (GlassMode::Glass, "Glass"), (GlassMode::Liquid, "Liquid"), (GlassMode::Clay, "Clay"), (GlassMode::Paper, "Paper"), (GlassMode::Wood, "Wood"), (GlassMode::Custom, "Custom")]) {
         g.set_mode(mode);
     }
     match g.mode {
@@ -954,6 +999,14 @@ fn glass_editor(ui: &mut Ui, g: &mut theme::GlassStyle, x: f32, y: f32, cw: f32)
                 g.apply_mode();
             }
             ui.text(x, y + 190.0, "0 is flat, 1 is the full Jelly Glass look.", 12.5, false, ui.ink, 0.6, Align::Left);
+        }
+        GlassMode::Liquid => {
+            f.slider(ui, "Frost", &mut g.blur, 0.0, 20.0, "");
+            f.slider(ui, "Edge light", &mut g.rim, 0.0, 2.0, "");
+            f.slider(ui, "Lens width", &mut g.bezel, 6.0, 48.0, " px");
+            f.slider(ui, "Bending", &mut g.refraction, 0.0, 60.0, "");
+            f.slider(ui, "Tint strength", &mut g.tint[3], 0.0, 0.5, "");
+            ui.text(x, y + 410.0, "Clear glass lit from above: a thin bright rim and a lens only at the edge.", 12.5, false, ui.ink, 0.6, Align::Left);
         }
         GlassMode::Clay => {
             f.slider(ui, "Puffiness", &mut g.bezel, 6.0, 60.0, " px");
@@ -991,6 +1044,7 @@ fn glass_custom(ui: &mut Ui, g: &mut theme::GlassStyle, x: f32, y: f32, cw: f32)
     ui.section(x, f.y + 8.0, "TINT & SHADE");
     f.skip(26.0);
     f.slider(ui, "Tint strength", &mut g.tint[3], 0.0, 0.9, "");
+    f.toggle(ui, "Tint follows accent", &mut g.tint_accent);
     // (the three colour sliders are in their own colours when the accent is several)
     use chebrium::style::Tone;
     ui.tinted(Tone::Danger, |ui| f.slider(ui, "Tint red", &mut g.tint[0], 0.0, 1.0, ""));
@@ -1417,6 +1471,8 @@ fn page_layout(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
     let (dock, mb) = (&mut ctx.theme.dock, &mut ctx.theme.menubar);
     f.slider(ui, "Dock icon size", &mut dock.icon_size, 40.0, 88.0, " px");
     f.toggle(ui, "Magnify on hover", &mut dock.magnify);
+    // a soft, blurred copy of each icon inside the Dock's glass
+    f.slider(ui, "Bloom", &mut dock.bloom, 0.0, 1.0, "");
     f.pitch = 42.0;
     f.toggle(ui, "Menu bar", &mut mb.bar);
     f.pick(ui, "Bar style", &mut mb.kind, &[(MenubarKind::Glass, "Glass"), (MenubarKind::Solid, "Solid"), (MenubarKind::Fade, "Fade"), (MenubarKind::Clear, "None")]);
@@ -1477,8 +1533,14 @@ fn page_windows(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
     f.slider(ui, "Content opacity", &mut w.client_opacity, 0.3, 1.0, "");
     let mut sh = w.shadow[0];
     f.slider(ui, "Shadow strength", &mut sh, 0.0, 0.8, "");
-    w.shadow[0] = sh;
-    w.shadow_idle[0] = sh * 0.52;
+    // (only when moved: the theme's own unfocused and tight shadows stay as they are until then)
+    if sh != w.shadow[0] {
+        w.shadow[0] = sh;
+        w.shadow_idle[0] = sh * 0.52;
+        w.shadow_near[0] = sh * 0.53;
+        w.shadow_near_idle[0] = sh * 0.33;
+    }
+    f.slider(ui, "Outline", &mut w.outline, 0.0, 0.4, "");
     f.skip(if custom { 4.0 } else { 24.0 });
     f.note(ui, "Windows already open keep their frame until the next theme change.", true);
 }
@@ -1516,10 +1578,11 @@ fn page_keywords(page: Page) -> &'static str {
         Page::Windows => "title bar buttons frame border corner radius shadow opacity traffic lights decoration custom",
         Page::Animations => "motion speed jelly genie minimize open close effects sounds volume transition",
         Page::Keys => "keyboard shortcut keys layout run program",
-        Page::Mouse => "cursor pointer speed acceleration scroll natural tap touchpad left-handed size",
+        Page::Mouse => "cursor pointer speed acceleration scroll natural tap touchpad left-handed size launch icon bounce starting program hide typing",
         Page::Icons => "icon shape plate tile padding theme",
         Page::About => "version info credits",
         Page::Notifications => "notification toast do not disturb dnd corner position time",
+        Page::Osd => "osd on-screen indicator volume brightness keys bar pill popup hud media",
         Page::DateTime => "clock time date 24 hour seconds calendar week monday sunday format",
         Page::Sound => "volume mute speaker output sound effects audio",
         Page::Network => "wifi wi-fi wireless bluetooth internet connection",
