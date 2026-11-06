@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::theme::{ControlLook, ScrollClick, ScrollShow, SidebarSize};
+use chebrium::ui::Cursor;
 
 fn group(ui: &mut Ui, r: [f32; 4]) {
     ui.fill(r, 12.0, ui.ink, 0.05);
@@ -271,7 +272,7 @@ fn labels_block(ui: &mut Ui, style: &mut crate::keys::KeyStyle, x: f32, y: f32, 
     ui.row(x + 16.0, gy + 31.0, "Super key is shown as");
     let labels: Vec<&str> = SUPER_LABELS.iter().map(|s| s.1).collect();
     let mut sel = SUPER_LABELS.iter().position(|(l, _)| *l == style.super_label).unwrap_or(0);
-    if ui.segmented([rx - 300.0, gy + 12.0, 300.0, 28.0], &labels, &mut sel) {
+    if ui.segmented([rx - 340.0, gy + 12.0, 340.0, 28.0], &labels, &mut sel) {
         style.super_label = SUPER_LABELS[sel].0;
     }
     let mut cy = gy + 52.0;
@@ -458,6 +459,36 @@ fn cursor_preview(ui: &mut Ui, r: [f32; 4], shape: crate::cursor::Shape, prefs: 
     }
 }
 
+/// One row of choices shown as the cursors they give: a tile per choice with the cursor drawn that way and its name under
+/// it; the chosen one ringed in the accent. Tiles have one width on every row, from the same left edge as the controls.
+#[allow(clippy::too_many_arguments)]
+fn shape_tiles<T: Copy + PartialEq>(ui: &mut Ui, x0: f32, y: f32, label: &str, v: &mut T, opts: &[(T, &str)], shape: crate::cursor::Shape, base: &crate::cursor::CursorPrefs, set: fn(&mut crate::cursor::CursorPrefs, T), cell: &dyn Fn(&str) -> Option<u32>, want: &mut Vec<String>) {
+    ui.row(x0, y + 37.0, label);
+    let (tw, th, gap) = (104.0, 62.0, 10.0);
+    for (k, (val, name)) in opts.iter().enumerate() {
+        let r = [x0 + 150.0 + k as f32 * (tw + gap), y + 6.0, tw, th];
+        let hov = ui.hit(r);
+        let sel = *v == *val;
+        if sel {
+            ui.fill([r[0] - 2.0, r[1] - 2.0, r[2] + 4.0, r[3] + 4.0], 13.0, ui.accent, 0.9);
+            ui.fill(r, 11.0, if ui.dark { [0.149, 0.149, 0.149] } else { [0.96, 0.97, 1.0] }, 1.0);
+        }
+        ui.fill(r, 11.0, ui.ink, if hov { 0.10 } else { 0.05 });
+        // the cursor as this choice draws it (the current look with only this choice changed)
+        let mut p = base.clone();
+        set(&mut p, *val);
+        cursor_preview(ui, [r[0] + r[2] / 2.0 - 16.0, r[1] + 6.0, 32.0, 32.0], shape, &p, cell, want);
+        ui.text(r[0] + r[2] / 2.0, r[1] + r[3] - 8.0, name, 11.5, sel, ui.ink, if sel { 0.95 } else { 0.7 }, Align::Center);
+        if hov {
+            ui.want_cursor(Cursor::Pointer);
+            if ui.click && !sel {
+                *v = *val;
+                ui.changed = true;
+            }
+        }
+    }
+}
+
 pub(super) fn page_mouse(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
     use crate::cursor::{CursorLook, LaunchAnim, Shape, ARROWS, BEAMS, BUSY_STYLES, EDGES, HANDS, LAUNCH_ANIMS, LOOKS, RESIZES};
     use crate::input::Accel;
@@ -494,8 +525,8 @@ pub(super) fn page_mouse(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw:
     }
     f.slider(ui, "Size", &mut c.size, 16.0, 64.0, " px");
     c.size = c.size.round();
-    f.toggle(ui, "Change the cursor over edges, buttons and while a program starts", &mut c.dynamic);
-    f.toggle(ui, "Shake the mouse to make the cursor bigger for a moment", &mut c.shake_to_find);
+    f.toggle(ui, "Change the cursor by what it points at", &mut c.dynamic);
+    f.toggle(ui, "Shake to find the cursor", &mut c.shake_to_find);
     f.toggle(ui, "Hide the cursor while typing", &mut c.hide_typing);
     let drawn = c.theme.is_empty() || missing;
     if !c.theme.is_empty() {
@@ -504,20 +535,68 @@ pub(super) fn page_mouse(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw:
         next += 14.0;
     }
 
+    // ---- a large cursor, and a place to try the shapes with the real pointer
+    let ph = 196.0;
+    ui.section(x, next, "PREVIEW");
+    let top = next + 12.0;
+    group(ui, [x, top, cw, ph]);
+    let hero = [x + 16.0, top + 16.0, 200.0, 120.0];
+    // a scrap of the accent colour for the cursor to stand on, as it will on a wallpaper
+    ui.grad(hero, 12.0, ui.accent, [ui.accent[0] * 0.55, ui.accent[1] * 0.55, ui.accent[2] * 0.7], 0.55);
+    if drawn {
+        cursor_preview(ui, [hero[0] + hero[2] / 2.0 - 32.0, hero[1] + hero[3] / 2.0 - 32.0, 64.0, 64.0], Shape::Default, c, ctx.app_icon, ctx.want_icons);
+    } else {
+        ui.text(hero[0] + hero[2] / 2.0, hero[1] + hero[3] / 2.0 + 4.0, "The theme's own cursor", 12.0, false, [1.0; 3], 0.9, Align::Center);
+    }
+    // try it here: the pointer itself changes over each of these
+    let tx0 = hero[0] + hero[2] + 14.0;
+    let tw = (x + cw - 16.0 - tx0 - 2.0 * 10.0) / 3.0;
+    let tries: [(&str, &str, Cursor); 3] = [("A link", "Hover the link", Cursor::Pointer), ("Text", "Hover the lines", Cursor::Text), ("Window edge", "Hover here", Cursor::ResizeNwse)];
+    for (k, (title, hint, cur)) in tries.iter().enumerate() {
+        let r = [tx0 + k as f32 * (tw + 10.0), hero[1], tw, hero[3]];
+        let hov = ui.hit(r);
+        ui.fill(r, 12.0, ui.ink, if hov { 0.10 } else { 0.06 });
+        ui.text(r[0] + 12.0, r[1] + 22.0, title, 12.5, true, ui.ink, 0.9, Align::Left);
+        ui.text(r[0] + 12.0, r[1] + r[3] - 12.0, hint, 10.5, false, ui.ink, 0.5, Align::Left);
+        match k {
+            0 => {
+                ui.text(r[0] + 12.0, r[1] + 58.0, "memrium.desktop", 13.0, false, ui.accent, 1.0, Align::Left);
+                let lw = ui.measure("memrium.desktop", 13.0, false);
+                ui.fill([r[0] + 12.0, r[1] + 61.0, lw, 1.0], 0.0, ui.accent, 0.9);
+            }
+            1 => {
+                for (i, wd) in [0.82f32, 0.64, 0.74].iter().enumerate() {
+                    ui.fill([r[0] + 12.0, r[1] + 44.0 + i as f32 * 12.0, (r[2] - 24.0) * wd, 5.0], 2.5, ui.ink, 0.22);
+                }
+            }
+            _ => {
+                // the corner of a small window
+                let wr = [r[0] + r[2] - 74.0, r[1] + 34.0, 56.0, 42.0];
+                ui.fill(wr, 8.0, ui.ink, 0.14);
+                ui.fill([wr[0] + wr[2] - 10.0, wr[1] + wr[3] - 10.0, 6.0, 6.0], 3.0, ui.accent, 0.9);
+            }
+        }
+        if hov {
+            ui.want_cursor(*cur);
+        }
+    }
+    // every drawn shape, small, with the choices below
+    if drawn {
+        let shapes = crate::cursor::PREVIEW_SHAPES;
+        let room = cw - 32.0;
+        let pitch = (room / shapes.len() as f32).min(48.0);
+        let sx = x + 16.0 + (room - pitch * shapes.len() as f32) / 2.0;
+        for (i, sh) in shapes.iter().enumerate() {
+            cursor_preview(ui, [sx + pitch * i as f32 + (pitch - 32.0) / 2.0, top + ph - 48.0, 32.0, 32.0], *sh, c, ctx.app_icon, ctx.want_icons);
+        }
+    }
+    next = top + ph + 34.0;
+
     // ---- the look of the drawn cursor
     if drawn {
         let custom = c.look == CursorLook::Custom;
-        let (mut f, n) = card(ui, next, "LOOK", if custom { 12 } else { 9 });
+        let (mut f, n) = card(ui, next, "LOOK", if custom { 7 } else { 4 });
         next = n;
-        // every drawn shape with the choices below, so a change is seen at once
-        ui.row(f.x, f.y, "Preview");
-        let shapes = crate::cursor::PREVIEW_SHAPES;
-        let room = f.cw - 150.0;
-        let pitch = (room / shapes.len() as f32).min(40.0);
-        for (i, s) in shapes.iter().enumerate() {
-            cursor_preview(ui, [f.x + f.cw - pitch * (shapes.len() - i) as f32 + (pitch - 32.0) / 2.0, f.y - 16.0, 32.0, 32.0], *s, c, ctx.app_icon, ctx.want_icons);
-        }
-        f.skip(f.pitch);
         f.pick(ui, "Colour", &mut c.look, &LOOKS);
         if custom {
             let mut hue = c.hue / 360.0;
@@ -527,25 +606,35 @@ pub(super) fn page_mouse(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw:
             colour_row(ui, &mut f, "Saturation", &mut c.sat, &|t| theme::hsv_to_rgb(h, t, v.max(0.5)));
             colour_row(ui, &mut f, "Brightness", &mut c.bright, &|t| theme::hsv_to_rgb(h, s, t));
         }
-        f.slider(ui, "Outline", &mut c.outline, 0.0, 3.0, "");
+        f.slider_text(ui, "Outline", &mut c.outline, 0.0, 3.0, &|v| if v < 0.05 { "None".into() } else { format!("{v:.1} px") });
         c.outline = (c.outline * 10.0).round() / 10.0;
         f.pick(ui, "Outline colour", &mut c.edge, &EDGES);
         let mut shadow = (c.shadow * 100.0).round();
-        f.slider(ui, "Shadow", &mut shadow, 0.0, 100.0, "%");
+        f.slider_text(ui, "Shadow", &mut shadow, 0.0, 100.0, &|v| if v < 0.5 { "Off".into() } else { format!("{v:.0}%") });
         c.shadow = shadow.round() / 100.0;
-        // each shape's own choice, with that shape drawn beside it
-        let beside = |ui: &mut Ui, f: &Form, n: usize, shape: Shape, c: &crate::cursor::CursorPrefs, want: &mut Vec<String>| {
-            let w = (f.cw - 150.0).min(120.0 * n as f32);
-            cursor_preview(ui, [f.x + f.cw - w - 44.0, f.y - 16.0, 32.0, 32.0], shape, c, ctx.app_icon, want);
-        };
-        beside(ui, &f, ARROWS.len(), Shape::Default, c, ctx.want_icons);
-        f.pick(ui, "Arrow", &mut c.arrow, &ARROWS);
-        beside(ui, &f, HANDS.len(), Shape::Pointer, c, ctx.want_icons);
-        f.pick(ui, "Over links", &mut c.hand, &HANDS);
-        beside(ui, &f, BEAMS.len(), Shape::Text, c, ctx.want_icons);
-        f.pick(ui, "Over text", &mut c.beam, &BEAMS);
-        beside(ui, &f, RESIZES.len(), Shape::ResizeNwse, c, ctx.want_icons);
-        f.pick(ui, "Over edges", &mut c.resize, &RESIZES);
+
+        // ---- each shape's own choice: the choices are the cursors themselves
+        ui.section(x, next, "SHAPES");
+        let rows = 4.0;
+        let row_h = 74.0;
+        let top = next + 12.0;
+        group(ui, [x, top, cw, rows * row_h + 8.0]);
+        for i in 1..4 {
+            separator(ui, x, top + 4.0 + i as f32 * row_h, cw);
+        }
+        let mut yy = top + 4.0;
+        let base = c.clone();
+        shape_tiles(ui, x + 16.0, yy, "Arrow", &mut c.arrow, &ARROWS, Shape::Default, &base, |p, v| p.arrow = v, ctx.app_icon, ctx.want_icons);
+        yy += row_h;
+        let base = c.clone();
+        shape_tiles(ui, x + 16.0, yy, "Over links", &mut c.hand, &HANDS, Shape::Pointer, &base, |p, v| p.hand = v, ctx.app_icon, ctx.want_icons);
+        yy += row_h;
+        let base = c.clone();
+        shape_tiles(ui, x + 16.0, yy, "Over text", &mut c.beam, &BEAMS, Shape::Text, &base, |p, v| p.beam = v, ctx.app_icon, ctx.want_icons);
+        yy += row_h;
+        let base = c.clone();
+        shape_tiles(ui, x + 16.0, yy, "Over edges", &mut c.resize, &RESIZES, Shape::ResizeNwse, &base, |p, v| p.resize = v, ctx.app_icon, ctx.want_icons);
+        next = top + rows * row_h + 8.0 + 34.0;
     }
 
     // ---- the busy cursor
@@ -734,10 +823,17 @@ pub(super) fn page_displays(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, 
     f.skip(26.0);
     f.pick(ui, "Other displays are", &mut prefs.side, &[(Side::Left, "Left"), (Side::Right, "Right")]);
     let mut scale = prefs.scale;
-    f.pick(ui, "Interface size", &mut scale, &[(0.0, "Auto"), (1.0, "100%"), (1.25, "125%"), (1.5, "150%"), (2.0, "200%")]);
+    f.pick(ui, "Interface size", &mut scale, &[(0.0, "Auto"), (0.75, "75%"), (1.0, "100%"), (1.25, "125%"), (1.5, "150%"), (2.0, "200%")]);
     if scale != prefs.scale {
         prefs.scale = scale;
     }
+    let mut ss = prefs.supersample;
+    f.pick(ui, "Scaled rendering", &mut ss, &[(1.0, "Off"), (1.5, "1.5×"), (2.0, "2×")]);
+    if ss != prefs.supersample {
+        prefs.supersample = ss;
+    }
+    f.note(ui, "Draws in a higher resolution and shrinks it to the screen: smoother lines and text, sharper programs.", true);
+    f.note(ui, "With a smaller interface size it fits more on the screen than it has pixels. Heavier on the graphics card.", true);
     f.skip(8.0);
     if ui.button([x + cw - 140.0, f.y - 14.0, 140.0, 32.0], "Apply", true) {
         actions.push(SettingsAction::ApplyDisplays);

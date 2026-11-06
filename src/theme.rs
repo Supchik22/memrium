@@ -221,7 +221,7 @@ impl GlassStyle {
     /// Liquid glass: clear and neutral, frosted a little, bending the scene only in a thin band at the edge, with a
     /// crisp specular rim from above (the shader's own lighting for this mode) and no gloss or colour split to speak of.
     pub fn liquid(dark: bool) -> GlassStyle {
-        GlassStyle { blur: 5.0, refraction: 26.0, bezel: 24.0, dispersion: 0.012, rim: 0.85, rim_sharp: 1.0, gloss: 0.0, saturation: 1.22, adapt: 0.22, tint: Self::liquid_tint(dark), tint_accent: false, border: [0.0; 4], shadow: [0.16, 26.0, 9.0], ..GlassStyle::default() }
+        GlassStyle { blur: 5.0, refraction: 26.0, bezel: 24.0, dispersion: 0.04, rim: 0.85, rim_sharp: 1.0, gloss: 0.0, saturation: 1.22, adapt: 0.22, tint: Self::liquid_tint(dark), tint_accent: false, border: [0.0; 4], shadow: [0.16, 26.0, 9.0], ..GlassStyle::default() }
     }
 
     /// A breath of white by day, smoky grey by night.
@@ -311,9 +311,10 @@ impl GlassStyle {
             // Liquid Glass bends the scene only in a narrow band at the rim. A band as wide as half the panel, with a
             // bend longer than the panel is tall, fills a dock with a mirrored, squeezed copy of the backdrop from
             // beyond its far side: a thick ring of foreign colour instead of clear glass. So the band is at most a
-            // quarter of the short side and the bend at most three quarters of it (the rim looks no further in than the band).
-            p.params[2] = p.params[2].min(w.min(h) * 0.25);
-            p.params[3] = p.params[3].min(p.params[2] * 0.75);
+            // 40 % of the short side and the bend at most as long as the band (the rim looks no further in than the band).
+            // (A quarter and three quarters of it left a small pill with a bend of a few pixels, hardly to be seen.)
+            p.params[2] = p.params[2].min(w.min(h) * 0.45);
+            p.params[3] = p.params[3].min((p.params[2] * 1.15).min(w.min(h) * 0.45));
         }
         p.tint = self.tint;
         p.fx = [self.blur, self.dispersion, self.rim, self.gloss];
@@ -1288,8 +1289,8 @@ pub fn appearance_text(theme: &Theme, language: &str) -> String {
     };
     let g = &theme.glass;
     format!(
-        "# written by the shell: the look the programs follow\ndark = {}\naccent = [{:.4}, {:.4}, {:.4}]\nradius = {:.1}\ntitlebar = {:.1}\ndecoration = \"{deco}\"\nopacity = {:.3}\nlanguage = \"{}\"\nglass_tint = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_border = [{:.4}, {:.4}, {:.4}, {:.4}]\ncontrols = \"{}\"\ncontrols_depth = {:.3}\ncontrols_round = {:.3}\ncontrols_accent = {}\ncontrols_multi = {}\ncontrols_thickness = {:.3}\nmenubar = {}\npopup_opacity = {:.3}\nslide = {}\n",
-        theme.dark, theme.accent[0], theme.accent[1], theme.accent[2], theme.window.radius, theme.window.titlebar, theme.window.client_opacity, language, g.tint[0], g.tint[1], g.tint[2], g.tint[3], g.border[0], g.border[1], g.border[2], g.border[3], if theme.ui.controls.look == ControlLook::Flat { "flat" } else { "keys" }, theme.ui.controls.depth, theme.ui.controls.round, theme.ui.controls.accent_pick, theme.ui.controls.multi, theme.ui.controls.thickness, theme.bars.iter().any(|b| b.left.iter().chain(&b.center).chain(&b.right).any(|w| w.kind == "app-menu")), theme.ui.popup_opacity, theme.ui.slide
+        "# written by the shell: the look the programs follow\ndark = {}\naccent = [{:.4}, {:.4}, {:.4}]\nradius = {:.1}\ntitlebar = {:.1}\ndecoration = \"{deco}\"\nopacity = {:.3}\nlanguage = \"{}\"\nglass_tint = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_border = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_look = [{:.3}, {:.3}, {:.3}, {:.4}, {:.3}, {:.3}, {:.3}]\ncontrols = \"{}\"\ncontrols_depth = {:.3}\ncontrols_round = {:.3}\ncontrols_accent = {}\ncontrols_multi = {}\ncontrols_thickness = {:.3}\nmenubar = {}\npopup_opacity = {:.3}\nslide = {}\n",
+        theme.dark, theme.accent[0], theme.accent[1], theme.accent[2], theme.window.radius, theme.window.titlebar, theme.window.client_opacity, language, g.tint[0], g.tint[1], g.tint[2], g.tint[3], g.border[0], g.border[1], g.border[2], g.border[3], g.blur, g.refraction, g.bezel, g.dispersion, g.rim, g.rim_sharp, g.saturation, if theme.ui.controls.look == ControlLook::Flat { "flat" } else { "keys" }, theme.ui.controls.depth, theme.ui.controls.round, theme.ui.controls.accent_pick, theme.ui.controls.multi, theme.ui.controls.thickness, theme.bars.iter().any(|b| b.left.iter().chain(&b.center).chain(&b.right).any(|w| w.kind == "app-menu")), theme.ui.popup_opacity, theme.ui.slide
     )
 }
 
@@ -1327,8 +1328,6 @@ pub struct Config {
     pub overrides: toml::Table,
     /// favourite apps in the Dock/taskbar (desktop ids); empty = automatic
     pub pinned: Vec<String>,
-    /// file manager preferences
-    pub files: crate::files::FilesPrefs,
     /// icons on the desktop
     pub desktop: crate::desktop::DesktopPrefs,
     /// pointer, scrolling, keyboard repeat
@@ -1353,11 +1352,13 @@ pub struct Config {
     pub notifications: NotifyPrefs,
     /// the indicator of volume / brightness / media keys
     pub osd: OsdPrefs,
+    /// the camera and what it may be used for (Settings -> Privacy)
+    pub privacy: crate::privacy::PrivacyPrefs,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { theme: "macos".into(), overrides: toml::Table::new(), pinned: Vec::new(), files: Default::default(), desktop: Default::default(), input: Default::default(), screenshots: Default::default(), power: Default::default(), keys: Default::default(), weather_city: String::new(), display: Default::default(), desk_widgets: Vec::new(), language: "auto".into(), cc_tiles: Vec::new(), notifications: NotifyPrefs::default(), osd: OsdPrefs::default() }
+        Config { theme: "macos".into(), overrides: toml::Table::new(), pinned: Vec::new(), desktop: Default::default(), input: Default::default(), screenshots: Default::default(), power: Default::default(), keys: Default::default(), weather_city: String::new(), display: Default::default(), desk_widgets: Vec::new(), language: "auto".into(), cc_tiles: Vec::new(), notifications: NotifyPrefs::default(), osd: OsdPrefs::default(), privacy: Default::default() }
     }
 }
 
@@ -1500,10 +1501,13 @@ impl Config {
 
     pub fn load() -> Config {
         let mut cfg = match std::fs::read_to_string(Self::path()) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-                eprintln!("config: {e}; using defaults");
-                Config::default()
-            }),
+            Ok(text) => {
+                Self::move_files_prefs(&text);
+                toml::from_str(&text).unwrap_or_else(|e| {
+                    eprintln!("config: {e}; using defaults");
+                    Config::default()
+                })
+            }
             Err(_) => Config::default(),
         };
         // handy for trying a template without touching the saved config
@@ -1511,6 +1515,19 @@ impl Config {
             cfg.select(&t);
         }
         cfg
+    }
+
+    /// The file manager's preferences were kept here (`[files]`) while it was a window of the shell; it is a program of
+    /// its own now and keeps them in files.toml. The first time, they move there.
+    fn move_files_prefs(text: &str) {
+        let path = crate::files::FilesPrefs::path();
+        if path.exists() {
+            return;
+        }
+        let Some(files) = text.parse::<toml::Table>().ok().and_then(|t| t.get("files").cloned()) else { return };
+        if let Ok(prefs) = files.try_into::<crate::files::FilesPrefs>() {
+            prefs.save();
+        }
     }
 
     pub fn save(&self) {

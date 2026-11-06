@@ -165,7 +165,7 @@ pub struct Freeze {
 impl State {
     /// Open the area picker on a frozen picture of the screen, so what moves underneath does not change while picking.
     pub fn begin_shot_sel(&mut self, start: Option<[f32; 2]>, record: bool) {
-        let (w, h, rgba) = self.capture_rgba(None);
+        let (w, h, rgba) = self.capture_rgba_hi(None, true);
         self.shot_freeze = RgbaImage::from_raw(w, h, rgba).map(|img| {
             let tex = self.renderer.create_surface_tex(w, h, true);
             let stride = w as usize * 4;
@@ -181,8 +181,8 @@ impl State {
 
     /// `logical` cut out of the frozen picture (device px, RGBA).
     fn crop_freeze(&self, f: &Freeze, logical: [f32; 4]) -> (u32, u32, Vec<u8>) {
-        let full = self.crop_px(None);
-        let [x0, y0, x1, y1] = self.crop_px(Some(logical));
+        let full = self.crop_px_hi(None, true);
+        let [x0, y0, x1, y1] = self.crop_px_hi(Some(logical), true);
         let (fw, fh) = f.img.dimensions();
         let x = x0.saturating_sub(full[0]).min(fw.saturating_sub(1));
         let y = y0.saturating_sub(full[1]).min(fh.saturating_sub(1));
@@ -203,7 +203,7 @@ impl State {
         let (w, h, rgba) = match self.shot_freeze.take() {
             // cut out of the picture the picker showed, so the area is what the user saw when picking it
             Some(f) => self.crop_freeze(&f, r),
-            None => self.capture_rgba(Some(r)),
+            None => self.capture_rgba_hi(Some(r), true),
         };
         let Some(base) = RgbaImage::from_raw(w, h, rgba) else { return };
         let tex = self.renderer.create_surface_tex(w, h, true);
@@ -518,9 +518,9 @@ impl State {
         }
         self.capture_alone = true;
         self.renderer.solid_bg = Some([0.0; 3]);
-        let on_black = self.capture_rgba(Some(region));
+        let on_black = self.capture_rgba_hi(Some(region), true);
         self.renderer.solid_bg = Some([1.0; 3]);
-        let on_white = self.capture_rgba(Some(region));
+        let on_white = self.capture_rgba_hi(Some(region), true);
         self.renderer.solid_bg = None;
         self.capture_alone = false;
         // everything back as it was

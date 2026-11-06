@@ -4,7 +4,7 @@
 use crate::role::Role;
 use memrium_de::apps::{self, AppEntry, IconIndex, IconSlot};
 use memrium_de::decor::{self, Btn};
-use memrium_de::files::{self, Files, FilesCtx, FilesEvent, Key, KeyMods};
+use memrium_de::files::{self, FilesEvent, Key, KeyMods};
 use memrium_de::fsops::{self, Fm};
 use memrium_de::menu::{Menu, MenuClick, MenuItem, NavKey};
 use memrium_de::theme::{Config, DecoKind, Theme};
@@ -351,7 +351,6 @@ enum SnapOp {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sw {
     Settings,
-    Files,
 }
 
 /// A closed window fading out: its last pixels and chrome, kept for a moment.
@@ -397,7 +396,6 @@ impl ShellWin {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuFor {
     Desktop,
-    Files,
     DesktopIcons,
     /// a widget on the bar (see `State::bar_click`)
     Bar(BarHit),
@@ -559,14 +557,12 @@ pub struct State {
     // ---- settings window
     pub settings: Settings,
     pub swin: ShellWin,
-    pub fwin: ShellWin,
     /// shell windows, back to front
     pub z: Vec<Sw>,
     /// the clock of `stamp`s: shell windows and client windows are stacked by when they were last raised
     pub stack_clock: u64,
     /// the shell window that held the focus when the keyboard was last handed over (`update` follows `focused_shell`)
     pub shell_focus_seen: Option<Sw>,
-    pub files: Files,
     pub fm: Fm,
     pub menu: Menu,
     pub menu_for: MenuFor,
@@ -608,7 +604,8 @@ pub struct State {
     pub icon_failed: HashSet<String>,
     /// the cursor previews of the Mouse settings page in the icon atlas, and the look (accent and preferences) they show
     pub cursor_previews: Vec<String>,
-    pub cursor_preview_look: String,
+    /// the looks whose previews are kept, newest last (the page shows the current look and a few variants of it at once)
+    pub cursor_preview_looks: Vec<String>,
     /// set by the thread that rebuilt the icon indexes for a new icon theme: the loaded icons are dropped on the next frame
     pub icons_rebuilt: Arc<std::sync::atomic::AtomicBool>,
     /// when the icon theme the editor writes was last looked at, and the time its marker file had then
@@ -660,6 +657,10 @@ pub struct State {
     pub damage: crate::damage::DamageTracker,
     pub ghosts: Vec<Ghost>,
     pub shot_sel: Option<ShotSel>,
+    /// the screen frozen for its text to be read and selected (the Copilot key)
+    pub live_shot: Option<crate::livetext::LiveShot>,
+    /// dictation into the focused field (Super+H)
+    pub voice: Option<crate::voice::Dictation>,
     /// the screen as it was when the area picker opened: shown instead of the live desktop while the area is picked
     pub shot_freeze: Option<crate::shot_edit::Freeze>,
     pub shot_req: Option<ShotReq>,
@@ -737,6 +738,8 @@ pub struct State {
     pub clipboard: crate::clipboard::Clipboard,
     /// the volume / brightness slider that a tray icon opens
     pub flyout: Option<crate::flyout::Flyout>,
+    /// hand gestures: the camera service and the reactions it brings (Settings -> Privacy)
+    pub gestures: crate::gestures::Gestures,
     /// the power card of the battery icon, and whether sleep and screen locking were blocked by hand
     pub card: Option<crate::popup::Popup>,
     /// MEMRIUM_DEBUG_POINTER: how many raw motions were sent to clients
@@ -2026,6 +2029,10 @@ impl State {
         if self.shot_sel.is_some() {
             return;
         }
+        if self.live_shot.is_some() {
+            self.live_text_motion();
+            return;
+        }
         if self.shot_edit.is_some() {
             self.shot_edit_motion();
             return;
@@ -2037,7 +2044,6 @@ impl State {
         self.scene.set_mouse(x, y);
         self.launcher.set_mouse([x, y]);
         self.settings.set_mouse([x, y]);
-        self.files.set_mouse([x, y]);
         self.desktop.set_mouse([x, y]);
         self.menu.set_mouse([x, y]);
         let mut dragging_files = false;
@@ -2053,7 +2059,6 @@ impl State {
             Some(d) if dragging_files && !self.key_mods().ctrl && self.shell_covers([x, y]).is_none() && target.as_deref() == Some(self.desktop.dir()) && self.desktop.owns(&d.paths) => Some((d.paths.clone(), d.start, [x, y])),
             _ => None,
         };
-        self.files.drop_hover = target.clone();
         self.desktop.drop_hover = target;
         let hover = self.bar_hit([x, y]);
         self.bar_hover = hover;
@@ -2065,7 +2070,7 @@ impl State {
         }
         self.title_menu_hover([x, y]);
         let covering = self.shell_covers([x, y]);
-        for k in [Sw::Settings, Sw::Files] {
+        for k in [Sw::Settings] {
             let hover = if covering == Some(k) { decor::buttons(&self.sw_theme(k), self.sw_frame(k)).into_iter().find(|(_, r)| Self::in_rect([x, y], *r)).map(|(b, _)| b) } else { None };
             self.shell_win_mut(k).hover = hover;
         }
@@ -2249,6 +2254,10 @@ impl State {
             self.shot_edit_button(button, pressed);
             return;
         }
+        if self.live_shot.is_some() {
+            self.live_text_button(button == BTN_LEFT, pressed);
+            return;
+        }
         if let Some(sel) = &mut self.shot_sel {
             if button == BTN_LEFT {
                 if pressed {
@@ -2269,7 +2278,7 @@ impl State {
         }
         let time = self.time_ms();
         if !pressed && button == BTN_LEFT && self.launcher_modal() {
-            match self.launcher.release(self.mouse, &self.apps, self.shell_covers(self.mouse) == Some(Sw::Files)) {
+            match self.launcher.release(self.mouse, &self.apps, false) {
                 LauncherClick::App(i) => {
                     let app = self.apps[i].clone();
                     self.launch_app(&app);
@@ -2277,18 +2286,15 @@ impl State {
                 }
                 LauncherClick::Shortcut(i) => {
                     let app = self.apps[i].clone();
-                    // a file manager window under the pointer takes it (in the folder under the pointer, else the one it
-                    // shows); anywhere else it goes onto the desktop
-                    let in_files = self.shell_covers(self.mouse) == Some(Sw::Files);
-                    let dir = if in_files { self.files.drop_target(self.mouse).filter(|d| d.is_dir() && !d.starts_with(fsops::trash_path())) } else { Some(self.desktop.dir().to_path_buf()) };
+                    // a launcher dragged out of the launcher goes onto the desktop (the file manager is a program of its
+                    // own: it takes the drag as any program does)
+                    let dir = Some(self.desktop.dir().to_path_buf());
                     match dir.map(|d| memrium_de::apps::write_shortcut(&app, &d)) {
                         Some(Ok(path)) => {
                             // the views read the folder again; on the desktop it starts out selected
                             self.fm.gen += 1;
-                            if !in_files {
-                                self.desktop.reload();
-                                self.desktop.select_only(path);
-                            }
+                            self.desktop.reload();
+                            self.desktop.select_only(path);
                             self.launcher.close();
                         }
                         Some(Err(e)) => eprintln!("no launcher for {}: {e}", app.name),
@@ -2502,7 +2508,6 @@ impl State {
                     }
                 }
                 self.desk_widget_release();
-                self.files.mouse_up();
                 self.desktop.mouse_up();
                 self.settings.mouse_up();
                 self.scene.mouse_up();
@@ -2531,10 +2536,6 @@ impl State {
         match self.shell_covers(self.mouse) {
             Some(Sw::Settings) => {
                 self.settings.scroll(dy);
-                return;
-            }
-            Some(Sw::Files) => {
-                self.files.scroll(dy);
                 return;
             }
             None => {}
@@ -2654,6 +2655,19 @@ impl State {
             }
             return self.intercepted.remove(&evdev);
         }
+        // the Copilot key (KEY_F23, sent with Super+Shift): whatever symbol the keymap gives it, it is Live Text while
+        // that shortcut is the default one
+        if evdev == 193 && self.config.keys.chord("live-text") == "Super+Shift+F23" {
+            eprintln!("key: Copilot key (F23) {:?}, mods super {} shift {}", sym.name(), mods.logo, mods.shift);
+            if self.live_shot.is_some() {
+                self.live_shot = None;
+                self.invalidate();
+            } else {
+                self.begin_live_text();
+            }
+            self.intercepted.insert(evdev);
+            return true;
+        }
         let had_hold = self.shot_hold.is_some();
         let consumed = self.shortcut(mods, sym);
         if consumed {
@@ -2689,7 +2703,10 @@ impl State {
         }
         let key = match sym.key_char() {
             Some(c) if c.is_alphanumeric() => c.to_lowercase().to_string(),
-            _ => sym.name().map(|n| n.trim_start_matches("XK_").trim_start_matches("KEY_").to_lowercase()).unwrap_or_default(),
+            // the Copilot key sends Super+Shift+F23, but xkeyboard-config (2.4x) names that key `XF86TouchpadOff`, and
+            // `XF86Assistant` while Super+Shift are held; a shortcut written with F23 still means it
+            _ if sym == Keysym::XF86_Assistant || (sym == Keysym::XF86_TouchpadOff && mods.logo && mods.shift) => "f23".into(),
+            _ => sym.name().map(|n| n.trim_start_matches("XF86XK_").trim_start_matches("XK_").trim_start_matches("KEY_").to_lowercase()).unwrap_or_default(),
         };
         out.push_str(&key);
         out
@@ -2709,9 +2726,12 @@ impl State {
                 self.fps_text = "…".into();
                 self.invalidate();
             }
+            "gestures" => self.toggle_gestures(),
+            "live-text" => self.begin_live_text(),
+            "dictate" => self.toggle_dictation(),
             "settings" => self.toggle_settings(),
             "wallpaper" => self.bar_action("wallpaper"),
-            "files" => self.open_shell(Sw::Files),
+            "files" => self.open_files(None),
             "terminal" => self.bar_command(B_TERMINAL),
             "close-window" | "close-window-2" => {
                 if let Some(i) = top {
@@ -2770,6 +2790,22 @@ impl State {
         }
         let chord = Self::chord_of(mods, sym);
         let bound = self.config.keys.action_for(&chord);
+        if std::env::var_os("MEMRIUM_KEY_LOG").is_some() {
+            eprintln!("key: {:?} (0x{:x}) chord {chord:?} -> {bound:?}", sym.name(), sym.raw());
+        }
+        // the frozen screen of Live Text takes every key; its own key closes it again
+        if self.live_shot.is_some() {
+            if bound == Some("live-text") {
+                self.live_shot = None;
+                self.invalidate();
+                return true;
+            }
+            return self.live_text_key(ctrl, sym);
+        }
+        // Esc while dictating throws the recording away (every other key goes on to the program)
+        if sym == Keysym::Escape && self.voice.is_some() && self.cancel_dictation() {
+            return true;
+        }
         // Shift with the window-switching key goes the other way (the keyboard sends it as its own symbol)
         if alt && !ctrl && !logo && (sym == Keysym::ISO_Left_Tab || (mods.shift && sym == Keysym::Tab)) && self.config.keys.action_for("alt+tab") == Some("switch-window") {
             self.cycle_windows(true);
@@ -2866,16 +2902,6 @@ impl State {
                 }
             }
         }
-        if self.focused_shell() == Some(Sw::Files) && !logo && !global && !(alt && matches!(sym, Keysym::Tab | Keysym::F4)) && !(ctrl && sym == Keysym::comma) {
-            if let Some(k) = Self::to_files_key(sym) {
-                let m = KeyMods { ctrl, alt, shift: mods.shift };
-                let (used, ev) = self.files.key(k, m, &mut self.fm);
-                self.handle_files_events(ev);
-                if used {
-                    return true;
-                }
-            }
-        }
         if self.desktop.focused && self.focused_shell().is_none() && !logo && !global && !(alt && matches!(sym, Keysym::Tab | Keysym::F4)) && !(ctrl && sym == Keysym::comma) {
             if let Some(k) = Self::to_files_key(sym) {
                 let m = KeyMods { ctrl, alt, shift: mods.shift };
@@ -2935,10 +2961,6 @@ impl State {
     pub fn launch_app(&mut self, app: &AppEntry) {
         if app.id == apps::SETTINGS_ID {
             self.open_shell(Sw::Settings);
-            return;
-        }
-        if app.id == apps::FILES_ID {
-            self.open_shell(Sw::Files);
             return;
         }
         let t0 = std::time::Instant::now();
@@ -3098,9 +3120,6 @@ impl State {
         if key == apps::SETTINGS_ID && self.settings.open {
             v.push(DockWin { id: SHELL_SETTINGS, title: "Settings".into(), minimized: self.swin.minimized });
         }
-        if key == apps::FILES_ID && self.files.open {
-            v.push(DockWin { id: SHELL_FILES, title: "Files".into(), minimized: self.fwin.minimized });
-        }
         v
     }
 
@@ -3110,7 +3129,6 @@ impl State {
         let mut items: Vec<DockItem> = Vec::new();
         let mut shown: HashSet<String> = HashSet::new();
         let settings_open = self.settings.open;
-        let files_open = self.files.open;
         let mut running_keys: HashSet<String> = self
             .wins
             .iter()
@@ -3119,9 +3137,6 @@ impl State {
             .collect();
         if settings_open {
             running_keys.insert(apps::SETTINGS_ID.to_string());
-        }
-        if files_open {
-            running_keys.insert(apps::FILES_ID.to_string());
         }
 
         let pinned = self.pinned.clone();
@@ -3149,12 +3164,6 @@ impl State {
                 extras.push((apps::SETTINGS_ID.to_string(), self.apps[i].name.clone(), Some(i)));
             }
         }
-        if files_open && !shown.contains(apps::FILES_ID) {
-            if let Some(i) = self.apps.iter().position(|a| a.id == apps::FILES_ID) {
-                shown.insert(apps::FILES_ID.to_string());
-                extras.push((apps::FILES_ID.to_string(), self.apps[i].name.clone(), Some(i)));
-            }
-        }
         for (key, name, idx) in extras {
             entries.push((key, name, idx, true, first_extra));
             first_extra = false;
@@ -3177,7 +3186,7 @@ impl State {
             items.push(DockItem { key, name, icon, running, separator_before: sep, windows, pinned: is_pinned, badge, gpu });
         }
         let focused = if let Some(k) = self.focused_shell() {
-            Some(if k == Sw::Settings { apps::SETTINGS_ID } else { apps::FILES_ID }.to_string())
+            Some(match k { Sw::Settings => apps::SETTINGS_ID }.to_string())
         } else {
             self.wins.iter().rev().find(|w| w.mapped && !w.minimized && !w.or).map(|w| self.key_of(w))
         };
@@ -3235,8 +3244,8 @@ impl State {
     /// A Dock / taskbar item was clicked: focus its window, or start the app.
     fn dock_click(&mut self, key: String) {
         {
-            if key == apps::SETTINGS_ID || key == apps::FILES_ID {
-                let k = if key == apps::SETTINGS_ID { Sw::Settings } else { Sw::Files };
+            if key == apps::SETTINGS_ID {
+                let k = Sw::Settings;
                 if self.is_open(k) && self.focused_shell() == Some(k) {
                     self.shell_win_mut(k).minimized = true;
                 } else {
@@ -3296,28 +3305,24 @@ impl State {
     pub fn is_open(&self, k: Sw) -> bool {
         match k {
             Sw::Settings => self.settings.open,
-            Sw::Files => self.files.open,
         }
     }
 
     fn shell_win(&self, k: Sw) -> &ShellWin {
         match k {
             Sw::Settings => &self.swin,
-            Sw::Files => &self.fwin,
         }
     }
 
     fn shell_win_mut(&mut self, k: Sw) -> &mut ShellWin {
         match k {
             Sw::Settings => &mut self.swin,
-            Sw::Files => &mut self.fwin,
         }
     }
 
     fn client_size(&self, k: Sw) -> [f32; 2] {
         self.shell_win(k).size.unwrap_or(match k {
             Sw::Settings => [WIN_W, WIN_H],
-            Sw::Files => [files::WIN_W, files::WIN_H],
         })
     }
 
@@ -3365,6 +3370,12 @@ impl State {
         self.shell_win_mut(k).stamp = stamp;
     }
 
+    /// Start the file manager (a program of its own), showing `path` (a file is shown selected in its folder).
+    pub fn open_files(&mut self, path: Option<&std::path::Path>) {
+        let args: Vec<String> = path.map(|p| vec![p.to_string_lossy().to_string()]).unwrap_or_default();
+        fsops::spawn_own("memrium_files", &args, &self.socket);
+    }
+
     /// Open (or restore and raise) a shell window.
     pub fn open_shell(&mut self, k: Sw) {
         if !self.is_open(k) {
@@ -3386,7 +3397,6 @@ impl State {
                     self.settings.open();
                     self.load_walls();
                 }
-                Sw::Files => self.files.open_at(&fsops::home()),
             }
         }
         // asked for from another desktop, it comes to this one
@@ -3543,7 +3553,6 @@ impl State {
                     match b {
                         Btn::Close => match k {
                             Sw::Settings => self.settings.close(),
-                            Sw::Files => self.files.close(),
                         },
                         Btn::Minimize => self.shell_win_mut(k).minimized = true,
                         Btn::Maximize => self.toggle_shell_maximize(k),
@@ -3573,11 +3582,6 @@ impl State {
                     self.settings.mouse_down(p);
                 }
             }
-            Sw::Files => {
-                let m = self.key_mods();
-                let ev = self.files.mouse_down(p, right, m, &mut self.fm);
-                self.handle_files_events(ev);
-            }
         }
         true
     }
@@ -3593,23 +3597,19 @@ impl State {
         for ev in events {
             match ev {
                 FilesEvent::Menu(items, at) => {
-                    self.menu_for = if self.events_from_desktop { MenuFor::DesktopIcons } else { MenuFor::Files };
+                    self.menu_for = MenuFor::DesktopIcons;
                     // a view that does not know where the pointer is (a name committed with Enter) asks for it with -1
                     let at = if at[0] < 0.0 { self.mouse } else { at };
                     self.menu.open_at(at, items);
                 }
                 FilesEvent::Open(path) => fsops::open_external(&path, &self.socket),
                 FilesEvent::Own(program, args) => fsops::spawn_own(program, &args, &self.socket),
-                FilesEvent::OpenFolder(path) => {
-                    self.open_shell(Sw::Files);
-                    self.files.goto(path, true);
-                }
+                FilesEvent::OpenFolder(path) => self.open_files(Some(&path)),
                 FilesEvent::DragStart(paths) => {
                     self.file_drag = Some(FileDrag { paths, start: self.mouse, active: false });
                 }
                 FilesEvent::Terminal(dir) => self.open_terminal_in(&dir),
                 FilesEvent::Prefs => {
-                    self.config.files = self.files.prefs.clone();
                     self.config.desktop = self.desktop.prefs.clone();
                     self.cfg_dirty = Some(Instant::now());
                 }
@@ -3684,10 +3684,7 @@ impl State {
         // so the shell's would only repeat them under other names
         let mut names: Vec<String> = Vec::new();
         if app.is_empty() {
-            names.extend(["File", "Edit", "View"].map(String::from));
-            if self.focused_shell() == Some(Sw::Files) {
-                names.push("Go".into());
-            }
+            names.extend(["File", "View"].map(String::from));
         }
         let is = |title: &str, key: &str| title == key || title.to_lowercase() == tr(key).to_lowercase();
         // the front program's own menus: the same title replaces the shell's, a new one comes before Window
@@ -3799,7 +3796,6 @@ impl State {
     /// Height of a shell window's top row, the title bar in the unified look.
     fn sw_bar_h(k: Sw) -> f32 {
         match k {
-            Sw::Files => files::TOOLBAR_H,
             Sw::Settings => memrium_de::settings::TOOLBAR_H,
         }
     }
@@ -3843,7 +3839,6 @@ impl State {
     fn sw_drag_at(&self, k: Sw, p: [f32; 2]) -> bool {
         self.sw_unified()
             && match k {
-                Sw::Files => self.files.drag_at(p),
                 Sw::Settings => self.settings.drag_at(p),
             }
     }
@@ -4005,7 +4000,6 @@ impl State {
     pub fn bar_title(&self) -> String {
         match self.focused_shell() {
             Some(Sw::Settings) => "Settings".to_string(),
-            Some(Sw::Files) => "Files".to_string(),
             None => match self.wins.iter().rev().find(|w| w.mapped && !w.minimized && !w.or) {
                 Some(w) => match self.app_index_for_window(w) {
                     Some(i) => self.apps[i].name.clone(),
@@ -4135,7 +4129,7 @@ impl State {
                 w.min_k.target = if any_up { 1.0 } else { 0.0 };
             }
         }
-        for k in [Sw::Settings, Sw::Files] {
+        for k in [Sw::Settings] {
             if self.is_open(k) {
                 self.shell_win_mut(k).minimized = any_up;
             }
@@ -4189,7 +4183,7 @@ impl State {
             "network" => self.toggle_card(crate::popup::PopKind::Network, None, self.mouse[0]),
             "bluetooth" => self.toggle_card(crate::popup::PopKind::Bluetooth, None, self.mouse[0]),
             "settings" => self.open_shell(Sw::Settings),
-            "files" => self.open_shell(Sw::Files),
+            "files" => self.open_files(None),
             "terminal" => self.bar_command(B_TERMINAL),
             "screenshot" => self.shot_req = Some(ShotReq::Full),
             "screenshot-region" => self.begin_shot_sel(None, false),
@@ -4252,8 +4246,7 @@ impl State {
             }
             Target::File(path) => {
                 if path.is_dir() {
-                    self.open_shell(Sw::Files);
-                    self.files.goto(path, true);
+                    self.open_files(Some(&path));
                 } else {
                     fsops::open_external(&path, &self.socket);
                 }
@@ -4298,8 +4291,6 @@ impl State {
     /// The entries of the bar menu called `name` for the front window: its program's own when it gave `from_app`, else
     /// the shell's (`None` when there is no such menu).
     pub(crate) fn bar_menu_items(&self, name: &str, from_app: Option<Vec<MenuItem>>) -> Option<Vec<MenuItem>> {
-        use files::cmd::*;
-        let files = self.focused_shell() == Some(Sw::Files);
         let m: Vec<MenuItem> = match name {
             _ if from_app.is_some() => from_app.unwrap_or_default(),
             "logo" => vec![
@@ -4319,42 +4310,15 @@ impl State {
                 MenuItem::sep(),
                 MenuItem::new(B_LOGOUT, "Log Out…").icon("x").key("Ctrl+Alt+Backspace"),
             ],
-            "File" if files => vec![
-                MenuItem::new(NEW_FOLDER, "New Folder").icon("folder-plus").key("Ctrl+Shift+N"),
-                MenuItem::new(NEW_FILE, "New Text File").icon("file-plus"),
-                MenuItem::new(OPEN, "Open").key("Enter").enabled(self.files.has_selection()),
-                MenuItem::sep(),
-                MenuItem::new(B_CLOSE, "Close Window").key("Alt+F4"),
-            ],
             "File" => vec![
                 MenuItem::new(B_NEW_FILES, "New Files Window").icon("folder").key("Super+E"),
                 MenuItem::new(B_TERMINAL, "New Terminal").icon("terminal"),
                 MenuItem::sep(),
                 MenuItem::new(B_CLOSE, "Close Window").key("Alt+F4").enabled(self.has_window()),
             ],
-            "Edit" => vec![
-                MenuItem::new(UNDO, "Undo").icon("undo-2").key("Ctrl+Z").enabled(files && self.fm.can_undo()),
-                MenuItem::sep(),
-                MenuItem::new(CUT, "Cut").icon("scissors").key("Ctrl+X").enabled(files && self.files.has_selection()),
-                MenuItem::new(COPY, "Copy").icon("copy").key("Ctrl+C").enabled(files && self.files.has_selection()),
-                MenuItem::new(PASTE, "Paste").icon("clipboard-paste").key("Ctrl+V").enabled(files && self.fm.can_paste()),
-                MenuItem::sep(),
-                MenuItem::new(SELECT_ALL, "Select All").key("Ctrl+A").enabled(files),
-            ],
-            "View" if files => self.files.view_menu(),
             "View" => vec![
                 MenuItem::new(B_CC, "Quick Settings").icon("sliders-horizontal").checked(self.scene.cc_open()),
                 MenuItem::new(B_EDIT, "Edit Controls").icon("pencil"),
-            ],
-            "Go" => vec![
-                MenuItem::new(G_BACK, "Back").icon("arrow-left").key("Alt+←").enabled(self.files.can_back()),
-                MenuItem::new(G_FWD, "Forward").icon("arrow-right").key("Alt+→").enabled(self.files.can_forward()),
-                MenuItem::new(G_UP, "Enclosing Folder").icon("arrow-up").key("Alt+↑"),
-                MenuItem::sep(),
-                MenuItem::new(G_HOME, "Home").icon("house"),
-                MenuItem::new(G_DESKTOP, "Desktop").icon("monitor"),
-                MenuItem::new(G_DOCS, "Documents").icon("file-text"),
-                MenuItem::new(G_DOWNLOADS, "Downloads").icon("download"),
             ],
             "Window" => {
                 let mut v = vec![
@@ -4364,9 +4328,6 @@ impl State {
                 let mut list = Vec::new();
                 if self.settings.open {
                     list.push(MenuItem::new(B_SHELL_SETTINGS, "Settings").icon("settings"));
-                }
-                if self.files.open {
-                    list.push(MenuItem::new(B_SHELL_FILES, "Files").icon("folder"));
                 }
                 for (i, w) in self.wins.iter().enumerate().filter(|(_, w)| w.mapped && !w.or) {
                     let t = if w.title.is_empty() { w.app_id.clone() } else { w.title.clone() };
@@ -4442,7 +4403,7 @@ impl State {
                 self.settings.set_page(Settings::page_by_name("about").unwrap_or(0));
             }
             B_SETTINGS => self.open_shell(Sw::Settings),
-            B_FILES | B_NEW_FILES => self.open_shell(Sw::Files),
+            B_FILES | B_NEW_FILES => self.open_files(None),
             B_TERMINAL => {
                 let home = fsops::home();
                 self.open_terminal_in(&home);
@@ -4456,7 +4417,6 @@ impl State {
             B_SHUTDOWN => self.power("poweroff"),
             B_CLOSE => match self.focused_shell() {
                 Some(Sw::Settings) => self.settings.close(),
-                Some(Sw::Files) => self.files.close(),
                 None => {
                     if let Some(i) = self.wins.iter().rposition(|w| w.mapped && !w.minimized && !w.or) {
                         self.close_window(i);
@@ -4482,7 +4442,6 @@ impl State {
             }
             B_EDIT => self.scene.set_edit(true),
             B_SHELL_SETTINGS => self.open_shell(Sw::Settings),
-            B_SHELL_FILES => self.open_shell(Sw::Files),
             n if n >= B_WIN_BASE => {
                 let i = (n - B_WIN_BASE) as usize;
                 if i < self.wins.len() {
@@ -4490,19 +4449,13 @@ impl State {
                     self.focus_window(i);
                 }
             }
-            other => {
-                // Files commands chosen from the Edit / View / Go menus
-                let mut ev = Vec::new();
-                self.files.command(other, &mut self.fm, &mut ev);
-                self.handle_files_events(ev);
-            }
+            other => eprintln!("unknown menu command {other}"),
         }
     }
 
     /// Folder that files dropped at `p` would land in.
     fn drop_target_at(&self, p: [f32; 2]) -> Option<std::path::PathBuf> {
         match self.shell_covers(p) {
-            Some(Sw::Files) => self.files.drop_target(p),
             Some(_) => None,
             None => (self.desktop.prefs.show && self.desktop_hit(p)).then(|| self.desktop.drop_target(p)),
         }
@@ -4510,7 +4463,6 @@ impl State {
 
     fn finish_drag(&mut self, d: FileDrag) {
         self.desktop.drag = None;
-        self.files.drop_hover = None;
         self.desktop.drop_hover = None;
         let Some(dir) = self.drop_target_at(self.mouse) else { return };
         let copy = self.key_mods().ctrl;
@@ -4562,11 +4514,6 @@ impl State {
     fn menu_command(&mut self, id: u32) {
         use files::cmd::*;
         match self.menu_for {
-            MenuFor::Files => {
-                let mut ev = Vec::new();
-                self.files.command(id, &mut self.fm, &mut ev);
-                self.handle_files_events(ev);
-            }
             MenuFor::Bar(_) => self.bar_command(id),
             MenuFor::Panel(b, w) => self.panel_menu_command(id, b, w),
             MenuFor::Dock => self.dock_menu_command(id),
@@ -4608,11 +4555,8 @@ impl State {
                         self.open_shell(Sw::Settings);
                         self.settings.set_page(2);
                     }
-                    D_FILES => self.open_shell(Sw::Files),
-                    D_DESKTOP_DIR => {
-                        self.open_shell(Sw::Files);
-                        self.files.goto(desk, true);
-                    }
+                    D_FILES => self.open_files(None),
+                    D_DESKTOP_DIR => self.open_files(Some(&desk)),
                     D_TERMINAL => self.open_terminal_in(&desk),
                     _ => {}
                 }
@@ -4908,15 +4852,16 @@ impl State {
                 SettingsAction::Sys(cmd) => self.sys_watcher.send(cmd),
                 SettingsAction::TestNotification => self.test_notification(),
                 SettingsAction::TestOsd => self.test_osd(),
+                SettingsAction::TestGesture(word) => self.test_gesture(word),
                 SettingsAction::Preset(id) => {
                     // a clean template switch, but keep the user's wallpaper
                     let wallpaper = self.theme.wallpaper.clone();
                     self.config.select(&id);
                     let mut t = self.config.resolve();
                     t.wallpaper = if t.wallpaper.path.is_empty() { wallpaper } else { t.wallpaper };
-                    // a template brings its own file manager look (Aero: Explorer)
+                    // a template brings its own file manager look (Aero: Explorer); the program reads it from files.toml
                     if let Some(name) = t.files.clone() {
-                        self.files.prefs = files::FilesPrefs::preset(&name);
+                        files::FilesPrefs::apply_preset(&name);
                     }
                     self.apply_theme(t);
                 }
@@ -4930,6 +4875,8 @@ impl State {
                 SettingsAction::ApplyDisplays => {
                     self.config.save();
                     self.displays_dirty = true;
+                    // Scaled rendering needs no new monitor set-up: it takes effect at once, in a window too
+                    self.reapply_supersample();
                 }
                 SettingsAction::SaveTemplate(name) => {
                     self.shot_notice = Some(match memrium_de::theme::save_template(&self.theme, &name) {
@@ -5052,10 +4999,11 @@ impl State {
                 let mut want_icons = Vec::new();
                 let index = self.icons.get();
                 let icon_names: &[String] = index.as_deref().map_or(&[], |i| i.names());
+                let camera_status = self.gesture_status_line();
                 let (cp, cl, actions) = {
                     let renderer = &self.renderer;
                     let app_icon = |id: &str| renderer.app_icon_get(id);
-                    let mut ctx = SettingsCtx { screen: self.size, theme: &mut theme, presets: &self.presets, preset_id: &self.config.theme, walls: &self.walls, language: &self.config.language, wall_accent: self.wall_accent, cfg: &mut cfg, monitors: &self.monitor_infos, size: self.client_size(Sw::Settings), icons: &icon_cells, sys: &self.sys, app_icon: &app_icon, want_icons: &mut want_icons, icon_names };
+                    let mut ctx = SettingsCtx { screen: self.size, theme: &mut theme, presets: &self.presets, preset_id: &self.config.theme, walls: &self.walls, language: &self.config.language, wall_accent: self.wall_accent, cfg: &mut cfg, monitors: &self.monitor_infos, size: self.client_size(Sw::Settings), icons: &icon_cells, sys: &self.sys, app_icon: &app_icon, want_icons: &mut want_icons, icon_names, camera_status: &camera_status };
                     self.settings.draw(&mut ctx, origin)
                 };
                 // the icons the Programs page lacked start loading (a few a frame)
@@ -5074,11 +5022,23 @@ impl State {
                         // a cursor preview of the Mouse page; the previews of an older look go back to the atlas
                         if self.renderer.app_icon_get(&id).is_none() {
                             if let Some((img, look)) = memrium_de::cursor::preview_image(&id) {
-                                if look != self.cursor_preview_look {
-                                    for old in self.cursor_previews.drain(..) {
-                                        self.renderer.app_icon_free(&old);
+                                // a few looks are kept: the page shows the current one and its variants (the shape
+                                // tiles) side by side, and dropping all but one would make them push each other out
+                                // every frame. The oldest look goes back to the atlas when there are too many.
+                                if let Some(i) = self.cursor_preview_looks.iter().position(|l| *l == look) {
+                                    let l = self.cursor_preview_looks.remove(i);
+                                    self.cursor_preview_looks.push(l);
+                                } else {
+                                    self.cursor_preview_looks.push(look);
+                                    if self.cursor_preview_looks.len() > 16 {
+                                        let gone = self.cursor_preview_looks.remove(0);
+                                        let look_of = |id: &str| memrium_de::cursor::preview_image(id).map(|(_, l)| l);
+                                        let (drop, keep): (Vec<String>, Vec<String>) = std::mem::take(&mut self.cursor_previews).into_iter().partition(|old| look_of(old).as_deref() == Some(gone.as_str()));
+                                        for old in drop {
+                                            self.renderer.app_icon_free(&old);
+                                        }
+                                        self.cursor_previews = keep;
                                     }
-                                    self.cursor_preview_look = look;
                                 }
                                 if self.renderer.image_cell(&id, &img).is_some() {
                                     self.cursor_previews.push(id);
@@ -5128,27 +5088,6 @@ impl State {
                     self.pending_theme = Some(theme);
                 }
                 self.pending_actions.extend(actions);
-            }
-            Sw::Files => {
-                let name = if fsops::is_computer(&self.files.cwd) { "Computer".to_string() } else { self.files.cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "/".into()) };
-                self.files.chrome = chrome;
-                self.files.corner = corner;
-                let title = decor::title_labels(&frame_theme, frame, &title_text(&format!("Files — {name}")), focused);
-                panels.extend(self.renderer.label_panels(&title));
-                let time = self.time_ms() as f32 / 1000.0;
-                let files_size = self.client_size(Sw::Files);
-                let (cp, cl) = {
-                    let r = &self.renderer;
-                    let measure = |t: &str, s: f32, b: bool| r.text_width(t, s, b);
-                    let cache = &self.fileicons;
-                    let icon = |e: &fsops::Entry, thumb: bool| cache.state(r, e, thumb);
-                    let ctx = FilesCtx { theme: &self.theme, size: files_size, measure: &measure, time, fm: &self.fm, icon: &icon };
-                    self.files.draw(&ctx, origin)
-                };
-                let wanted = std::mem::take(&mut self.files.wanted);
-                self.fileicons.request(&mut self.renderer, &wanted);
-                panels.extend(cp);
-                panels.extend(self.renderer.label_panels(&cl));
             }
         }
         // the content's fills that reach the window's corners are rounded like the window
@@ -5299,7 +5238,7 @@ impl State {
         self.launcher.update(dt, &an);
         self.menu.update(dt, &an);
         self.launcher.refresh_if_indexed(&self.apps);
-        for k in [Sw::Settings, Sw::Files] {
+        for k in [Sw::Settings] {
             // a window of another desktop stays "shown": it slides away with the row instead of closing
             let shown = self.is_open(k) && !self.shell_win(k).minimized;
             let w = self.shell_win_mut(k);
@@ -5361,6 +5300,9 @@ impl State {
         self.update_vinyl(dt);
         self.update_visualizer();
         self.update_flyout(dt);
+        self.gestures_tick(dt);
+        self.live_text_tick();
+        self.voice_tick(dt);
         self.update_card(dt);
         self.tray_update();
         self.appmenu_update();
@@ -5447,11 +5389,9 @@ impl State {
         use memrium_de::display::bounds;
         let (x0, y0, x1, y1) = bounds(placed);
         let (cw, ch) = ((x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32);
+        self.sync_supersample();
         self.renderer.resize(cw, ch, scale);
-        crate::role::set_scale_grid(scale);
-        crate::role::set_x_scale(scale);
-        self.set_x_dpi();
-        self.send_preferred_scale_to_all();
+        self.tell_scale();
         let k = 1.0 / scale;
         self.world = [x0 as f32 * k, y0 as f32 * k, x1 as f32 * k, y1 as f32 * k];
         self.mons = placed.iter().map(|p| [p.x as f32 * k, p.y as f32 * k, p.w as f32 * k, p.h as f32 * k]).collect();
@@ -5534,7 +5474,7 @@ impl State {
                 w.role.configure(Some((((area[2] - ix) as i32).max(1), ((area[3] - iy) as i32).max(1))), ((area[0] + w.ins[0]) as i32, (area[1] + w.ins[1]) as i32), Some(true), None);
             }
         }
-        for k in [Sw::Settings, Sw::Files] {
+        for k in [Sw::Settings] {
             if self.shell_win(k).restore.is_some() {
                 let area = self.snap_rect([self.size[0] / 2.0, self.size[1] / 2.0], self.shell_win(k).tile);
                 let ins = self.sw_ins(k);
@@ -5554,12 +5494,37 @@ impl State {
         }
     }
 
-    pub fn resize_output(&mut self, w_px: u32, h_px: u32, scale: f32) {
-        self.renderer.resize(w_px, h_px, scale);
-        crate::role::set_scale_grid(scale);
-        crate::role::set_x_scale(scale);
+    /// Scaled rendering as the settings have it (`MEMRIUM_SS=2` overrides it, to try it): the renderer draws that much larger.
+    fn sync_supersample(&mut self) {
+        let ss = std::env::var("MEMRIUM_SS").ok().and_then(|v| v.parse().ok()).unwrap_or(self.config.display.supersample);
+        self.renderer.set_supersample(ss);
+    }
+
+    /// Take the Scaled rendering setting into use now.
+    fn reapply_supersample(&mut self) {
+        let before = self.renderer.supersample();
+        self.sync_supersample();
+        if (self.renderer.supersample() - before).abs() > 0.001 {
+            self.tell_scale();
+            self.invalidate();
+        }
+    }
+
+    /// Tell everything that works in device pixels the scale the renderer draws at (the interface scale times the
+    /// supersampling): programs draw for it, X programs and the size grid follow.
+    fn tell_scale(&mut self) {
+        let eff = self.renderer.scale();
+        crate::role::set_scale_grid(eff);
+        crate::role::set_x_scale(eff);
         self.set_x_dpi();
+        self.output.change_current_state(None, None, Some(smithay::output::Scale::Custom { advertised_integer: eff.round().max(1.0) as i32, fractional: eff as f64 }), None);
         self.send_preferred_scale_to_all();
+    }
+
+    pub fn resize_output(&mut self, w_px: u32, h_px: u32, scale: f32) {
+        self.sync_supersample();
+        self.renderer.resize(w_px, h_px, scale);
+        self.tell_scale();
         let [lw, lh] = self.renderer.logical_size();
         self.size = [lw, lh];
         let edit = self.scene.edit_mode();
@@ -5644,7 +5609,12 @@ impl State {
     /// `None`) as RGBA. Returns (width, height, pixels) in device pixels.
     /// The device-pixel box (x0, y0, x1, y1) a logical rectangle (the whole screen when `None`) is cut out of the picture with.
     pub fn crop_px(&self, logical: Option<[f32; 4]>) -> [u32; 4] {
-        let (pw, ph) = self.renderer.pixel_size();
+        self.crop_px_hi(logical, false)
+    }
+
+    /// As `crop_px`, for a picture taken with `capture_rgba_hi(.., hi)`.
+    pub fn crop_px_hi(&self, logical: Option<[f32; 4]>, hi: bool) -> [u32; 4] {
+        let (pw, ph) = self.renderer.capture_px(hi);
         // the rectangle is in desktop coordinates; the picture starts at the desktop's top-left corner
         let [cl_w, cl_h] = self.renderer.logical_size();
         let off = self.canvas_off();
@@ -5658,7 +5628,13 @@ impl State {
     }
 
     pub fn capture_rgba(&mut self, logical: Option<[f32; 4]>) -> (u32, u32, Vec<u8>) {
-        let (pw, ph) = self.renderer.pixel_size();
+        self.capture_rgba_hi(logical, false)
+    }
+
+    /// With `hi` and Scaled rendering on, the picture has the larger size the frame is drawn at (a screenshot keeps the
+    /// detail). Programs that ask for the screen (screen sharing) take the output's size: `capture_rgba`.
+    pub fn capture_rgba_hi(&mut self, logical: Option<[f32; 4]>, hi: bool) -> (u32, u32, Vec<u8>) {
+        let (pw, ph) = self.renderer.capture_px(hi);
         let format = self.renderer.format();
         let device = self.renderer.device().clone();
         let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -5675,7 +5651,9 @@ impl State {
         let (skip, notice) = (self.allow_skip, self.shot_notice.take());
         self.allow_skip = false;
         self.capturing = true;
+        self.renderer.hi_capture = hi;
         let mut enc = self.render(&view);
+        self.renderer.hi_capture = false;
         self.capturing = false;
         self.allow_skip = skip;
         self.shot_notice = notice;
@@ -5691,7 +5669,7 @@ impl State {
         let slice = buf.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
         device.poll(wgpu::PollType::Wait).unwrap();
-        let [x0, y0, x1, y1] = self.crop_px(logical);
+        let [x0, y0, x1, y1] = self.crop_px_hi(logical, hi);
         let cw = x1 - x0;
         let ch = y1 - y0;
         let bgra = matches!(format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
@@ -5728,8 +5706,8 @@ impl State {
                 Some(shot) => shot,
                 None => return,
             },
-            ShotReq::Full => self.capture_rgba(None),
-            ShotReq::Region(r) => self.capture_rgba(Some(r)),
+            ShotReq::Full => self.capture_rgba_hi(None, true),
+            ShotReq::Region(r) => self.capture_rgba_hi(Some(r), true),
         };
         self.finish_shot(rgba, cw, ch, req == ShotReq::Full);
     }
@@ -5784,7 +5762,7 @@ impl State {
         }
         let Some(rec) = self.recording.as_ref().filter(|r| r.due()) else { return };
         let rect = rec.rect;
-        let (w, h, rgba) = self.capture_rgba(Some(rect));
+        let (w, h, rgba) = self.capture_rgba_hi(Some(rect), true);
         if let Some(Err(e)) = self.recording.as_mut().map(|r| r.push(rgba, w, h)) {
             eprintln!("recording failed: {e}");
             self.recording = None;

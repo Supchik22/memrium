@@ -267,7 +267,7 @@ pub(super) fn page_power(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw:
 /// The installed programs, read once when the Programs page is first shown.
 fn installed_apps() -> &'static [crate::apps::AppEntry] {
     static APPS: std::sync::OnceLock<Vec<crate::apps::AppEntry>> = std::sync::OnceLock::new();
-    APPS.get_or_init(|| crate::apps::scan().into_iter().filter(|a| a.id != crate::apps::SETTINGS_ID && a.id != crate::apps::FILES_ID).collect())
+    APPS.get_or_init(|| crate::apps::scan().into_iter().filter(|a| a.id != crate::apps::SETTINGS_ID).collect())
 }
 
 /// How many installed programs the picker lists at once (the field above narrows them).
@@ -348,4 +348,46 @@ pub(super) fn page_programs(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, 
     if rules.rules() != before.as_slice() {
         rules.save();
     }
+}
+
+/// Privacy: the camera, which gestures the desktop reacts to, and the dot that shows when the camera is in use.
+pub(super) fn page_privacy(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, actions: &mut Vec<SettingsAction>) {
+    title(ui, x, y, "Privacy");
+    let status = ctx.camera_status;
+    let p = &mut ctx.cfg.privacy;
+
+    let top = card(ui, x, y + 70.0, cw, "CAMERA", 148.0);
+    let mut f = Form::new(x + 16.0, top + 32.0, cw - 32.0, 46.0);
+    f.toggle(ui, "Hand gestures", &mut p.gestures);
+    rule(ui, x, top + 56.0, cw);
+    f.note(ui, "The camera is used only while this is on. Pictures stay on this computer and are not saved.", true);
+    f.note(ui, "Turning it off closes the camera at once.", true);
+    let line = if !p.gestures {
+        "Camera: off".to_string()
+    } else if status.is_empty() {
+        "Camera: starting…".to_string()
+    } else {
+        format!("Camera: {status}")
+    };
+    f.note(ui, &line, false);
+
+    let top = card(ui, x, top + 148.0 + 26.0, cw, "REACTIONS", 3.0 * 46.0 + 66.0);
+    let mut f = Form::new(x + 16.0, top + 32.0, cw - 32.0, 46.0);
+    f.toggle(ui, "Thumbs up", &mut p.like);
+    rule(ui, x, top + 56.0, cw);
+    f.toggle(ui, "Thumbs down", &mut p.dislike);
+    rule(ui, x, top + 102.0, cw);
+    f.toggle(ui, "Peace sign (confetti)", &mut p.peace);
+    let by = f.y - 12.0 + 6.0;
+    for (i, (label, word)) in [("Try thumbs up", "like"), ("Try thumbs down", "dislike"), ("Try confetti", "peace")].into_iter().enumerate() {
+        if ui.button([x + 16.0 + i as f32 * 150.0, by, 140.0, 32.0], label, false) {
+            actions.push(SettingsAction::TestGesture(word));
+        }
+    }
+
+    let top = card(ui, x, top + 3.0 * 46.0 + 66.0 + 26.0, cw, "INDICATOR", 112.0);
+    let mut f = Form::new(x + 16.0, top + 32.0, cw - 32.0, 46.0);
+    f.toggle(ui, "Show a dot while the camera is in use", &mut p.indicator);
+    rule(ui, x, top + 56.0, cw);
+    f.note(ui, "A small camera mark at the top of the screen, so it is never on without you seeing it.", true);
 }

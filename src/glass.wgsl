@@ -166,7 +166,9 @@ fn shade_glass(px: vec2<f32>, pn: Panel, sd: f32, n: vec2<f32>, base: vec3<f32>)
     let depth = -sd;                       // px inside the shape
     let t = depth / max(bezel, 1.0);       // 0 at edge .. 1 at bezel limit
     // Refraction offset: strong near the edge, fades to zero inside.
-    let k = (1.0 - lens(t));
+    // The bend falls off smoothly over the whole band (the square of the distance to its inner limit). The convex lens
+    // profile this replaces is so steep that the picture is bent only within a pixel or two of the edge: invisible.
+    let k = 1.0 - clamp(t, 0.0, 1.0);
     let k2 = select(0.0, k * k, t < 1.0);
     let disp = -n * k2 * pn.params.w;      // sample from further inside => edge bends scene inward
     let dsp = pn.fx.y;
@@ -174,10 +176,13 @@ fn shade_glass(px: vec2<f32>, pn: Panel, sd: f32, n: vec2<f32>, base: vec3<f32>)
     let br = pn.fx.x;
     // no refraction here (or no dispersion): one blurred sample instead of three (green is that one sample either way;
     // written with three calls, not four, as each call is inlined whole)
-    var col = blur_bg(px + disp, br);
+    // the bend shows only where there is something to bend: the blur is mostly taken off in the band at the rim, and the
+    // middle of the glass stays frosted
+    let br_rim = br * (1.0 - 0.8 * k2);
+    var col = blur_bg(px + disp, br_rim);
     if (!(k2 <= 0.0001 || dsp < 0.001)) {
-        col.r = blur_bg(px + disp * (1.0 + dsp), br).r;
-        col.b = blur_bg(px + disp * (1.0 - dsp), br).b;
+        col.r = blur_bg(px + disp * (1.0 + dsp), br_rim).r;
+        col.b = blur_bg(px + disp * (1.0 - dsp), br_rim).b;
     }
 
     col = saturate_col(col, select(pn.extra.w, 1.15, pn.extra.w <= 0.0));
@@ -507,7 +512,11 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
     if (kind == 7u) {
         // application icon from the atlas (premultiplied), drawn at tint.a opacity.
         // params.w = shape mask (1 squircle, 2 circle, 3 rounded), fx.x = padding, fx.y > 0.5 = one-colour tint (color2.rgb)
-        let u = local / pn.rect.zw;
+        // the picture sits on whole physical pixels: its top-left corner is moved to the nearest one (half a pixel at most), so
+        // a straight line of the icon covers pixels instead of straddling two of them
+        let tl = (pn.rect.xy - pn.rect.zw) * g.scale;
+        let snap = (round(tl) - tl) / g.scale;
+        let u = (local - snap) / pn.rect.zw;
         let uu = u / max(1.0 - pn.fx.x, 0.2);
         // a soft copy of the picture (the Dock's bloom) reaches past the icon's edge: fx.w is how far, as a share of the icon's size
         let lim = 1.0 + 2.0 * max(pn.fx.w, 0.0);
@@ -519,7 +528,11 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
             let sa = sin(pn.fx.z);
             let ur = vec2(ca * uu.x - sa * uu.y, sa * uu.x + ca * uu.y);
             let uv = (cell + clamp(ur * 0.5 + vec2(0.5), vec2(0.004), vec2(0.996))) / 24.0;
-            let lod = clamp(log2(128.0 / max(2.0 * pn.rect.z * g.scale, 1.0)), 0.0, 2.0);
+            var lod = clamp(log2(128.0 / max(2.0 * pn.rect.z * g.scale, 1.0)), 0.0, 2.0);
+            // close to a level of the chain: take that level alone (each is drawn from the vector, not shrunk from the one
+            // above), instead of a blend of two that is always a little soft
+            let lod_whole = round(lod);
+            lod = select(lod, lod_whole, abs(lod - lod_whole) < 0.25);
             var t = textureSampleLevel(app_atlas, bgs, uv, lod);
             if (pn.fx.w > 0.0) {
                 // bloom: 16 taps on a spiral round this point, from a coarse level of the picture, so the copy is smooth
@@ -545,7 +558,7 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
                 } else if (shape == 2u) {
                     msd = (length(u) - 1.0) * pn.rect.z;
                 } else {
-                    msd = sd_round_rect(local, pn.rect.zw, pn.rect.z * 0.44);
+                    msd = sd_round_rect(local - snap, pn.rect.zw, pn.rect.z * 0.44);
                 }
                 t = t * clamp(0.5 - msd * g.scale, 0.0, 1.0);
             }

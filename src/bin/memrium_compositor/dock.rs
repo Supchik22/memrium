@@ -340,7 +340,6 @@ impl State {
     pub fn dock_focus_window(&mut self, id: u64) {
         match id {
             SHELL_SETTINGS => self.open_shell(crate::state::Sw::Settings),
-            SHELL_FILES => self.open_shell(crate::state::Sw::Files),
             _ => {
                 if let Some(i) = self.win_by_id(id) {
                     self.focus_window(i);
@@ -352,7 +351,6 @@ impl State {
     pub fn dock_close_window(&mut self, id: u64) {
         match id {
             SHELL_SETTINGS => self.settings.close(),
-            SHELL_FILES => self.files.close(),
             _ => {
                 if let Some(i) = self.win_by_id(id) {
                     self.close_window(i);
@@ -390,7 +388,7 @@ impl State {
             }
             items.push(MenuItem::sep());
         }
-        if app.as_ref().is_some_and(|a| a.id != apps::SETTINGS_ID && a.id != apps::FILES_ID) || (app.is_some() && wins.is_empty()) {
+        if app.as_ref().is_some_and(|a| a.id != apps::SETTINGS_ID) || (app.is_some() && wins.is_empty()) {
             let name = app.as_ref().map(|a| a.name.clone()).unwrap_or_default();
             items.push(MenuItem::new(M_NEW, if wins.is_empty() { format!("Open {name}") } else { "Open New Window".to_string() }).icon("plus"));
         }

@@ -188,9 +188,21 @@ fn ort_ready() -> bool {
         if std::env::var("MEMRIUM_CUTOUT_ENGINE").is_ok_and(|e| e == "tract") {
             return false;
         }
-        let mut paths: Vec<PathBuf> = ["MEMRIUM_ONNXRUNTIME", "ORT_DYLIB_PATH"].iter().filter_map(std::env::var_os).map(PathBuf::from).collect();
+        let mut paths: Vec<PathBuf> = ["MEMRIUM_ONNXRUNTIME", "ORT_DYLIB_PATH"].iter().filter_map(std::env::var_os).filter(|v| !v.is_empty()).map(PathBuf::from).collect();
+        // a copy kept for Memrium (a Nix store link at ~/.local/share/memrium/onnxruntime, when the system's is too old)
+        if let Some(home) = std::env::var_os("HOME") {
+            paths.push(PathBuf::from(home).join(".local/share/memrium/onnxruntime/lib/libonnxruntime.so"));
+        }
         paths.extend(["/run/current-system/sw/lib/libonnxruntime.so", "/usr/lib/libonnxruntime.so", "/usr/lib/x86_64-linux-gnu/libonnxruntime.so", "/usr/local/lib/libonnxruntime.so"].map(PathBuf::from));
         for p in paths.into_iter().filter(|p| p.exists()) {
+            // onnxruntime 1.22 never comes back from being loaded (seen on NixOS: the whole program hangs before its
+            // first line); a library whose store path names an older version than 1.23 is left alone
+            if let Some((major, minor)) = version_in_path(&p) {
+                if (major, minor) < (1, 23) {
+                    eprintln!("cutout: onnxruntime {major}.{minor} at {} is too old (it hangs when loaded); 1.23 or newer is needed", p.display());
+                    continue;
+                }
+            }
             if debug() {
                 eprintln!("cutout: loading onnxruntime from {}", p.display());
             }
@@ -207,6 +219,15 @@ fn ort_ready() -> bool {
         }
         false
     })
+}
+
+/// The onnxruntime version a library's (resolved) path names, as Nix store paths do: `...-onnxruntime-1.22.2/lib/...`.
+fn version_in_path(p: &Path) -> Option<(u32, u32)> {
+    let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let s = real.to_string_lossy();
+    let at = s.find("onnxruntime-")? + "onnxruntime-".len();
+    let mut nums = s[at..].split(|c: char| !c.is_ascii_digit()).filter(|t| !t.is_empty());
+    Some((nums.next()?.parse().ok()?, nums.next()?.parse().ok()?))
 }
 
 impl Segmenter {
@@ -357,8 +378,14 @@ impl Segmenter {
 
     /// The object under the point `at` (picture px), lifted out of `rgba` (the same picture the embedding was made of).
     pub fn cut(&self, emb: &Embedding, rgba: &[u8], at: [f32; 2]) -> Result<Option<Cutout>, String> {
+        self.cut_within(emb, rgba, at, 1.0)
+    }
+
+    /// As `cut`, taking no guess that covers more than `max_area` of the picture: on a screenshot a whole window is a
+    /// guess too, and the click meant the thing in it.
+    pub fn cut_within(&self, emb: &Embedding, rgba: &[u8], at: [f32; 2], max_area: f32) -> Result<Option<Cutout>, String> {
         let t = std::time::Instant::now();
-        let sel = self.select(emb, at)?;
+        let sel = self.select_within(emb, at, max_area)?;
         let dec = t.elapsed();
         let c = sel.and_then(|s| s.render(emb, rgba, 1));
         if debug() {
@@ -370,6 +397,11 @@ impl Segmenter {
     /// The object under `at` (picture px), as a mask: quick (two runs of the decoder); `Selection::render` makes its
     /// pixels. None when there is nothing there, or only the background.
     pub fn select(&self, emb: &Embedding, at: [f32; 2]) -> Result<Option<Selection>, String> {
+        self.select_within(emb, at, 1.0)
+    }
+
+    /// As `select`, leaving out guesses that cover more than `max_area` of the picture.
+    pub fn select_within(&self, emb: &Embedding, at: [f32; 2], max_area: f32) -> Result<Option<Selection>, String> {
         let click = [at[0] * emb.scale, at[1] * emb.scale];
         let seed = [(click[0] / 4.0) as usize, (click[1] / 4.0) as usize];
         let region = [((emb.w as f32 * emb.scale / 4.0).ceil() as usize).clamp(1, LOW), ((emb.h as f32 * emb.scale / 4.0).ceil() as usize).clamp(1, LOW)];
@@ -389,7 +421,7 @@ impl Segmenter {
             // the background is not an object: a guess that runs along much of the picture's edge is left out, and so is
             // one made largely of the backdrop's colour (an object with a patch of the white wall beside it)
             // (and a guess the model itself doubts is no object)
-            if area > 0.0 && iou[i] >= MIN_IOU && border <= MAX_BORDER && sides < 2 && plain <= MAX_PLAIN {
+            if area > 0.0 && area <= max_area && iou[i] >= MIN_IOU && border <= MAX_BORDER && sides < 2 && plain <= MAX_PLAIN {
                 guesses.push((i, m, area, iou[i]));
             }
         }
@@ -417,7 +449,7 @@ impl Segmenter {
             if debug() {
                 eprintln!("cutout: refined: iou {:.2}, area {:.2}, edge {:.2}, background-coloured {:.2} ({} points)", iou2[0], area, border, plain, points.len());
             }
-            if border <= MAX_BORDER && sides < 2 && plain <= MAX_PLAIN && area > first_area * 0.6 && area < first_area * 1.8 && iou2[0] >= first_iou - 0.15 {
+            if area <= max_area && border <= MAX_BORDER && sides < 2 && plain <= MAX_PLAIN && area > first_area * 0.6 && area < first_area * 1.8 && iou2[0] >= first_iou - 0.15 {
                 chosen = (m, iou2[0]);
             }
         }

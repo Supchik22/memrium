@@ -22,7 +22,7 @@ pub struct AppEntry {
 
 /// Id of the virtual entry that opens the shell's Settings.
 pub const SETTINGS_ID: &str = "memrium-settings";
-/// Id of the virtual entry that opens the shell's file manager.
+/// Id of the file manager program.
 pub const FILES_ID: &str = "memrium-files";
 
 fn data_dirs() -> Vec<PathBuf> {
@@ -156,24 +156,14 @@ pub fn scan() -> Vec<AppEntry> {
         wm_class: String::new(),
         categories: vec!["Settings".into()],
     });
-    out.push(AppEntry {
-        id: FILES_ID.into(),
-        name: "Files".into(),
-        generic_name: "File Manager".into(),
-        exec: String::new(),
-        icon: "system-file-manager".into(),
-        keywords: "folder browse explorer finder dolphin documents downloads".into(),
-        terminal: false,
-        wm_class: String::new(),
-        categories: vec!["Utility".into(), "FileManager".into()],
-    });
     out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 
 /// The programs of the desktop that ship beside it and have no desktop file: (executable, id, name, kind of program,
 /// icon, search words, categories). Each is listed when its executable is there.
-const OWN: [(&str, &str, &str, &str, &str, &str, &[&str]); 8] = [
+const OWN: [(&str, &str, &str, &str, &str, &str, &[&str]); 9] = [
+    ("memrium_files", "memrium-files", "Files", "File Manager", "system-file-manager", "folder browse explorer finder dolphin documents downloads", &["Utility", "FileManager"]),
     ("memrium_calc", "memrium-calc", "Memrium Calculator", "Calculator", "accessories-calculator", "calc math sum arithmetic numbers", &["Utility", "Calculator"]),
     ("memrium_player", "memrium-player", "Memrium Player", "Media Player", "multimedia-video-player", "video audio music movie mpv film", &["AudioVideo", "Player"]),
     ("memrium_snake", "memrium-snake", "Memrium Snake", "Game", "applications-games", "snake game arcade retro nokia", &["Game", "ArcadeGame"]),
@@ -788,6 +778,20 @@ fn walk_mime(dir: &Path, depth: u32, wanted: bool, out: &mut HashMap<String, Vec
 /// Is the icon file from the plateless theme of a clear look of our icons (`iconrender::LIVE_SUFFIX`)?
 pub fn is_live_icon(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str().to_str().is_some_and(|n| n.starts_with(crate::iconrender::THEME_NAME) && n.ends_with(crate::iconrender::LIVE_SUFFIX)))
+}
+
+/// The pictures for the levels of the icon atlas's mip chain (see `renderer::bake_app_icon_levels`): the icon at the cell
+/// size, half and a quarter. An SVG is drawn at each size, so a straight line is as sharp at 64 px as at 128 (shrinking
+/// the big picture blurs it); a PNG is decoded once and resized for each level.
+pub fn load_icon_levels(path: &Path) -> Option<Vec<image::RgbaImage>> {
+    const CELL: u32 = 128;
+    const LEVELS: u32 = 3;
+    if path.extension().and_then(|e| e.to_str()) == Some("svg") {
+        (0..LEVELS).map(|m| load_icon_file(path, CELL >> m)).collect()
+    } else {
+        let img = image::open(path).ok()?.to_rgba8();
+        Some((0..LEVELS).map(|m| image::imageops::resize(&img, CELL >> m, CELL >> m, image::imageops::FilterType::Lanczos3)).collect())
+    }
 }
 
 /// Decode a PNG or rasterise an SVG to `px` x `px`.

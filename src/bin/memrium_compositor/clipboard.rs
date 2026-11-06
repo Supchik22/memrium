@@ -278,6 +278,22 @@ impl State {
         self.clipboard.own_expected = false;
     }
 
+    /// Make some text the clipboard, and keep it in the history.
+    pub fn clip_set_text(&mut self, text: String) {
+        let id = self.clipboard.add(ClipData::Text(text));
+        let mimes = self.clipboard.items.iter().find(|e| e.id == id).map(|e| e.mimes()).unwrap_or_default();
+        self.clipboard.serving = Some(id);
+        self.clipboard.own_expected = true;
+        set_data_device_selection(&self.dh, &self.seat, mimes, ());
+        self.clipboard.own_expected = false;
+    }
+
+    /// Type some text into the program that has the keyboard: it becomes the clipboard and is pasted (dictation).
+    pub fn clip_type_text(&mut self, text: String) {
+        let id = self.clipboard.add(ClipData::Text(text));
+        self.clip_paste(id);
+    }
+
     /// Somebody pastes what we offered: write the entry to them.
     pub fn clip_serve(&mut self, mime: &str, fd: OwnedFd) -> Result<(), OwnedFd> {
         let Some(id) = self.clipboard.serving else { return Err(fd) };

@@ -1130,6 +1130,26 @@ pub fn convert_all(paths: &[PathBuf], to: &str) -> String {
     }
 }
 
+/// Turn each picture a quarter turn, in the file itself (clockwise or not); the status line text says how it went.
+pub fn rotate_all(paths: &[PathBuf], clockwise: bool) -> String {
+    let (mut done, mut last_err) = (0, None);
+    for p in paths.iter().filter(|p| can_convert(p) && extension_of(p) != "svg") {
+        let r = image::open(p).map_err(|e| e.to_string()).and_then(|img| {
+            let turned = if clockwise { img.rotate90() } else { img.rotate270() };
+            turned.save(p).map_err(|e| e.to_string())
+        });
+        match r {
+            Ok(()) => done += 1,
+            Err(e) => last_err = Some(format!("{}: {e}", p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())),
+        }
+    }
+    match last_err {
+        Some(e) => format!("Could not rotate ({done} done): {e}"),
+        None if done == 1 => "Rotated 1 picture".to_string(),
+        None => format!("Rotated {done} pictures"),
+    }
+}
+
 /// The "Convert to" submenu of the context menu: when every selected file is a picture. A single picture is not offered
 /// its own format. The ids are `base` plus the index in `CONVERT_TO`.
 pub fn convert_menu(paths: &[PathBuf], base: u32) -> Option<crate::menu::MenuItem> {
@@ -1145,7 +1165,31 @@ pub fn convert_menu(paths: &[PathBuf], base: u32) -> Option<crate::menu::MenuIte
     Some(MenuItem::new(0, "Convert to").icon("image").sub(items))
 }
 
-/// The formats the context menu lists itself (indices into `CONVERT_TO`): PNG, JPEG, WebP.
+/// "Quick Edit": one entry for every quick change to the selected files, whose submenu depends on what they are (only what
+/// fits all of them is offered). Pictures get "Convert to"; sound and film will get theirs when there is a converter for them.
+/// `None` when nothing applies.
+pub fn quick_edit_menu(paths: &[PathBuf], base: u32) -> Option<crate::menu::MenuItem> {
+    use crate::menu::MenuItem;
+    // the formats go straight under "Quick Edit" ("Convert to PNG"), no menu of their own in between
+    let items: Vec<MenuItem> = convert_menu(paths, base)
+        .map(|m| m.sub.into_iter().map(|mut i| {
+            if !i.separator && i.id != base + CONVERT_TO.len() as u32 {
+                i.label = format!("Convert to {}", i.label);
+            }
+            i
+        }).collect())
+        .unwrap_or_default();
+    let mut items = items;
+    // turning a picture round is offered for pixel pictures only (a drawing is a different thing to turn)
+    if !items.is_empty() && paths.iter().all(|p| can_convert(p) && extension_of(p) != "svg") {
+        items.push(MenuItem::sep());
+        items.push(MenuItem::new(crate::files::cmd::ROTATE_LEFT, "Rotate Left").icon("rotate-ccw"));
+        items.push(MenuItem::new(crate::files::cmd::ROTATE_RIGHT, "Rotate Right").icon("rotate-cw"));
+    }
+    (!items.is_empty()).then(|| MenuItem::new(0, "Quick Edit").icon("wand-sparkles").sub(items))
+}
+
+/// The formats the context menu lists itself (indices into `CONVERT_TO`): PNG, JPEG, WebP. "More…" opens the converter with the rest.
 const QUICK_FORMATS: [usize; 3] = [0, 1, 2];
 
 #[cfg(test)]

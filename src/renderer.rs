@@ -592,36 +592,54 @@ struct LayerCache {
 pub struct BakedIcon {
     tile: Option<TileStyle>,
     levels: Vec<image::RgbaImage>,
-    source: image::RgbaImage,
+    /// the picture of each level as it was drawn (kept to bake the icon again when the tile style changes)
+    sources: Vec<image::RgbaImage>,
 }
 
-/// The cell picture of an icon and its mips, premultiplied (so mips and bilinear filtering do not bleed colour from
-/// transparent pixels). `tile`: the style of the tile it sits on, or None to show the icon as it is.
-fn bake_icon(img: &image::RgbaImage, tile: Option<TileStyle>) -> Vec<image::RgbaImage> {
-    let mut base = match tile.as_ref() {
-        Some(t) => tile::bake(img, t, APP_CELL),
-        None => image::imageops::resize(img, APP_CELL, APP_CELL, image::imageops::FilterType::Lanczos3),
-    };
-    for p in base.pixels_mut() {
-        let a = p.0[3] as u32;
-        for c in 0..3 {
-            p.0[c] = ((p.0[c] as u32 * a + 127) / 255) as u8;
-        }
-    }
+/// The picture for each level of an icon's mip chain (the cell size, half, a quarter) from one picture: every level is
+/// made from `img` itself, never from the level above, so no level is the blur of a blur. (An icon drawn from a vector
+/// should have its levels drawn at their own sizes instead: `apps::load_icon_levels`.)
+fn level_sources(img: &image::RgbaImage) -> Vec<image::RgbaImage> {
     (0..APP_MIPS)
         .map(|mip| {
             let cell = APP_CELL >> mip;
-            if mip == 0 { base.clone() } else { image::imageops::resize(&base, cell, cell, image::imageops::FilterType::Triangle) }
+            if img.width() == cell && img.height() == cell { img.clone() } else { image::imageops::resize(img, cell, cell, image::imageops::FilterType::Lanczos3) }
+        })
+        .collect()
+}
+
+/// The cell pictures of an icon, one per level of the chain, premultiplied (so bilinear filtering does not bleed colour from
+/// transparent pixels). `sources[mip]` is the picture of that level; `tile`: the style of the tile it sits on, or None to
+/// show the icon as it is.
+fn bake_icon(sources: &[image::RgbaImage], tile: Option<TileStyle>) -> Vec<image::RgbaImage> {
+    (0..APP_MIPS as usize)
+        .map(|mip| {
+            let cell = APP_CELL >> mip;
+            let src = &sources[mip.min(sources.len() - 1)];
+            let mut level = match tile.as_ref() {
+                Some(t) => tile::bake(src, t, cell),
+                None if src.width() == cell && src.height() == cell => src.clone(),
+                None => image::imageops::resize(src, cell, cell, image::imageops::FilterType::Lanczos3),
+            };
+            for p in level.pixels_mut() {
+                let a = p.0[3] as u32;
+                for c in 0..3 {
+                    p.0[c] = ((p.0[c] as u32 * a + 127) / 255) as u8;
+                }
+            }
+            level
         })
         .collect()
 }
 
 /// Make an application icon ready for `Renderer::app_icon_insert`: the slow part (the tile, the mips), fit for another thread.
 pub fn bake_app_icon(img: &image::RgbaImage, tile: Option<TileStyle>) -> BakedIcon {
-    // the source is kept to bake the icon again when the tile style changes; the atlas cell is APP_CELL, so a bigger
-    // source would only waste memory
-    let source = if img.width() > APP_CELL || img.height() > APP_CELL { image::imageops::thumbnail(img, APP_CELL, APP_CELL) } else { img.clone() };
-    BakedIcon { tile, levels: bake_icon(img, tile), source }
+    bake_app_icon_levels(level_sources(img), tile)
+}
+
+/// Like `bake_app_icon`, from a picture for each level (`apps::load_icon_levels`: an SVG drawn at every size).
+pub fn bake_app_icon_levels(sources: Vec<image::RgbaImage>, tile: Option<TileStyle>) -> BakedIcon {
+    BakedIcon { tile, levels: bake_icon(&sources, tile), sources }
 }
 
 /// A client's pixels on the GPU (BGRA8).
@@ -672,6 +690,19 @@ struct Reveal {
     state: ([f32; 2], f32),
     fade: bool,
     rim: bool,
+}
+
+/// The pass that shrinks a supersampled frame onto the target (see `Renderer::set_supersample`).
+struct DownPipe {
+    pipeline: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+    ubuf: wgpu::Buffer,
+}
+
+/// The larger texture a supersampled frame is drawn into, and what binds it to the shrinking pass.
+struct DownTex {
+    view: wgpu::TextureView,
+    bind: wgpu::BindGroup,
 }
 
 /// GPU time of the passes of one frame (a debugging aid: `MEMRIUM_BENCH` in the headless backend).
@@ -743,7 +774,7 @@ pub struct Renderer {
     app_free: Vec<u32>,
     app_next: u32,
     /// the icons as loaded, kept so they can be set on tiles (or taken off them) when the style changes
-    app_sources: HashMap<String, image::RgbaImage>,
+    app_sources: HashMap<String, Vec<image::RgbaImage>>,
     icon_tile: Option<TileStyle>,
     text_fonts: TextFonts,
     text_atlas: wgpu::Texture,
@@ -764,6 +795,16 @@ pub struct Renderer {
     video: bool,
     /// the theme-switch transition in progress (see `begin_reveal`)
     reveal: Option<Reveal>,
+    /// the frame is drawn `ss` times larger each way (1 = off) and shrunk onto the target: smoother lines and text, and
+    /// programs are told the larger scale, so they draw sharper too
+    ss: f32,
+    /// the next frame goes to a target of the supersampled size as it is, not shrunk (a screenshot or a recording that keeps the detail)
+    pub hi_capture: bool,
+    /// the output in device pixels, and the interface scale before `ss` was applied
+    out_px: (u32, u32),
+    ui_scale: f32,
+    down_pipe: Option<DownPipe>,
+    down_tex: Option<DownTex>,
     started: std::time::Instant,
     glass_adapt: f32,
 }
@@ -984,6 +1025,12 @@ impl Renderer {
             live_audio: false,
             video: false,
             reveal: None,
+            ss: 1.0,
+            hi_capture: false,
+            out_px: (w, h),
+            ui_scale: scale,
+            down_pipe: None,
+            down_tex: None,
             started: std::time::Instant::now(),
             glass_adapt: 0.0,
         };
@@ -1145,7 +1192,7 @@ impl Renderer {
 
     /// Output size in device pixels.
     pub fn pixel_size(&self) -> (u32, u32) {
-        ((self.size[0] * self.scale).round() as u32, (self.size[1] * self.scale).round() as u32)
+        self.out_px
     }
 
     pub fn epoch(&self) -> u64 {
@@ -1298,15 +1345,122 @@ impl Renderer {
         self.touch();
     }
 
+    /// The output is `w` x `h` device pixels at interface scale `scale`. With supersampling on the frame is drawn into
+    /// textures `ss` times larger and the scale the shader works with is `ss` times larger too.
     pub fn resize(&mut self, w: u32, h: u32, scale: f32) {
         self.touch();
-        self.scale = scale;
+        self.out_px = (w, h);
+        self.ui_scale = scale;
+        let (iw, ih) = self.internal_px();
+        self.scale = scale * self.ss;
         self.size = [w as f32 / scale, h as f32 / scale];
-        self.wall = Self::make_tex(&self.device, w, h);
-        self.scene = Self::make_tex(&self.device, w, h);
+        self.wall = Self::make_tex(&self.device, iw, ih);
+        self.scene = Self::make_tex(&self.device, iw, ih);
+        self.make_down(iw, ih);
         self.generation += 1;
         self.rebuild_groups();
         self.bake_wallpaper();
+    }
+
+    /// The size frames are drawn at, in device pixels: the output's, times the supersampling.
+    fn internal_px(&self) -> (u32, u32) {
+        ((self.out_px.0 as f32 * self.ss).round() as u32, (self.out_px.1 as f32 * self.ss).round() as u32)
+    }
+
+    /// Draw frames `ss` times larger each way and shrink them onto the screen (1 = off). Clamped to what the graphics
+    /// card's textures can hold. Returns what was used.
+    pub fn set_supersample(&mut self, ss: f32) -> f32 {
+        let room = self.device.limits().max_texture_dimension_2d as f32 / self.out_px.0.max(self.out_px.1).max(1) as f32;
+        let ss = if ss.is_finite() { ss.clamp(1.0, 3.0).min(room.max(1.0)) } else { 1.0 };
+        let ss = if ss < 1.05 { 1.0 } else { ss };
+        if (ss - self.ss).abs() > 0.001 {
+            self.ss = ss;
+            let (w, h, scale) = (self.out_px.0, self.out_px.1, self.ui_scale);
+            self.resize(w, h, scale);
+        }
+        self.ss
+    }
+
+    pub fn supersample(&self) -> f32 {
+        self.ss
+    }
+
+    /// The size of a picture of the screen: the output's, or with `hi` the larger one the frame is drawn at.
+    pub fn capture_px(&self, hi: bool) -> (u32, u32) {
+        if hi { self.internal_px() } else { self.out_px }
+    }
+
+    /// The textures of a supersampled frame, and the pass that shrinks it (nothing when supersampling is off).
+    fn make_down(&mut self, iw: u32, ih: u32) {
+        if self.ss <= 1.0 {
+            self.down_tex = None;
+            return;
+        }
+        if self.down_pipe.is_none() {
+            let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("downscale"), source: wgpu::ShaderSource::Wgsl(include_str!("downscale.wgsl").into()) });
+            let bgl = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("downscale"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                    wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                    wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                ],
+            });
+            let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("downscale"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+            let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("downscale"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format: self.format, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            });
+            let ubuf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("downscale"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            self.down_pipe = Some(DownPipe { pipeline, bgl, ubuf });
+        }
+        let Some(p) = &self.down_pipe else { return };
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("supersampled frame"),
+            size: wgpu::Extent3d { width: iw.max(1), height: ih.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("downscale"),
+            layout: &p.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: p.ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        self.down_tex = Some(DownTex { view, bind });
+    }
+
+    /// Shrink the supersampled frame onto `target`.
+    fn downscale(&self, enc: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
+        let (Some(p), Some(t)) = (&self.down_pipe, &self.down_tex) else { return };
+        let (iw, ih) = self.internal_px();
+        let data: [f32; 4] = [iw as f32, ih as f32, self.ss, 0.0];
+        self.queue.write_buffer(&p.ubuf, 0, bytemuck::cast_slice(&data));
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("downscale"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: target, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&p.pipeline);
+        pass.set_bind_group(0, &t.bind, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     // ------------------------------------------------------------ client surfaces
@@ -1409,12 +1563,12 @@ impl Renderer {
         }
         // (a new cell is used by panels that are new themselves, so the frame's diff sees them: no full redraw)
         let id = self.take_cell()?;
-        self.upload_icon_cell(id, img, application);
+        let sources = level_sources(img);
+        self.write_icon_levels(id, &bake_icon(&sources, self.icon_tile.filter(|_| application)));
         if application {
-            // the source is kept to bake the icon again when the tile style changes; the atlas cell is APP_CELL, so a bigger
-            // source would only waste memory
-            let src = if img.width() > APP_CELL || img.height() > APP_CELL { image::imageops::thumbnail(img, APP_CELL, APP_CELL) } else { img.clone() };
-            self.app_sources.insert(key.to_string(), src);
+            // the sources are kept to bake the icon again when the tile style changes (at most a cell each: a bigger picture
+            // would only waste memory)
+            self.app_sources.insert(key.to_string(), sources);
         }
         self.app_cells.insert(key.to_string(), id);
         Some(id)
@@ -1422,7 +1576,7 @@ impl Renderer {
 
     /// Put the icon in atlas cell `id`, on its tile when tiles are on.
     fn upload_icon_cell(&self, id: u32, img: &image::RgbaImage, application: bool) {
-        let levels = bake_icon(img, self.icon_tile.filter(|_| application));
+        let levels = bake_icon(&level_sources(img), self.icon_tile.filter(|_| application));
         self.write_icon_levels(id, &levels);
     }
 
@@ -1442,7 +1596,7 @@ impl Renderer {
         }
         let Some(id) = self.take_cell() else { return true };
         self.write_icon_levels(id, &baked.levels);
-        self.app_sources.insert(key.to_string(), baked.source);
+        self.app_sources.insert(key.to_string(), baked.sources);
         self.app_cells.insert(key.to_string(), id);
         true
     }
@@ -1470,7 +1624,7 @@ impl Renderer {
         self.touch();
         for (key, &id) in &self.app_cells {
             if let Some(src) = self.app_sources.get(key) {
-                self.upload_icon_cell(id, src, true);
+                self.write_icon_levels(id, &bake_icon(src, tile));
             }
         }
     }
@@ -1723,6 +1877,19 @@ impl Renderer {
     /// rest of it must still hold the previous frame. The glass shell blurs and refracts what is behind it, so the part
     /// that is redone is wider than the damage by the most the glass can reach.
     pub fn render_damaged(&mut self, target: &wgpu::TextureView, items: &[Item], shell: &[Panel], damage: Option<[f32; 4]>) -> wgpu::CommandEncoder {
+        // supersampled: the frame is drawn into the larger texture (which keeps the last frame, so the damage rules hold
+        // for it) and the whole of it is shrunk onto the target
+        let Some(view) = self.down_tex.as_ref().map(|d| d.view.clone()) else { return self.render_into(target, items, shell, damage) };
+        if self.hi_capture {
+            return self.render_into(target, items, shell, None);
+        }
+        let mut enc = self.render_into(&view, items, shell, damage);
+        self.downscale(&mut enc, target);
+        self.last_region = None;
+        enc
+    }
+
+    fn render_into(&mut self, target: &wgpu::TextureView, items: &[Item], shell: &[Panel], damage: Option<[f32; 4]>) -> wgpu::CommandEncoder {
         let mut enc = self.device.create_command_encoder(&Default::default());
         self.stamp(&mut enc, 4);
         const REACH: f32 = 80.0;
@@ -2101,8 +2268,10 @@ impl Renderer {
             }
         }
         if let Some(r) = &self.reveal {
-            let (w, h) = self.pixel_size();
-            let data: [f32; 8] = [r.state.0[0], r.state.0[1], r.state.1, (2.0 * self.scale).max(1.5), w as f32, h as f32, if r.fade { 1.0 } else { 0.0 }, if r.rim { 1.0 } else { 0.0 }];
+            // (the reveal is told in output pixels; the frame may be drawn larger)
+            let (w, h) = self.internal_px();
+            let k = self.ss;
+            let data: [f32; 8] = [r.state.0[0] * k, r.state.0[1] * k, r.state.1 * k, (2.0 * self.scale).max(1.5), w as f32, h as f32, if r.fade { 1.0 } else { 0.0 }, if r.rim { 1.0 } else { 0.0 }];
             self.queue.write_buffer(&r.ubuf, 0, bytemuck::cast_slice(&data));
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("reveal"),

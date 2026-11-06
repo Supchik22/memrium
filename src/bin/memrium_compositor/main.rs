@@ -11,6 +11,10 @@ mod fileicons;
 mod headless;
 mod record;
 mod flyout;
+mod gestures;
+mod keygrab;
+mod livetext;
+mod voice;
 mod popup;
 mod appmenu_service;
 mod appmenu_wayland;
@@ -124,6 +128,9 @@ fn parse_args() -> Args {
 fn main() {
     // few allocator arenas: the threads that decode wallpapers and scan icons must not each keep what they freed
     chebrium::mem::tame_allocator();
+    // onnxruntime (the screen's Live Text reads with it) must be loaded before the threads start: later it was seen to
+    // hang in the dynamic loader
+    memrium_de::cutout::preload();
     let args = parse_args();
     if args.session {
         session::run(args);

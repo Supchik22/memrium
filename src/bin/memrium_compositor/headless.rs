@@ -155,6 +155,16 @@ pub fn run(mut args: Args) {
                         r.zoom_override = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
                     }
                 }
+                // `livetext`: the Copilot key (Live Text over the frozen screen); `selectall`: Ctrl+A in it
+                Some("livetext") => state.begin_live_text(),
+                Some("dictate") => state.toggle_dictation(),
+                Some("clipboard") => {
+                    let x = state.size[0] / 2.0;
+                    state.toggle_card(crate::popup::PopKind::Clipboard, None, x);
+                }
+                Some("selectall") => {
+                    state.live_text_key(true, smithay::input::keyboard::Keysym::a);
+                }
                 Some("rdown") => state.pointer_button(0x111, true),
                 Some("rup") => state.pointer_button(0x111, false),
                 Some("key") => {
@@ -214,6 +224,8 @@ pub fn run(mut args: Args) {
                         Some("alt") => 56,
                         Some("ctrl") => 29,
                         Some("shift") => 42,
+                        // the Copilot key's own code (KEY_F23), read through the real keymap
+                        Some("f23") => 193,
                         _ => 0,
                     };
                     if code != 0 {
@@ -269,7 +281,7 @@ pub fn run(mut args: Args) {
         state.flush_relative();
         if let (Some(at), false) = (files_at, files_opened) {
             if now_ms > at {
-                state.open_shell(crate::state::Sw::Files);
+                state.open_files(None);
                 files_opened = true;
             }
         }

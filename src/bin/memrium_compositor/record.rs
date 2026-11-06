@@ -1,7 +1,8 @@
 //! Recording a demo: the headless shell is stepped on a virtual clock (a fixed time per frame, so the video does not depend on how
 //! fast the machine renders), and every frame is written as two small pictures for the video editor: the whole screen, and a
 //! "camera" view that follows the pointer and comes closer when it stops. `MEMRIUM_RECORD=<dir>`, `MEMRIUM_RECORD_FPS=30`,
-//! `MEMRIUM_RECORD_SECS=40`, view size `MEMRIUM_RECORD_VIEW=1000x900`.
+//! `MEMRIUM_RECORD_SECS=40`, view size `MEMRIUM_RECORD_VIEW=1000x900`, `MEMRIUM_RECORD_NO_OVERVIEW=1` leaves out the
+//! whole-screen pictures.
 
 use image::imageops::{self, FilterType};
 use std::io::Write;
@@ -102,15 +103,18 @@ impl Recorder {
         let full = image::RgbaImage::from_raw(w, h, px).expect("frame size");
         let crop = imageops::crop_imm(&full, (rx * scale) as u32, (ry * scale) as u32, (rw * scale) as u32, (rh * scale) as u32).to_image();
         let view = imageops::resize(&crop, self.view.0, self.view.1, FilterType::Lanczos3);
-        let ov_w = 1000u32;
-        let ov = imageops::resize(&full, ov_w, ov_w * h / w, FilterType::Triangle);
+        // the overview (the whole screen, small) is only for a video editor's mini-map: `MEMRIUM_RECORD_NO_OVERVIEW=1` skips it
+        let overview = std::env::var_os("MEMRIUM_RECORD_NO_OVERVIEW").is_none();
+        let ov = overview.then(|| imageops::resize(&full, 1000, 1000 * h / w, FilterType::Triangle));
         let save = |img: &image::RgbaImage, name: String| {
             let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
             let mut f = std::fs::File::create(self.dir.join(name)).unwrap();
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, 93).encode_image(&rgb).unwrap();
         };
         save(&view, format!("v{:05}.jpg", self.frame));
-        save(&ov, format!("o{:05}.jpg", self.frame));
+        if let Some(ov) = &ov {
+            save(ov, format!("o{:05}.jpg", self.frame));
+        }
         // where the pointer is inside the camera view, and the view's place on the screen (shares of the screen)
         let (px_, py_) = ((mouse[0] - rx) / rw * self.view.0 as f32, (mouse[1] - ry) / rh * self.view.1 as f32);
         let _ = writeln!(self.log, "{{\"f\":{},\"mx\":{:.1},\"my\":{:.1},\"cx\":{:.4},\"cy\":{:.4},\"cw\":{:.4},\"ch\":{:.4},\"ox\":{:.4},\"oy\":{:.4},\"down\":{},\"click\":{},\"z\":{:.3},\"key\":{}}}", self.frame, px_, py_, rx / lw, ry / lh, rw / lw, rh / lh, mouse[0] / lw, mouse[1] / lh, self.down, self.clicked, self.z, self.keys.take().map_or("null".to_string(), |k| format!("\"{k}\"")));

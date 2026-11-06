@@ -34,6 +34,10 @@ struct Gfx {
     idle: bool,
     /// timers and the X server's sockets (XWayland)
     calloop: calloop::EventLoop<'static, State>,
+    /// the keyboard's shortcuts taken from the desktop around (Ctrl+Alt+G gives them back)
+    grab: Option<crate::keygrab::KeyGrab>,
+    /// the modifiers held, for Ctrl+Alt+G
+    ctrl_alt: (bool, bool),
 }
 
 impl Gfx {
@@ -55,8 +59,7 @@ pub fn apply_test_hooks(state: &mut State, args: &mut Args, socket: &str) {
         state.settings.set_page(page);
     }
     if let Some(dir) = &args.files {
-        state.open_shell(crate::state::Sw::Files);
-        state.files.goto(std::path::PathBuf::from(dir), true);
+        state.open_files(Some(std::path::Path::new(dir)));
     }
     if args.cc {
         state.scene.set_cc_open(true);
@@ -125,6 +128,12 @@ pub fn apply_test_hooks(state: &mut State, args: &mut Args, socket: &str) {
         state.swin.genie = true;
         state.swin.k.x = v.parse().unwrap_or(0.5);
         state.swin.k.target = state.swin.k.x;
+    }
+    // test hook: entries in the clipboard history, `MEMRIUM_TEST_CLIP="https://a.b||#ff8800||12*7+3"`
+    if let Ok(v) = std::env::var("MEMRIUM_TEST_CLIP") {
+        for t in v.split("||") {
+            state.clip_set_text(t.replace("\\n", "\n"));
+        }
     }
     match std::env::var("MEMRIUM_TEST_PANEL").as_deref() {
         Ok("edit") => state.panel_edit = Some(0),
@@ -261,7 +270,23 @@ impl ApplicationHandler for App {
         state.appmenu.start();
         state.start_xwayland(calloop.handle());
         window.request_redraw();
-        self.gfx = Some(Gfx { listener, state, display, surface, window, config, last: Instant::now(), shot: self.args.shot.take(), idle: false, calloop });
+        // take the keyboard's shortcuts from the desktop around, as a virtual machine does (MEMRIUM_NO_GRAB=1 does not)
+        let grab = if std::env::var_os("MEMRIUM_NO_GRAB").is_some() {
+            None
+        } else {
+            use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+            match (window.display_handle().map(|d| d.as_raw()), window.window_handle().map(|w| w.as_raw())) {
+                (Ok(RawDisplayHandle::Wayland(d)), Ok(RawWindowHandle::Wayland(w))) => match crate::keygrab::KeyGrab::new(d.display.as_ptr(), w.surface.as_ptr()) {
+                    Ok(g) => Some(g),
+                    Err(e) => {
+                        eprintln!("keyboard: the shortcuts stay with the desktop around ({e})");
+                        None
+                    }
+                },
+                _ => None,
+            }
+        };
+        self.gfx = Some(Gfx { listener, state, display, surface, window, config, last: Instant::now(), shot: self.args.shot.take(), idle: false, calloop, grab, ctrl_alt: (false, false) });
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
@@ -362,7 +387,28 @@ impl ApplicationHandler for App {
                 MouseScrollDelta::LineDelta(x, y) => g.state.pointer_axis(-x as f64 * 15.0, -y as f64 * 15.0),
                 MouseScrollDelta::PixelDelta(p) => g.state.pointer_axis(-p.x, -p.y),
             },
+            WindowEvent::ModifiersChanged(m) => {
+                g.ctrl_alt = (m.state().control_key(), m.state().alt_key());
+                // while Ctrl+Alt are held the desktop around has its shortcuts: Ctrl+Alt+F2 switches to a text console
+                // (only it can), Ctrl+Alt+Del works; let go and the nested shell has them again
+                if let Some(grab) = g.grab.as_mut() {
+                    grab.hold(g.ctrl_alt == (true, true));
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if !event.repeat => {
+                // Ctrl+Alt+G: the desktop around gets its shortcuts back (or loses them again); not passed on
+                if event.physical_key == PhysicalKey::Code(winit::keyboard::KeyCode::KeyG) && g.ctrl_alt == (true, true) {
+                    if event.state == ElementState::Pressed {
+                        if let Some(grab) = g.grab.as_mut() {
+                            let on = !grab.wanted;
+                            grab.wanted = on;
+                            grab.set(on);
+                            g.state.shot_notice = Some((if on { "Keyboard taken: Ctrl+Alt+G gives it back" } else { "Keyboard given back: Ctrl+Alt+G takes it" }.into(), 2.5));
+                            g.state.invalidate();
+                        }
+                    }
+                    return;
+                }
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if let Some(sc) = PhysicalKey::Code(code).to_scancode() {
                         g.state.key(sc, event.state == ElementState::Pressed);

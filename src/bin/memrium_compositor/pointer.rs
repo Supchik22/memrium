@@ -51,7 +51,7 @@ impl State {
     }
 
     fn open_window_count(&self) -> usize {
-        self.wins.iter().filter(|w| w.mapped && !w.or).count() + self.settings.open as usize + self.files.open as usize
+        self.wins.iter().filter(|w| w.mapped && !w.or).count() + self.settings.open as usize
     }
 
     /// The cursor the shell wants at the pointer, if it has an opinion (`None`: leave it to the client under it).

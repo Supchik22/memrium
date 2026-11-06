@@ -24,6 +24,9 @@ pub struct DisplayPrefs {
     pub side: Side,
     /// user interface scale for every monitor; 0 = choose from the main monitor's size
     pub scale: f32,
+    /// draw the desktop this many times larger each way and shrink it to the screen (1 = off, 1.5, 2): smoother lines and
+    /// text, and programs draw sharper. With a smaller interface size it also gives more room than the screen has pixels
+    pub supersample: f32,
     /// connectors that are switched off
     pub disabled: Vec<String>,
     /// chosen mode per connector, "1920x1080@60"; missing = the monitor's preferred mode
@@ -34,7 +37,7 @@ pub struct DisplayPrefs {
 
 impl Default for DisplayPrefs {
     fn default() -> Self {
-        DisplayPrefs { primary: String::new(), side: Side::Left, scale: 0.0, disabled: Vec::new(), modes: BTreeMap::new(), order: Vec::new() }
+        DisplayPrefs { primary: String::new(), side: Side::Left, scale: 0.0, supersample: 1.0, disabled: Vec::new(), modes: BTreeMap::new(), order: Vec::new() }
     }
 }
 

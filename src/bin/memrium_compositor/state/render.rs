@@ -57,6 +57,31 @@ impl State {
             memrium_de::renderer::shift_scene(&mut items, &mut shell, off[0], off[1]);
             return Some(self.renderer.render(&target, &items, &shell));
         }
+        if self.live_shot.is_some() {
+            // Live Text: the frozen screen, its lines lit, nothing live
+            let mut shell = Vec::new();
+            self.live_text_panels(&mut shell);
+            let [fx0, fy0, fx1, fy1] = self.world;
+            let rect = [fx0, fy0, fx1 - fx0, fy1 - fy0];
+            let tex = &self.live_shot.as_ref().unwrap().tex;
+            let mut items = vec![Item::Surface { tex, rect, clip: None, frosted: false, alpha: 1.0, veil: 1.0 }];
+            let hash = self.frame_hash(&shell, &items);
+            self.frame_skipped = self.allow_skip && hash == self.last_hash;
+            self.last_hash = hash;
+            if self.frame_skipped {
+                return None;
+            }
+            self.frames_drawn += 1;
+            let Some(target) = target() else {
+                self.last_hash = 0;
+                self.damage.reset();
+                return None;
+            };
+            self.damage.reset();
+            let off = self.canvas_off();
+            memrium_de::renderer::shift_scene(&mut items, &mut shell, off[0], off[1]);
+            return Some(self.renderer.render(&target, &items, &shell));
+        }
         if self.shot_sel.is_some() && self.shot_freeze.is_some() {
             // the picker shows the frozen picture and its dimming, nothing live
             let mut shell = Vec::new();
@@ -117,6 +142,8 @@ impl State {
         self.widgets_panels(&mut shell, &mut toast_labels);
         self.flyout_panels(&mut shell, &mut toast_labels);
         self.card_panels(&mut shell, &mut toast_labels);
+        self.gesture_panels(&mut shell);
+        self.voice_panels(&mut shell);
         labels.extend(toast_labels);
         shell.extend(self.renderer.label_panels(&labels));
         if let Some(d) = self.file_drag.as_ref().filter(|d| d.active) {

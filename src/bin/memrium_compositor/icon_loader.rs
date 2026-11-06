@@ -4,7 +4,7 @@
 //! pictures into the atlas (`State::pump_icons`).
 
 use memrium_de::apps::{IconIndex, IconSlot};
-use memrium_de::renderer::{bake_app_icon, BakedIcon, TileStyle};
+use memrium_de::renderer::{bake_app_icon_levels, BakedIcon, TileStyle};
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     mpsc::{channel, Receiver, Sender},
@@ -83,7 +83,7 @@ impl IconLoader {
                         },
                     };
                     let path = index.find(&job.icon, 128);
-                    let icon = path.as_deref().and_then(|p| memrium_de::apps::load_icon_file(p, 128)).map(|img| bake_app_icon(&img, job.tile));
+                    let icon = path.as_deref().and_then(memrium_de::apps::load_icon_levels).map(|levels| bake_app_icon_levels(levels, job.tile));
                     let live = job.pack.is_none() && path.as_deref().is_some_and(memrium_de::apps::is_live_icon);
                     if done_tx.send(Done { id: job.id, icon, live }).is_err() {
                         return;

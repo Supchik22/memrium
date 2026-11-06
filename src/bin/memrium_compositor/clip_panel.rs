@@ -179,9 +179,36 @@ impl State {
                     tr[0] + tr[2] + 14.0
                 }
                 ClipData::Text(t) => {
-                    let lines = flat(ui, t, 12.5, inner - 28.0 - if hov { 52.0 } else { 0.0 }, 3);
+                    // what the text is (a link, a colour, a sum...): a badge and its action under the text
+                    let kind = memrium_de::smartclip::classify(t);
+                    let smart = kind != memrium_de::smartclip::Kind::Plain;
+                    let lines = flat(ui, t, 12.5, inner - 28.0 - if hov { 52.0 } else { 0.0 }, if smart { 2 } else { 3 });
                     for (i, l) in lines.iter().enumerate() {
                         ui.text_raw(r[0] + 14.0, r[1] + 22.0 + i as f32 * 16.5, l, 12.5, false, ink, 0.92, Align::Left);
+                    }
+                    if smart {
+                        let by = r[1] + r[3] - 22.0;
+                        let mut bx = r[0] + 14.0;
+                        if let memrium_de::smartclip::Kind::Colour(c, _) = &kind {
+                            ui.fill([bx, by + 2.0, 14.0, 14.0], 7.0, *c, 1.0);
+                            bx += 20.0;
+                        } else {
+                            ui.glyph(bx + 6.0, by + 9.0, 12.0, kind.icon(), accent, 0.95);
+                            bx += 18.0;
+                        }
+                        ui.text_raw(bx, by + 13.0, kind.name(), 11.0, true, accent, 0.95, Align::Left);
+                        bx += ui.measure(kind.name(), 11.0, true) + 10.0;
+                        if let Some((label, action)) = kind.action(t) {
+                            let cw = ui.measure(&label, 11.0, true) + 18.0;
+                            let chip = [bx, by, cw, 18.0];
+                            let on = hov && ui.hit(chip);
+                            ui.fill(chip, 9.0, accent, if on { 0.32 } else { 0.18 });
+                            ui.text_raw(chip[0] + cw / 2.0, by + 13.0, &label, 11.0, true, ink, 0.95, Align::Center);
+                            if on && ui.click {
+                                acts.push(Act::ClipSmart(action));
+                                continue;
+                            }
+                        }
                     }
                     r[0] + 14.0
                 }

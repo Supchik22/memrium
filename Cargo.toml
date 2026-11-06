@@ -37,6 +37,8 @@ pipewire = "0.9"
 # the image viewer's object cut-out and text recognition (MobileSAM, PP-OCRv5): onnxruntime when it is installed
 # (loaded at run time), tract as the built-in fallback
 tract-onnx = "0.21"
+rqrr = { version = "0.11", default-features = false }
+wayland-backend = { version = "0.3", features = ["client_system"] }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "std", "api-22"] }
 # fast, well-mixed hasher for the per-frame change detection
 foldhash = "0.1"

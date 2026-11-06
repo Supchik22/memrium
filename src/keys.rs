@@ -12,6 +12,9 @@ pub const ACTIONS: &[(&str, &str, &str)] = &[
     ("launcher", "Open launcher (Launchpad, start menu)", "Alt+Space"),
     ("menu-search", "Search the program's menus", "Alt+Slash"),
     ("lock", "Lock screen", "Super+L"),
+    ("gestures", "Turn hand gestures (camera) on or off", "Super+Shift+G"),
+    ("live-text", "Read and copy the text on the screen (Copilot key)", "Super+Shift+F23"),
+    ("dictate", "Dictate into the text field (voice typing)", "Super+H"),
     ("settings", "Open Settings", "Super+Comma"),
     ("fps-overlay", "Show the frame rate (debug)", "Ctrl+Alt+F"),
     ("wallpaper", "Change wallpaper", "Super+Shift+D"),
@@ -60,15 +63,17 @@ pub struct KeyBinds {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SuperLabel {
-    /// ⌘
+    /// ◆ (ours)
     #[default]
+    Diamond,
+    /// ⌘
     Command,
     Windows,
     Super,
     Custom,
 }
 
-pub const SUPER_LABELS: [(SuperLabel, &str); 4] = [(SuperLabel::Command, "⌘"), (SuperLabel::Windows, "Win"), (SuperLabel::Super, "Super"), (SuperLabel::Custom, "Custom")];
+pub const SUPER_LABELS: [(SuperLabel, &str); 5] = [(SuperLabel::Diamond, "◆"), (SuperLabel::Command, "⌘"), (SuperLabel::Windows, "Win"), (SuperLabel::Super, "Super"), (SuperLabel::Custom, "Custom")];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -82,7 +87,7 @@ pub struct KeyStyle {
 
 impl KeyStyle {
     /// A shortcut (`Ctrl+Alt+T`, `Super+E`) as this style writes it. The modifiers that are one symbol each run together
-    /// (`⌃⌥T`, `⌘E`); anything else is joined with a plus.
+    /// (`⌃⌥T`, `◆E`); anything else is joined with a plus.
     pub fn show(&self, chord: &str) -> String {
         let mut mods: Vec<String> = Vec::new();
         let mut key = String::new();
@@ -94,6 +99,7 @@ impl KeyStyle {
                 "alt" | "option" if !last => Some(if self.symbols { "⌥".to_string() } else { "Alt".into() }),
                 "shift" if !last => Some(if self.symbols { "⇧".to_string() } else { "Shift".into() }),
                 "super" | "win" | "logo" | "meta" | "cmd" | "command" if !last => Some(match self.super_label {
+                    SuperLabel::Diamond => "◆".to_string(),
                     SuperLabel::Command => "⌘".to_string(),
                     SuperLabel::Windows => "Win".into(),
                     SuperLabel::Super => "Super".into(),
@@ -236,9 +242,12 @@ mod style_tests {
     #[test]
     fn super_and_symbols_are_written_as_chosen() {
         let mut s = KeyStyle::default();
-        assert_eq!(s.show("Super+E"), "⌘E");
+        assert_eq!(s.show("Super+E"), "◆E");
         assert_eq!(s.show("Ctrl+Alt+T"), "Ctrl+Alt+T");
-        assert_eq!(s.show("Super+Up"), "⌘Up");
+        assert_eq!(s.show("Super+Up"), "◆Up");
+        s.super_label = SuperLabel::Command;
+        assert_eq!(s.show("Super+E"), "⌘E");
+        s.super_label = SuperLabel::Diamond;
         assert_eq!(s.show("Print"), "Print");
         s.super_label = SuperLabel::Windows;
         assert_eq!(s.show("Super+E"), "Win+E");
@@ -250,6 +259,9 @@ mod style_tests {
         assert_eq!(s.show("Ctrl+Alt+T"), "⌃⌥T");
         assert_eq!(s.show("Ctrl+Shift+D"), "⌃⇧D");
         assert_eq!(s.show("Super+Shift+Up"), "⌘⇧Up");
+        s.super_label = SuperLabel::Diamond;
+        assert_eq!(s.show("Super+Shift+Up"), "◆⇧Up");
+        s.super_label = SuperLabel::Command;
         assert_eq!(s.show("Alt+Tab"), "⌥Tab");
         assert_eq!(s.show("Ctrl+Space"), "⌃␣");
         s.symbols = false;

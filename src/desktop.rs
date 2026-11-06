@@ -431,7 +431,7 @@ impl Desktop {
         } else {
             v.push(MenuItem::new(TRASH, "Move to Trash").icon("trash-2").key("Delete").danger());
         }
-        if let Some(m) = fsops::convert_menu(&self.selected_paths(), CONVERT_BASE) {
+        if let Some(m) = fsops::quick_edit_menu(&self.selected_paths(), CONVERT_BASE) {
             v.push(m);
         }
         if one && crate::archive::is_archive(&sel[0].path) {
@@ -570,6 +570,11 @@ impl Desktop {
                 let mut args = vec![if id == EXTRACT_HERE { "--extract" } else { "--compress" }.to_string()];
                 args.extend(self.selected_paths().iter().map(|p| p.to_string_lossy().to_string()));
                 ev.push(FilesEvent::Own("memrium_archive", args));
+            }
+            ROTATE_LEFT | ROTATE_RIGHT => {
+                fm.note = fsops::rotate_all(&self.selected_paths(), id == ROTATE_RIGHT);
+                fm.gen += 1;
+                self.reload();
             }
             id if (CONVERT_BASE..CONVERT_BASE + fsops::CONVERT_TO.len() as u32).contains(&id) => {
                 fm.note = fsops::convert_all(&self.selected_paths(), fsops::CONVERT_TO[(id - CONVERT_BASE) as usize].1);

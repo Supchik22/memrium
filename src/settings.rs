@@ -47,9 +47,10 @@ enum Page {
     Network,
     Power,
     Programs,
+    Privacy,
 }
 
-const PAGES: [(Page, &str, &str); 21] = [
+const PAGES: [(Page, &str, &str); 22] = [
     (Page::General, "General", "settings"),
     (Page::Themes, "Themes", "layers"),
     (Page::Displays, "Displays", "monitor"),
@@ -71,6 +72,7 @@ const PAGES: [(Page, &str, &str); 21] = [
     (Page::Network, "Network", "wifi"),
     (Page::Power, "Power & Battery", "battery-full"),
     (Page::Programs, "Programs", "layout-panel-left"),
+    (Page::Privacy, "Privacy", "shield-check"),
 ];
 
 /// The colour a settings page has when the accent is several: blue for the look of things, and its own for the rest.
@@ -93,6 +95,7 @@ fn page_tone(page: Page) -> chebrium::style::Tone {
         Page::Network => Primary,
         Page::Power => Success,
         Page::Programs => Indigo,
+        Page::Privacy => Success,
         Page::General => Grey,
         Page::Displays => Info,
         Page::Mouse => Grey,
@@ -132,6 +135,8 @@ pub enum SettingsAction {
     TestNotification,
     /// show the volume indicator, to see how it looks
     TestOsd,
+    /// play a gesture's reaction on the desktop without the camera ("like", "dislike", "peace")
+    TestGesture(&'static str),
     Close,
 }
 
@@ -162,6 +167,8 @@ pub struct SettingsCtx<'a> {
     pub want_icons: &'a mut Vec<String>,
     /// the names of the icons of the icon pack in use (for a widget's icon picker); empty until the index is built
     pub icon_names: &'a [String],
+    /// what the gesture service says about the camera ("" while it is off)
+    pub camera_status: &'a str,
 }
 
 pub struct Settings {
@@ -395,7 +402,7 @@ impl Settings {
             ("DESKTOP", &[Page::Layout, Page::Panels, Page::Notifications, Page::Osd, Page::DateTime]),
             ("WINDOWS", &[Page::Windows, Page::Animations]),
             ("DEVICES", &[Page::Displays, Page::Sound, Page::Network, Page::Power, Page::Mouse, Page::Keys]),
-            ("SYSTEM", &[Page::General, Page::About]),
+            ("SYSTEM", &[Page::Privacy, Page::General, Page::About]),
         ];
         let mut rows: Vec<(Option<&str>, Option<&(Page, &str, &str)>)> = Vec::new();
         if needle.is_empty() {
@@ -532,6 +539,7 @@ impl Settings {
             Page::Sound => more::page_sound(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions),
             Page::Network => more::page_network(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions),
             Page::Power => more::page_power(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions),
+            Page::Privacy => more::page_privacy(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions),
             Page::Programs => more::page_programs(&mut ui, ctx, cx0, py - 26.0, cw, &mut self.rules, &mut self.rule_name),
             Page::Mouse => general::page_mouse(&mut ui, ctx, cx0, py - 26.0, cw),
             Page::Glass => glass_prev = Some(page_glass(&mut ui, ctx, cx0, py - 26.0, cw, &mut self.glass_target)),
@@ -1583,6 +1591,7 @@ fn page_keywords(page: Page) -> &'static str {
         Page::About => "version info credits",
         Page::Notifications => "notification toast do not disturb dnd corner position time",
         Page::Osd => "osd on-screen indicator volume brightness keys bar pill popup hud media",
+        Page::Privacy => "privacy camera gestures hand thumbs up like peace reactions effects confetti indicator dot permission microphone",
         Page::DateTime => "clock time date 24 hour seconds calendar week monday sunday format",
         Page::Sound => "volume mute speaker output sound effects audio",
         Page::Network => "wifi wi-fi wireless bluetooth internet connection",

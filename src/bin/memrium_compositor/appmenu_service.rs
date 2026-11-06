@@ -244,7 +244,6 @@ impl crate::state::State {
         let shell = self.focused_shell();
         let target = self.menu_target();
         let name = match shell {
-            Some(crate::state::Sw::Files) => Some("Files".to_string()),
             Some(crate::state::Sw::Settings) => Some("Settings".to_string()),
             None => self.front_window().map(|w| w.title.clone()).filter(|t| !t.is_empty()),
         };
@@ -334,8 +333,7 @@ impl crate::state::State {
     pub fn appmenu_update(&mut self) {
         let asked: Vec<_> = self.appmenu.folder_requests.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
         for path in asked {
-            self.open_shell(crate::state::Sw::Files);
-            self.files.show(&path);
+            self.open_files(Some(&path));
             self.invalidate();
         }
         if self.appmenu.bridge.take_dirty() {

@@ -115,7 +115,6 @@ smithay::delegate_foreign_toplevel_list!(State);
 fn shell_key(k: Sw) -> u8 {
     match k {
         Sw::Settings => 0,
-        Sw::Files => 1,
     }
 }
 
@@ -153,7 +152,7 @@ impl State {
                 }
             }
         }
-        for (k, title, app_id) in [(Sw::Settings, "Settings", "memrium_settings"), (Sw::Files, "Files", "memrium_files")] {
+        for (k, title, app_id) in [(Sw::Settings, "Settings", "memrium_settings")] {
             let open = self.is_open(k);
             let key = shell_key(k);
             match (open, self.ext.shell.contains_key(&key)) {

@@ -49,6 +49,8 @@ pub enum Act {
     ClipPin(u64),
     ClipDelete(u64),
     ClipClear,
+    /// the smart clipboard's action for an entry (open what it names, or copy a form of it)
+    ClipSmart(memrium_de::smartclip::Action),
     /// run `bluetoothctl` with these arguments (connect, disconnect, remove, power, scan)
     Bluetooth(Vec<String>),
     /// pair with a device, trust it and connect
@@ -285,6 +287,20 @@ impl State {
                 });
             }
             Act::ClipClear => self.clipboard.clear(),
+            Act::ClipSmart(a) => {
+                self.close_card();
+                match a {
+                    memrium_de::smartclip::Action::Open(target) => {
+                        let mut c = std::process::Command::new("xdg-open");
+                        c.arg(&target).env("WAYLAND_DISPLAY", &self.socket).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                        let _ = c.spawn();
+                    }
+                    memrium_de::smartclip::Action::Copy(text) => {
+                        self.clip_set_text(text);
+                        self.shot_notice = Some(("Copied".into(), 1.5));
+                    }
+                }
+            }
             Act::NotifClear => self.notifications.clear(),
             Act::ToggleDnd => {
                 self.config.notifications.dnd = !self.config.notifications.dnd;
