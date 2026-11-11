@@ -25,7 +25,8 @@ pub const SETTINGS_ID: &str = "memrium-settings";
 /// Id of the file manager program.
 pub const FILES_ID: &str = "memrium-files";
 
-fn data_dirs() -> Vec<PathBuf> {
+/// The XDG data directories, the one that wins first (the user's own, then the system's, then Nix and Flatpak ones).
+pub fn data_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let home = std::env::var("HOME").unwrap_or_default();
     dirs.push(std::env::var("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(&home).join(".local/share")));
@@ -162,7 +163,7 @@ pub fn scan() -> Vec<AppEntry> {
 
 /// The programs of the desktop that ship beside it and have no desktop file: (executable, id, name, kind of program,
 /// icon, search words, categories). Each is listed when its executable is there.
-const OWN: [(&str, &str, &str, &str, &str, &str, &[&str]); 9] = [
+const OWN: [(&str, &str, &str, &str, &str, &str, &[&str]); 11] = [
     ("memrium_files", "memrium-files", "Files", "File Manager", "system-file-manager", "folder browse explorer finder dolphin documents downloads", &["Utility", "FileManager"]),
     ("memrium_calc", "memrium-calc", "Memrium Calculator", "Calculator", "accessories-calculator", "calc math sum arithmetic numbers", &["Utility", "Calculator"]),
     ("memrium_player", "memrium-player", "Memrium Player", "Media Player", "multimedia-video-player", "video audio music movie mpv film", &["AudioVideo", "Player"]),
@@ -172,6 +173,8 @@ const OWN: [(&str, &str, &str, &str, &str, &str, &[&str]); 9] = [
     ("memrium_monitor", "memrium-monitor", "Memrium Monitor", "System Monitor", "utilities-system-monitor", "processes tasks cpu memory ram kill task manager top htop resources network", &["System", "Monitor"]),
     ("memrium_icons", "memrium-icons", "Memrium Icons", "Icon Composer", "preferences-desktop-icons", "icon icons composer glass vector draw svg shapes editor inkscape design theme", &["Graphics", "Utility"]),
     ("memrium_view", "memrium-view", "Memrium Pictures", "Image Viewer", "image-viewer", "photo image picture gallery view png jpeg", &["Graphics", "Viewer"]),
+    ("memrium_packages", "memrium-packages", "Memrium Packages", "Package Browser", "system-software-install", "packages nix nixpkgs software install store apps programs search browse", &["System", "PackageManager"]),
+    ("memrium_maps", "memrium-maps", "Memrium Maps", "Maps", "org.gnome.Maps", "map maps openstreetmap osm 3d buildings navigation location place search street city", &["Utility", "Maps"]),
 ];
 
 fn own_apps() -> Vec<AppEntry> {
@@ -430,6 +433,10 @@ pub struct IconIndex {
     names: std::sync::OnceLock<Vec<String>>,
     /// the folders of the themes, the one that counts most first: a file of an earlier theme beats any of a later one
     order: Vec<PathBuf>,
+    /// each folder of `order` and its place in it, made when first asked for: a file's rank is found by looking its
+    /// own folders up (a few lookups) instead of trying every theme folder (thousands, when every installed theme
+    /// is in the chain)
+    ranks: std::sync::OnceLock<HashMap<PathBuf, usize>>,
 }
 
 fn icon_dirs() -> Vec<PathBuf> {
@@ -600,7 +607,7 @@ impl IconIndex {
                 walk_filtered(&theme, 0, &mut files);
             }
         }
-        IconIndex { files, order, names: Default::default() }
+        IconIndex { files, order, names: Default::default(), ranks: Default::default() }
     }
 
     /// Every icon of one pack in every category (apps, places, mimetypes, actions, devices...), for the icon composer, which can
@@ -611,7 +618,7 @@ impl IconIndex {
         for theme in &order {
             walk_all(theme, 0, &mut files);
         }
-        IconIndex { files, order, names: Default::default() }
+        IconIndex { files, order, names: Default::default(), ranks: Default::default() }
     }
 
     /// The small icons of actions and states ("actions", "status": document-open, edit-copy...) that menus show beside their
@@ -627,7 +634,7 @@ impl IconIndex {
                 walk_cats(&base.join(t), 0, false, &["actions", "status"], &mut files);
             }
         }
-        IconIndex { files, order: Vec::new(), names: Default::default() }
+        IconIndex { files, order: Vec::new(), names: Default::default(), ranks: Default::default() }
     }
 
     /// Folder and file-type icons ("places" / "mimetypes") from the installed icon themes.
@@ -642,7 +649,7 @@ impl IconIndex {
                 walk_mime(&base.join(t), 0, false, &mut files);
             }
         }
-        IconIndex { files, order: Vec::new(), names: Default::default() }
+        IconIndex { files, order: Vec::new(), names: Default::default(), ranks: Default::default() }
     }
 
     /// Every icon name of the index, sorted (the picker for a widget's icon lists them).
@@ -654,6 +661,11 @@ impl IconIndex {
         })
     }
 
+    /// Whether a theme (not the loose pictures of `pixmaps`) has an icon of this name: a quick look, no file is picked.
+    pub fn has_themed(&self, name: &str) -> bool {
+        self.files.get(name).is_some_and(|l| l.iter().any(|(_, p)| !p.to_string_lossy().contains("/pixmaps")))
+    }
+
     /// Best file for an icon name at roughly `px` pixels (an absolute path also works).
     pub fn find(&self, name: &str, px: u32) -> Option<PathBuf> {
         if name.starts_with('/') {
@@ -662,11 +674,21 @@ impl IconIndex {
         }
         let list = self.files.get(name)?;
         // the earliest theme that has the icon decides (our own theme is not beaten by the SVG of the pack it inherits)
-        let rank = |p: &Path| self.order.iter().position(|t| p.starts_with(t)).unwrap_or(usize::MAX);
-        let best = list.iter().map(|(_, p)| rank(p)).min()?;
+        let ranks = self.ranks.get_or_init(|| {
+            let mut m = HashMap::with_capacity(self.order.len());
+            for (i, t) in self.order.iter().enumerate() {
+                m.entry(t.clone()).or_insert(i);
+            }
+            m
+        });
+        let rank = |p: &Path| p.ancestors().skip(1).filter_map(|a| ranks.get(a)).min().copied().unwrap_or(usize::MAX);
+        let ranked: Vec<usize> = list.iter().map(|(_, p)| rank(p)).collect();
+        let best = *ranked.iter().min()?;
         // then: prefer sizes >= px (smallest such), else the largest; svg counts as "any size"
         list.iter()
-            .filter(|(_, p)| rank(p) == best)
+            .zip(&ranked)
+            .filter(|(_, r)| **r == best)
+            .map(|(e, _)| e)
             .min_by_key(|(s, p)| {
                 let svg = p.extension().and_then(|e| e.to_str()) == Some("svg");
                 if svg {
@@ -864,12 +886,30 @@ mod launch_tests {
     fn a_theme_that_comes_first_beats_the_svg_of_one_that_comes_later() {
         let mut files = HashMap::new();
         files.insert("app".to_string(), vec![(128, PathBuf::from("/t/own/128x128/apps/app.png")), (512, PathBuf::from("/t/pack/scalable/apps/app.svg"))]);
-        let index = IconIndex { files, order: vec![PathBuf::from("/t/own"), PathBuf::from("/t/pack")], names: Default::default() };
+        let index = IconIndex { files, order: vec![PathBuf::from("/t/own"), PathBuf::from("/t/pack")], names: Default::default(), ranks: Default::default() };
         assert_eq!(index.find("app", 128), Some(PathBuf::from("/t/own/128x128/apps/app.png")), "the chosen theme wins");
         // with no order (the action and file-type indexes) the old rule stays: a vector picture beats a bitmap
         let mut files = HashMap::new();
         files.insert("app".to_string(), vec![(128, PathBuf::from("/a/app.png")), (512, PathBuf::from("/b/app.svg"))]);
-        let any = IconIndex { files, order: Vec::new(), names: Default::default() };
+        let any = IconIndex { files, order: Vec::new(), names: Default::default(), ranks: Default::default() };
         assert_eq!(any.find("app", 128), Some(PathBuf::from("/b/app.svg")));
+    }
+}
+
+#[cfg(test)]
+mod find_speed {
+    /// How long a found icon takes to pick (`cargo test --release --lib find_speed -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn picking_a_found_icon_is_quick() {
+        let t = std::time::Instant::now();
+        let index = super::IconIndex::build();
+        println!("built in {:?}: {} names, {} theme folders", t.elapsed(), index.files.len(), index.order.len());
+        for name in ["firefox", "obs", "gimp", "steam", "org.kde.dolphin", "utilities-terminal"] {
+            let n = index.files.get(name).map_or(0, Vec::len);
+            let t = std::time::Instant::now();
+            let found = index.find(name, 128);
+            println!("{name}: {n} files, {:?} -> {:?}", t.elapsed(), found);
+        }
     }
 }

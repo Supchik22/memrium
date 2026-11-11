@@ -46,11 +46,14 @@ pub struct PrivacyPrefs {
     pub peace: bool,
     /// a dot at the top of the screen while the camera is in use
     pub indicator: bool,
+    /// search by meaning: pictures, screenshots and documents are indexed (models fetched, an indexer run on mains
+    /// power while idle); off until the user turns it on (see `semsearch`)
+    pub semantic_search: bool,
 }
 
 impl Default for PrivacyPrefs {
     fn default() -> Self {
-        PrivacyPrefs { gestures: false, like: true, dislike: true, peace: true, indicator: true }
+        PrivacyPrefs { gestures: false, like: true, dislike: true, peace: true, indicator: true, semantic_search: false }
     }
 }
 

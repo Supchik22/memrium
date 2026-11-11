@@ -390,4 +390,21 @@ pub(super) fn page_privacy(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, c
     f.toggle(ui, "Show a dot while the camera is in use", &mut p.indicator);
     rule(ui, x, top + 56.0, cw);
     f.note(ui, "A small camera mark at the top of the screen, so it is never on without you seeing it.", true);
+
+    let top = card(ui, x, top + 112.0 + 26.0, cw, "SEARCH BY MEANING", 220.0);
+    let mut f = Form::new(x + 16.0, top + 32.0, cw - 32.0, 46.0);
+    f.toggle(ui, "Find pictures and files by what is in them", &mut p.semantic_search);
+    rule(ui, x, top + 56.0, cw);
+    f.note(ui, "Super+S then finds \"cat on a sofa\" in photos, and words in screenshots and documents.", true);
+    f.note(ui, "Pictures, Documents, Desktop and Downloads are indexed here, plugged in and idle only.", true);
+    f.note(ui, "Nothing leaves this computer. The models are downloaded once (about 225 MB).", true);
+    let line = if p.semantic_search {
+        if ctx.search_status.is_empty() { "Starting…".to_string() } else { ctx.search_status.to_string() }
+    } else {
+        "Off".to_string()
+    };
+    f.note(ui, &line, false);
+    if !p.semantic_search && crate::semsearch::index_path().exists() && ui.button([x + 16.0, f.y - 6.0, 160.0, 32.0], "Delete the index", false) {
+        actions.push(SettingsAction::ForgetSearchIndex);
+    }
 }

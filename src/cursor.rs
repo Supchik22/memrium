@@ -270,6 +270,10 @@ pub struct CursorPrefs {
     pub launch_height: f32,
     /// how fast it moves, times the usual pace (0.25 .. 3)
     pub launch_speed: f32,
+    /// a change of shape is animated (see [`Morph`]) instead of swapping the picture at once
+    pub morph: bool,
+    /// how fast that change runs, times the usual pace (0.5 .. 2)
+    pub morph_speed: f32,
 }
 
 impl Default for CursorPrefs {
@@ -300,6 +304,8 @@ impl Default for CursorPrefs {
             launch_anim: LaunchAnim::Bounce,
             launch_height: 10.0,
             launch_speed: 1.0,
+            morph: true,
+            morph_speed: 1.0,
         }
     }
 }
@@ -313,6 +319,7 @@ impl CursorPrefs {
 }
 
 /// A drawn cursor: premultiplied ARGB pixels, `size` x `size`, and where the pointer's point is inside it.
+#[derive(Clone, Debug, PartialEq)]
 pub struct CursorImage {
     pub size: u32,
     pub hot: (i32, i32),
@@ -593,6 +600,30 @@ fn hsv(h: f32, sat: f32, val: f32) -> [f32; 3] {
     }
 }
 
+/// A hand as six rounded boxes (x, y, width, height, corner radius) in the design box: four fingers (index first), the
+/// palm and the thumb; and the pointer's point. The same layout for every hand, so that one can be blended into another
+/// (see [`Morph`]). The pointing hand's little finger has no width: it is folded away inside the palm.
+type Hand = ([[f32; 5]; 6], (f32, f32));
+
+const HAND_POINTER: Hand = (
+    [[10.0, 3.0, 4.6, 15.0, 2.3], [14.0, 11.5, 4.2, 8.0, 2.1], [18.0, 12.0, 4.2, 8.0, 2.1], [17.5, 17.0, 0.0, 5.0, 0.0], [7.0, 13.0, 18.0, 13.5, 5.5], [4.5, 15.0, 4.6, 8.5, 2.3]],
+    (12.0, 3.0),
+);
+/// (`hot` is the middle of the design box, as for the other centred shapes)
+const HAND_GRAB: Hand = (
+    [[8.0, 7.0, 4.0, 14.0, 2.0], [12.4, 4.5, 4.0, 14.0, 2.0], [16.8, 5.0, 4.0, 14.0, 2.0], [21.2, 8.0, 4.0, 14.0, 2.0], [7.0, 13.0, 18.5, 13.5, 6.0], [3.5, 14.5, 5.0, 8.5, 2.5]],
+    (16.0, 16.0),
+);
+const HAND_GRABBING: Hand = (
+    [[8.0, 10.5, 4.0, 9.0, 2.0], [12.4, 10.5, 4.0, 9.0, 2.0], [16.8, 10.5, 4.0, 9.0, 2.0], [21.2, 10.5, 4.0, 9.0, 2.0], [7.0, 14.0, 18.5, 12.5, 6.0], [4.0, 15.0, 5.0, 7.0, 2.5]],
+    (16.0, 16.0),
+);
+
+/// The filled pieces of a hand (boxes thinner than half a unit are left out: a finger folded away, or one unfolding).
+fn hand_pieces(boxes: &[[f32; 5]; 6]) -> Vec<Piece> {
+    boxes.iter().filter(|b| b[2] >= 0.5 && b[3] >= 0.5).filter_map(|b| rrect(b[0], b[1], b[2], b[3], b[4].max(0.0)).map(Piece::Fill)).collect()
+}
+
 /// The pieces of a shape in the 32 x 32 design box, the pointer's point, and the angle (degrees) to turn it by.
 fn pieces(shape: Shape, phase: f32, prefs: &CursorPrefs) -> (Vec<Piece>, (f32, f32), f32) {
     let arrow = prefs.arrow;
@@ -628,26 +659,16 @@ fn pieces(shape: Shape, phase: f32, prefs: &CursorPrefs) -> (Vec<Piece>, (f32, f
             v.extend(poly(&arrow_points(arrow, 1.0, 0.0, 0.0)).map(Piece::Fill));
         }
         Shape::Pointer => {
-            hot = (12.0, 3.0);
-            v.extend(rrect(10.0, 3.0, 4.6, 15.0, 2.3).map(Piece::Fill));
-            v.extend(rrect(7.0, 13.0, 18.0, 13.5, 5.5).map(Piece::Fill));
-            v.extend(rrect(14.0, 11.5, 4.2, 8.0, 2.1).map(Piece::Fill));
-            v.extend(rrect(18.0, 12.0, 4.2, 8.0, 2.1).map(Piece::Fill));
-            v.extend(rrect(4.5, 15.0, 4.6, 8.5, 2.3).map(Piece::Fill));
+            hot = HAND_POINTER.1;
+            v.extend(hand_pieces(&HAND_POINTER.0));
         }
         Shape::Grab => {
-            for (i, top) in [7.0, 4.5, 5.0, 8.0].iter().enumerate() {
-                v.extend(rrect(8.0 + i as f32 * 4.4, *top, 4.0, 14.0, 2.0).map(Piece::Fill));
-            }
-            v.extend(rrect(7.0, 13.0, 18.5, 13.5, 6.0).map(Piece::Fill));
-            v.extend(rrect(3.5, 14.5, 5.0, 8.5, 2.5).map(Piece::Fill));
+            hot = HAND_GRAB.1;
+            v.extend(hand_pieces(&HAND_GRAB.0));
         }
         Shape::Grabbing => {
-            for i in 0..4 {
-                v.extend(rrect(8.0 + i as f32 * 4.4, 10.5, 4.0, 9.0, 2.0).map(Piece::Fill));
-            }
-            v.extend(rrect(7.0, 14.0, 18.5, 12.5, 6.0).map(Piece::Fill));
-            v.extend(rrect(4.0, 15.0, 5.0, 7.0, 2.5).map(Piece::Fill));
+            hot = HAND_GRABBING.1;
+            v.extend(hand_pieces(&HAND_GRABBING.0));
         }
         Shape::Move => {
             v.extend(line((16.0, 6.0), (16.0, 26.0)).map(|p| Piece::Line(p, 2.2)));
@@ -792,14 +813,24 @@ pub fn render(shape: Shape, box_px: u32, look: CursorLook, accent: [f32; 3], pha
 
 /// Like `render`, with all the preferences: arrow shape, outline, busy style, custom hue.
 pub fn render_with(shape: Shape, box_px: u32, prefs: &CursorPrefs, accent: [f32; 3], phase: f32) -> CursorImage {
+    if shape == Shape::Hidden {
+        let n = box_px.clamp(12, 64);
+        return CursorImage { size: n, hot: (0, 0), argb: vec![0u32; (n * n) as usize] };
+    }
+    let (pieces, hot, turn) = pieces(shape, phase, prefs);
+    paint(shape, &pieces, hot, turn, false, box_px, prefs, accent, phase)
+}
+
+/// Paint `pieces` (design units) into a box of `box_px` device px, in the colours `shape` has with these preferences,
+/// turned by `turn` degrees around the box's middle. `snap`: move the drawing by the fraction of a pixel that rounding
+/// the pointer's point to a whole pixel loses, so that a point that glides (a morph's in-between pictures) stays exactly
+/// under the pointer instead of wobbling by half a pixel.
+#[allow(clippy::too_many_arguments)]
+fn paint(shape: Shape, pieces: &[Piece], hot: (f32, f32), turn: f32, snap: bool, box_px: u32, prefs: &CursorPrefs, accent: [f32; 3], phase: f32) -> CursorImage {
     let look = prefs.look;
     let n = box_px.clamp(12, 64);
     let mut argb = vec![0u32; (n * n) as usize];
     let mut out = CursorImage { size: n, hot: (0, 0), argb: Vec::new() };
-    if shape == Shape::Hidden {
-        out.argb = argb;
-        return out;
-    }
     const INK: [f32; 3] = [0.05, 0.06, 0.08];
     const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
     let (fill, edge) = match look {
@@ -831,8 +862,17 @@ pub fn render_with(shape: Shape, box_px: u32, prefs: &CursorPrefs, accent: [f32;
         return out;
     };
     let k = n as f32 / DESIGN;
-    let (pieces, hot, turn) = pieces(shape, phase, prefs);
+    // the hot spot, turned like the picture
+    let (mut hx, mut hy) = hot;
+    if turn != 0.0 {
+        let a = turn.to_radians();
+        let (dx, dy) = (hx - 16.0, hy - 16.0);
+        hx = 16.0 + dx * a.cos() - dy * a.sin();
+        hy = 16.0 + dx * a.sin() + dy * a.cos();
+    }
+    let (hpx, hpy) = ((hx * k).round(), (hy * k).round());
     let tf = if turn != 0.0 { Transform::from_rotate_at(turn, 16.0, 16.0).post_scale(k, k) } else { Transform::from_scale(k, k) };
+    let tf = if snap { tf.post_translate(hpx - hx * k, hpy - hy * k) } else { tf };
     let mut paint = Paint { anti_alias: true, ..Paint::default() };
     let outline = prefs.outline.clamp(0.0, 3.0);
     // the outlines first, so that touching pieces (a hand's fingers) do not draw lines through each other
@@ -853,7 +893,7 @@ pub fn render_with(shape: Shape, box_px: u32, prefs: &CursorPrefs, accent: [f32;
             paint.shader = sh;
         }
     }
-    for p in &pieces {
+    for p in pieces {
         match p {
             Piece::Fill(path) if hollow => {
                 let stroke = Stroke { width: 1.6, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
@@ -877,15 +917,7 @@ pub fn render_with(shape: Shape, box_px: u32, prefs: &CursorPrefs, accent: [f32;
     if prefs.shadow > 0.0 {
         add_shadow(&mut argb, n as usize, k, prefs.shadow.min(1.0));
     }
-    // the hot spot, turned like the picture
-    let (mut hx, mut hy) = hot;
-    if turn != 0.0 {
-        let a = turn.to_radians();
-        let (dx, dy) = (hx - 16.0, hy - 16.0);
-        hx = 16.0 + dx * a.cos() - dy * a.sin();
-        hy = 16.0 + dx * a.sin() + dy * a.cos();
-    }
-    out.hot = ((hx * k).round() as i32, (hy * k).round() as i32);
+    out.hot = (hpx as i32, hpy as i32);
     out.argb = argb;
     out
 }
@@ -1000,6 +1032,318 @@ impl Shake {
     /// Still growing or shrinking (the picture has to be drawn again soon).
     pub fn moving(&self, now: std::time::Instant) -> bool {
         self.level > 0.0 || self.held_until.is_some_and(|t| t > now)
+    }
+}
+
+// ---- changing shape smoothly
+//
+// When the cursor changes shape (arrow to text beam, hand to closed hand, one resize arrow to another...) the picture is
+// not swapped at once: for a moment (`MORPH_SECS`) one shape turns into the other.
+//
+// * Shapes built the same way are blended geometrically ([`Pose`]): the resize arrows turn by the shorter way to their
+//   new angle; the hands (pointing, open, closed) move each finger, the palm and the thumb to their new boxes; the arrow,
+//   the arrow with a "+" (copy) and the arrow with a busy ring resize the arrow and grow or shrink the badge. The blend
+//   eases out with a small overshoot, like a spring that settles.
+// * Any other pair cross-fades and scales ([`blend`]): the old picture shrinks and fades, the new one grows from a little
+//   smaller (overshooting slightly) and fades in. Programs' own pictures, Xcursor themes and the hidden cursor take this
+//   way too.
+//
+// The pointer's point. Input never uses the picture: a click lands where the pointer is, and that never moves while the
+// cursor changes shape. Every in-between picture puts *its* point exactly on the pointer: the cross-fade scales each
+// picture around its own hot spot and lines the two hot spots up, and a geometric blend moves the hot spot together with
+// the drawing (a pointing fingertip gliding to the middle of a closed hand, say) and then places the picture so that the
+// blended point sits on the pointer. So the part of the picture that says "here" is always where a click goes; nothing
+// in the animation ever shows a click point the button would not use.
+//
+// A change in the middle of a change starts from what is on screen at that moment: a geometric blend carries on from the
+// in-between pose, anything else cross-fades from the last picture shown, so a quick A -> B -> C never pops.
+
+/// How long a change of shape takes at speed 1, seconds.
+pub const MORPH_SECS: f32 = 0.16;
+
+/// A shape's geometry as numbers that can be blended with another shape of the same kind.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Pose {
+    /// the two-headed arrow, turned by this angle (degrees; it looks the same turned half round)
+    Resize(f32),
+    /// a hand: see [`Hand`]
+    Hand([[f32; 5]; 6], (f32, f32)),
+    /// the arrow (its size and its offset in x and y), and how much of the "+" badge and of the busy badge show (0 .. 1)
+    Arrow([f32; 3], f32, f32),
+}
+
+/// The pose of `shape`, if it can be blended at all (the shell's own drawing only, not a theme's picture).
+fn pose_of(shape: Shape, prefs: &CursorPrefs) -> Option<Pose> {
+    if !prefs.theme.is_empty() {
+        return None;
+    }
+    let plain = Pose::Arrow([1.0, 0.0, 0.0], 0.0, 0.0);
+    Some(match shape {
+        Shape::Default => plain,
+        Shape::Pointer if prefs.hand == HandStyle::Arrow => plain,
+        Shape::Copy => Pose::Arrow([0.85, 1.0, 1.0], 1.0, 0.0),
+        // (a rainbow busy cursor has colours of its own: it cross-fades)
+        Shape::Progress if prefs.busy != BusyStyle::Rainbow => Pose::Arrow([0.8, 1.0, 1.0], 0.0, 1.0),
+        Shape::Pointer => Pose::Hand(HAND_POINTER.0, HAND_POINTER.1),
+        Shape::Grab => Pose::Hand(HAND_GRAB.0, HAND_GRAB.1),
+        Shape::Grabbing => Pose::Hand(HAND_GRABBING.0, HAND_GRABBING.1),
+        Shape::ResizeEw => Pose::Resize(0.0),
+        Shape::ResizeNs => Pose::Resize(90.0),
+        Shape::ResizeNesw => Pose::Resize(-45.0),
+        Shape::ResizeNwse => Pose::Resize(45.0),
+        _ => return None,
+    })
+}
+
+fn mix(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+impl Pose {
+    /// `t` of the way from this pose to `to` (t may overshoot 1 a little); None when the two are not of one kind.
+    fn lerp(&self, to: &Pose, t: f32) -> Option<Pose> {
+        Some(match (self, to) {
+            (Pose::Resize(a), Pose::Resize(b)) => {
+                // the shorter way round: the arrow has two heads, so half a turn brings it back
+                let d = (b - a + 90.0).rem_euclid(180.0) - 90.0;
+                Pose::Resize(a + d * t)
+            }
+            (Pose::Hand(a, ha), Pose::Hand(b, hb)) => Pose::Hand(std::array::from_fn(|i| std::array::from_fn(|j| mix(a[i][j], b[i][j], t))), (mix(ha.0, hb.0, t), mix(ha.1, hb.1, t))),
+            (Pose::Arrow(a, pa, ba), Pose::Arrow(b, pb, bb)) => Pose::Arrow(std::array::from_fn(|i| mix(a[i], b[i], t)), mix(*pa, *pb, t), mix(*ba, *bb, t)),
+            _ => return None,
+        })
+    }
+
+    /// The pieces, the pointer's point and the turn, as `pieces` gives them for a shape.
+    fn pieces(&self, phase: f32, prefs: &CursorPrefs) -> (Vec<Piece>, (f32, f32), f32) {
+        match self {
+            Pose::Resize(angle) => {
+                let (v, hot, _) = pieces(Shape::ResizeEw, phase, prefs);
+                (v, hot, *angle)
+            }
+            Pose::Hand(boxes, hot) => (hand_pieces(boxes), *hot, 0.0),
+            Pose::Arrow([k, dx, dy], plus, busy) => {
+                let mut v: Vec<Piece> = poly(&arrow_points(prefs.arrow, *k, *dx, *dy)).map(Piece::Fill).into_iter().collect();
+                // the badges grow from their middles (too small to see: left out, rather than a speck of outline)
+                let plus = plus.clamp(0.0, 1.2);
+                if plus > 0.12 {
+                    let r = 5.0 * plus;
+                    v.extend(line((24.0, 24.0 - r), (24.0, 24.0 + r)).map(|p| Piece::Line(p, 2.6)));
+                    v.extend(line((24.0 - r, 24.0), (24.0 + r, 24.0)).map(|p| Piece::Line(p, 2.6)));
+                }
+                let busy = busy.clamp(0.0, 1.2);
+                if busy > 0.12 {
+                    if prefs.busy != BusyStyle::Ring {
+                        v.extend(hourglass(23.5, 22.5, 0.62 * busy, phase));
+                    } else {
+                        v.extend(arc(23.5, 23.5, 5.2 * busy, phase * 360.0, 270.0).map(|p| Piece::Line(p, 2.6 * busy.min(1.0))));
+                    }
+                }
+                (v, (2.0, 2.0), 0.0)
+            }
+        }
+    }
+}
+
+/// Eases out with a small overshoot (about 4%) and settles exactly on 1 at `u` = 1: a spring that is nearly damped.
+fn ease_spring(u: f32) -> f32 {
+    if u <= 0.0 {
+        return 0.0;
+    }
+    if u >= 1.0 {
+        return 1.0;
+    }
+    let x = u - 1.0;
+    const C: f32 = 1.1;
+    1.0 + (C + 1.0) * x * x * x + C * x * x
+}
+
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// How the two pictures of a cross-fade are drawn `u` (0 .. 1) of the way through: (scale, opacity) of the old one and of
+/// the new one. The old one is gone by two thirds of the way; the new one comes in from 60% of its size, overshoots a
+/// little and is exactly itself (scale 1, opaque) at the end.
+fn fade_curves(u: f32) -> ((f32, f32), (f32, f32)) {
+    let u = u.clamp(0.0, 1.0);
+    let out = (u / 0.65).min(1.0);
+    let old = (1.0 - 0.35 * out * out, 1.0 - smoothstep(0.0, 0.65, u));
+    let new = (0.6 + 0.4 * ease_spring(u), smoothstep(0.05, 0.75, u));
+    (old, new)
+}
+
+/// The largest cross-fade picture (a side, device px): enough for the biggest cursor plane.
+const BLEND_MAX: i32 = 256;
+
+/// The old picture `from` and the new one `to` cross-faded `u` (0 .. 1) of the way, each scaled around its own hot spot,
+/// with the two hot spots on one pixel (the pointer). Premultiplied ARGB like the pictures.
+fn blend(from: &CursorImage, to: &CursorImage, u: f32) -> CursorImage {
+    let ((so, ao), (sn, an)) = fade_curves(u);
+    // a margin for the new picture's overshoot
+    let pad = 2;
+    let hot = (from.hot.0.max(to.hot.0) + pad, from.hot.1.max(to.hot.1) + pad);
+    let reach = |img: &CursorImage| (hot.0 - img.hot.0 + img.size as i32).max(hot.1 - img.hot.1 + img.size as i32);
+    let size = (reach(from).max(reach(to)) + pad).min(BLEND_MAX).max(1);
+    let mut argb = vec![0u32; (size * size) as usize];
+    // one picture over what is there: `s` its scale, `a` its opacity
+    let mut layer = |img: &CursorImage, s: f32, a: f32| {
+        if a <= 0.0 || s <= 0.01 {
+            return;
+        }
+        let n = img.size as i32;
+        let texel = |x: i32, y: i32| -> [f32; 4] {
+            if x < 0 || y < 0 || x >= n || y >= n {
+                return [0.0; 4];
+            }
+            let p = img.argb[(y * n + x) as usize];
+            [(p >> 24) as f32, ((p >> 16) & 255) as f32, ((p >> 8) & 255) as f32, (p & 255) as f32]
+        };
+        // the picture's box on the canvas, scaled around its hot spot
+        let (hx, hy) = (img.hot.0 as f32, img.hot.1 as f32);
+        let x0 = ((hot.0 as f32 - hx * s).floor() as i32).max(0);
+        let y0 = ((hot.1 as f32 - hy * s).floor() as i32).max(0);
+        let x1 = ((hot.0 as f32 + (n as f32 - hx) * s).ceil() as i32).min(size);
+        let y1 = ((hot.1 as f32 + (n as f32 - hy) * s).ceil() as i32).min(size);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                // the canvas pixel's middle, in the picture's px (at scale 1 exactly one of its pixels: a plain copy)
+                let sx = (x as f32 + 0.5 - hot.0 as f32) / s + hx - 0.5;
+                let sy = (y as f32 + 0.5 - hot.1 as f32) / s + hy - 0.5;
+                let (ix, iy) = (sx.floor() as i32, sy.floor() as i32);
+                let (fx, fy) = (sx - ix as f32, sy - iy as f32);
+                let (p, q, r, t) = (texel(ix, iy), texel(ix + 1, iy), texel(ix, iy + 1), texel(ix + 1, iy + 1));
+                let c: [f32; 4] = std::array::from_fn(|i| ((p[i] * (1.0 - fx) + q[i] * fx) * (1.0 - fy) + (r[i] * (1.0 - fx) + t[i] * fx) * fy) * a);
+                if c[0] <= 0.0 {
+                    continue;
+                }
+                let at = (y * size + x) as usize;
+                let under = argb[at];
+                let keep = 1.0 - c[0] / 255.0;
+                let ch = |sh: u32, top: f32| ((((under >> sh) & 255) as f32 * keep + top).round().clamp(0.0, 255.0) as u32) << sh;
+                argb[at] = ch(24, c[0]) | ch(16, c[1]) | ch(8, c[2]) | ch(0, c[3]);
+            }
+        }
+    };
+    layer(from, so, ao);
+    layer(to, sn, an);
+    CursorImage { size: size as u32, hot, argb }
+}
+
+/// What a change of shape starts from.
+#[derive(Clone, Debug)]
+enum Start {
+    /// a geometric blend from one pose to the other
+    Pose(Pose, Pose),
+    /// a cross-fade from this picture (the one on screen when the change began) to the new shape's
+    Picture(CursorImage),
+}
+
+#[derive(Clone, Debug)]
+struct Run {
+    began: std::time::Instant,
+    secs: f32,
+    start: Start,
+}
+
+impl Run {
+    fn progress(&self, now: std::time::Instant) -> f32 {
+        now.saturating_duration_since(self.began).as_secs_f32() / self.secs.max(0.001)
+    }
+}
+
+/// The cursor picture while the shape changes: keeps what was shown last and the change in progress (see the notes
+/// above [`MORPH_SECS`]). The compositor tells it of a new shape with [`Morph::retarget`] and asks for the picture of
+/// the moment with [`Morph::frame`], as long as [`Morph::running`] says so (and whenever else it would draw anyway).
+#[derive(Default)]
+pub struct Morph {
+    /// the picture last handed out (what a change starts from)
+    shown: Option<CursorImage>,
+    /// the shape it is going to (or is)
+    target: Shape,
+    /// that shape's picture is the shell's drawing alone (no program's picture, no icon beside it)
+    plain: bool,
+    run: Option<Run>,
+}
+
+impl Morph {
+    /// The shape the cursor is or is changing to.
+    pub fn target(&self) -> Shape {
+        self.target
+    }
+
+    /// A change is in progress: the picture must be drawn again soon (every frame), until this turns false.
+    pub fn running(&self) -> bool {
+        self.run.is_some()
+    }
+
+    /// The cursor is now to show `to`. `plain`: its picture is the shell's own drawing and nothing else (not a program's
+    /// picture, no launch icon beside it); only then may it be blended geometrically.
+    pub fn retarget(&mut self, to: Shape, plain: bool, prefs: &CursorPrefs, now: std::time::Instant) {
+        if to == self.target {
+            self.plain = plain;
+            return;
+        }
+        let (from, was_plain) = (self.target, self.plain);
+        self.target = to;
+        self.plain = plain;
+        let Some(shown) = &self.shown else { return };
+        if !prefs.morph {
+            self.run = None;
+            return;
+        }
+        // where the picture is now, as a pose (mid-way through a blend: the in-between pose)
+        let current = match &self.run {
+            Some(run @ Run { start: Start::Pose(a, b), .. }) => a.lerp(b, ease_spring(run.progress(now))),
+            Some(_) => None,
+            None => pose_of(from, prefs).filter(|_| was_plain),
+        };
+        let next = pose_of(to, prefs).filter(|_| plain);
+        let start = match (current, next) {
+            (Some(a), Some(b)) if a.lerp(&b, 0.0).is_some() => {
+                if a == b {
+                    // (the same drawing: an arrow over links that looks like the arrow)
+                    self.run = None;
+                    return;
+                }
+                Start::Pose(a, b)
+            }
+            _ => Start::Picture(shown.clone()),
+        };
+        self.run = Some(Run { began: now, secs: MORPH_SECS / prefs.morph_speed.clamp(0.5, 2.0), start });
+    }
+
+    /// Forget the change in progress and what was shown (the next picture is put up as it is).
+    pub fn reset(&mut self) {
+        self.run = None;
+        self.shown = None;
+    }
+
+    /// The picture to show at `now`. `picture` draws the target shape's own picture (as the compositor would without a
+    /// change: theme, program's picture, launch icon and all); a geometric blend draws its in-between poses itself, into
+    /// a box of `box_px` device px. When the change is over this is exactly `picture()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn frame(&mut self, now: std::time::Instant, prefs: &CursorPrefs, box_px: u32, accent: [f32; 3], phase: f32, picture: impl FnOnce() -> CursorImage) -> &CursorImage {
+        let img = match self.run.take() {
+            Some(run) if run.progress(now) < 1.0 => {
+                let u = run.progress(now);
+                let img = match &run.start {
+                    Start::Pose(a, b) => match a.lerp(b, ease_spring(u)) {
+                        Some(p) => {
+                            let (pieces, hot, turn) = p.pieces(phase, prefs);
+                            paint(Shape::Default, &pieces, hot, turn, true, box_px, prefs, accent, phase)
+                        }
+                        None => picture(),
+                    },
+                    Start::Picture(from) => blend(from, &picture(), u),
+                };
+                self.run = Some(run);
+                img
+            }
+            _ => picture(),
+        };
+        self.shown.insert(img)
     }
 }
 
@@ -1326,5 +1670,215 @@ mod tests {
             }
             sheet.save(format!("{dir}/launch_{name}.png")).unwrap();
         }
+    }
+
+    /// A morph that has shown `from` and is then sent to `to` at `t0`.
+    fn morph_from(from: Shape, to: Shape, prefs: &CursorPrefs, t0: std::time::Instant) -> Morph {
+        let mut m = Morph::default();
+        m.retarget(from, true, prefs, t0);
+        m.frame(t0, prefs, 32, [0.1, 0.5, 1.0], 0.0, || render_with(from, 32, prefs, [0.1, 0.5, 1.0], 0.0));
+        m.retarget(to, true, prefs, t0);
+        m
+    }
+
+    fn at(m: &mut Morph, shape: Shape, prefs: &CursorPrefs, t: std::time::Instant) -> CursorImage {
+        m.frame(t, prefs, 32, [0.1, 0.5, 1.0], 0.0, || render_with(shape, 32, prefs, [0.1, 0.5, 1.0], 0.0)).clone()
+    }
+
+    /// Do two pictures look the same with their hot spots on one point (what is outside either counts as clear)?
+    fn same_on_screen(a: &CursorImage, b: &CursorImage) -> bool {
+        let px = |img: &CursorImage, x: i32, y: i32| {
+            let (x, y) = (x + img.hot.0, y + img.hot.1);
+            if x < 0 || y < 0 || x >= img.size as i32 || y >= img.size as i32 { 0 } else { img.argb[(y * img.size as i32 + x) as usize] }
+        };
+        (-300..300).all(|y| (-300..300).all(|x| px(a, x, y) == px(b, x, y)))
+    }
+
+    fn coverage(img: &CursorImage) -> u32 {
+        img.argb.iter().map(|p| p >> 24).sum()
+    }
+
+    #[test]
+    fn morph_curves_start_and_settle() {
+        assert_eq!(ease_spring(0.0), 0.0);
+        assert_eq!(ease_spring(1.0), 1.0);
+        let most = (0..=100).map(|i| ease_spring(i as f32 / 100.0)).fold(0.0f32, f32::max);
+        assert!(most > 1.0 && most < 1.06, "a small overshoot: {most}");
+        let ((so, ao), (sn, an)) = fade_curves(0.0);
+        assert_eq!((so, ao, an), (1.0, 1.0, 0.0));
+        assert!(sn < 1.0);
+        let ((_, ao), (sn, an)) = fade_curves(1.0);
+        assert_eq!((ao, sn, an), (0.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn resize_arrows_turn_the_short_way() {
+        let p = CursorPrefs::default();
+        let turn = |a: Shape, b: Shape, t: f32| match pose_of(a, &p).unwrap().lerp(&pose_of(b, &p).unwrap(), t).unwrap() {
+            Pose::Resize(r) => r,
+            other => panic!("{other:?}"),
+        };
+        // (a quarter turn either way is as short: one of them)
+        assert_eq!(turn(Shape::ResizeEw, Shape::ResizeNs, 0.5).abs(), 45.0);
+        // 90 -> -45 is a quarter turn less by going on to 135 (the same arrow)
+        assert_eq!(turn(Shape::ResizeNs, Shape::ResizeNesw, 1.0), 135.0);
+        assert_eq!((turn(Shape::ResizeNesw, Shape::ResizeNwse, 1.0) + 45.0).abs(), 90.0);
+        assert_eq!(turn(Shape::ResizeNwse, Shape::ResizeEw, 1.0), 0.0);
+        // unrelated shapes are not blended geometrically
+        assert!(pose_of(Shape::Default, &p).unwrap().lerp(&pose_of(Shape::Grab, &p).unwrap(), 0.5).is_none());
+        assert!(pose_of(Shape::Text, &p).is_none());
+        assert!(pose_of(Shape::Grab, &CursorPrefs { theme: "Breeze".into(), ..p.clone() }).is_none());
+    }
+
+    #[test]
+    fn poses_draw_their_shapes() {
+        // the end of each geometric blend is the shape itself (box 32: one px per unit, nothing to snap)
+        let p = CursorPrefs::default();
+        for (a, b) in [(Shape::Grab, Shape::Grabbing), (Shape::Grabbing, Shape::Pointer), (Shape::Pointer, Shape::Grab), (Shape::ResizeEw, Shape::ResizeNwse), (Shape::Default, Shape::Copy), (Shape::Copy, Shape::Progress)] {
+            let pose = pose_of(a, &p).unwrap().lerp(&pose_of(b, &p).unwrap(), 1.0).unwrap();
+            let (pieces, hot, turn) = pose.pieces(0.0, &p);
+            let img = paint(Shape::Default, &pieces, hot, turn, true, 32, &p, [0.1, 0.5, 1.0], 0.0);
+            let want = render_with(b, 32, &p, [0.1, 0.5, 1.0], 0.0);
+            assert_eq!(img.hot, want.hot, "{a:?} -> {b:?}");
+            let diff = img.argb.iter().zip(&want.argb).filter(|(x, y)| x != y).count();
+            assert!(diff <= 4, "{a:?} -> {b:?}: {diff} px differ");
+        }
+    }
+
+    #[test]
+    fn morph_ends_on_exactly_the_new_picture() {
+        let p = CursorPrefs::default();
+        let t0 = std::time::Instant::now();
+        for (a, b) in [(Shape::Default, Shape::Text), (Shape::Grab, Shape::Grabbing), (Shape::ResizeEw, Shape::ResizeNs), (Shape::Text, Shape::Hidden), (Shape::Hidden, Shape::Pointer)] {
+            let mut m = morph_from(a, b, &p, t0);
+            assert!(m.running(), "{a:?} -> {b:?}");
+            let mid = at(&mut m, b, &p, t0 + std::time::Duration::from_millis(60));
+            assert!(m.running());
+            assert_ne!(mid, render_with(b, 32, &p, [0.1, 0.5, 1.0], 0.0), "{a:?} -> {b:?} shows something in between");
+            let end = at(&mut m, b, &p, t0 + std::time::Duration::from_millis(400));
+            assert!(!m.running());
+            assert_eq!(end, render_with(b, 32, &p, [0.1, 0.5, 1.0], 0.0), "{a:?} -> {b:?}");
+        }
+        // hiding: the old picture shrinks away to nothing
+        let mut m = morph_from(Shape::Default, Shape::Hidden, &p, t0);
+        let full = coverage(&render_with(Shape::Default, 32, &p, [0.1, 0.5, 1.0], 0.0));
+        let mid = coverage(&at(&mut m, Shape::Hidden, &p, t0 + std::time::Duration::from_millis(50)));
+        assert!(mid > 0 && mid < full, "{mid} of {full}");
+    }
+
+    #[test]
+    fn morph_starts_from_what_is_shown() {
+        let p = CursorPrefs::default();
+        let t0 = std::time::Instant::now();
+        // cross-fade: the first picture is the old one (on a larger canvas, the hot spot where it was)
+        let mut m = morph_from(Shape::Default, Shape::Text, &p, t0);
+        let first = at(&mut m, Shape::Text, &p, t0);
+        assert!(same_on_screen(&first, &render_with(Shape::Default, 32, &p, [0.1, 0.5, 1.0], 0.0)));
+        // geometric: the first pose is the old shape
+        let mut m = morph_from(Shape::Grab, Shape::Grabbing, &p, t0);
+        let first = at(&mut m, Shape::Grabbing, &p, t0);
+        assert!(same_on_screen(&first, &render_with(Shape::Grab, 32, &p, [0.1, 0.5, 1.0], 0.0)));
+    }
+
+    #[test]
+    fn a_change_mid_way_carries_on_without_a_pop() {
+        let p = CursorPrefs::default();
+        let t0 = std::time::Instant::now();
+        let mid = t0 + std::time::Duration::from_millis(70);
+        // geometric: on from the in-between angle
+        let mut m = morph_from(Shape::ResizeEw, Shape::ResizeNs, &p, t0);
+        let before = at(&mut m, Shape::ResizeNs, &p, mid);
+        m.retarget(Shape::ResizeNesw, true, &p, mid);
+        assert!(matches!(m.run.as_ref().map(|r| &r.start), Some(Start::Pose(..))));
+        let after = at(&mut m, Shape::ResizeNesw, &p, mid);
+        assert_eq!(before, after);
+        // cross-fade: on from the picture on screen, and again (A -> B -> C -> D)
+        let mut m = morph_from(Shape::Default, Shape::Text, &p, t0);
+        let mut t = mid;
+        let mut shape = Shape::Text;
+        for next in [Shape::Pointer, Shape::NotAllowed, Shape::Crosshair] {
+            let before = at(&mut m, shape, &p, t);
+            m.retarget(next, true, &p, t);
+            let after = at(&mut m, next, &p, t);
+            assert!(same_on_screen(&before, &after), "-> {next:?}");
+            shape = next;
+            t += std::time::Duration::from_millis(40);
+        }
+        let end = at(&mut m, shape, &p, t + std::time::Duration::from_millis(400));
+        assert_eq!(end, render_with(shape, 32, &p, [0.1, 0.5, 1.0], 0.0));
+    }
+
+    #[test]
+    fn morph_respects_the_preferences_and_the_kind_of_picture() {
+        let t0 = std::time::Instant::now();
+        // off: the new picture at once
+        let off = CursorPrefs { morph: false, ..CursorPrefs::default() };
+        let mut m = morph_from(Shape::Default, Shape::Text, &off, t0);
+        assert!(!m.running());
+        assert_eq!(at(&mut m, Shape::Text, &off, t0), render_with(Shape::Text, 32, &off, [0.1, 0.5, 1.0], 0.0));
+        // the same drawing under another name: nothing to animate
+        let arrow = CursorPrefs { hand: HandStyle::Arrow, ..CursorPrefs::default() };
+        assert!(!morph_from(Shape::Default, Shape::Pointer, &arrow, t0).running());
+        // a picture with more than the drawing (a program's own, a launch icon beside it): cross-fade only
+        let p = CursorPrefs::default();
+        let mut m = Morph::default();
+        m.retarget(Shape::Default, true, &p, t0);
+        m.frame(t0, &p, 32, [0.0; 3], 0.0, || render_with(Shape::Default, 32, &p, [0.0; 3], 0.0));
+        m.retarget(Shape::Progress, false, &p, t0);
+        assert!(matches!(m.run.as_ref().map(|r| &r.start), Some(Start::Picture(_))));
+        // and back from it, too
+        m.retarget(Shape::Default, true, &p, t0 + std::time::Duration::from_millis(500));
+        assert!(matches!(m.run.as_ref().map(|r| &r.start), Some(Start::Picture(_))));
+        // a slower pace takes longer
+        let slow = CursorPrefs { morph_speed: 0.5, ..CursorPrefs::default() };
+        let mut m = morph_from(Shape::Default, Shape::Text, &slow, t0);
+        at(&mut m, Shape::Text, &slow, t0 + std::time::Duration::from_millis(250));
+        assert!(m.running());
+    }
+
+    /// `CURSOR_MORPH=/dir cargo test cursor_morph_sheet -- --ignored`: film strips of shape changes (one row each, hot spot
+    /// on the same point in every cell, 3x), to look at.
+    #[test]
+    #[ignore]
+    fn cursor_morph_sheet() {
+        let Ok(dir) = std::env::var("CURSOR_MORPH") else { return };
+        let p = CursorPrefs::default();
+        let pairs = [(Shape::Default, Shape::Text), (Shape::Default, Shape::Pointer), (Shape::Pointer, Shape::Grab), (Shape::Grab, Shape::Grabbing), (Shape::ResizeEw, Shape::ResizeNs), (Shape::ResizeNs, Shape::ResizeNwse), (Shape::Default, Shape::Progress), (Shape::Default, Shape::Copy), (Shape::Text, Shape::Hidden), (Shape::Default, Shape::ResizeNwse)];
+        let steps = 12u32;
+        let (cell, mag) = (72u32, 3u32);
+        let mut sheet = image::RgbaImage::from_pixel(cell * (steps + 1) * mag, cell * pairs.len() as u32 * mag, image::Rgba([120, 130, 150, 255]));
+        let t0 = std::time::Instant::now();
+        for (row, (a, b)) in pairs.iter().enumerate() {
+            let mut m = Morph::default();
+            m.retarget(*a, true, &p, t0);
+            m.frame(t0, &p, 40, [0.1, 0.5, 1.0], 0.3, || render_with(*a, 40, &p, [0.1, 0.5, 1.0], 0.3));
+            m.retarget(*b, true, &p, t0);
+            for i in 0..=steps {
+                let t = t0 + std::time::Duration::from_secs_f32(MORPH_SECS * i as f32 / steps as f32);
+                let pic = m.frame(t, &p, 40, [0.1, 0.5, 1.0], 0.3, || render_with(*b, 40, &p, [0.1, 0.5, 1.0], 0.3)).clone();
+                let (ox, oy) = (i * cell + cell / 2, row as u32 * cell + cell / 2);
+                for y in 0..pic.size as i32 {
+                    for x in 0..pic.size as i32 {
+                        let px = pic.argb[(y * pic.size as i32 + x) as usize];
+                        let al = (px >> 24) as f32 / 255.0;
+                        let (cx, cy) = (ox as i32 + x - pic.hot.0, oy as i32 + y - pic.hot.1);
+                        if al <= 0.0 || cx < (i * cell) as i32 || cy < (row as u32 * cell) as i32 || cx >= ((i + 1) * cell) as i32 || cy >= ((row as u32 + 1) * cell) as i32 {
+                            continue;
+                        }
+                        for my in 0..mag {
+                            for mx in 0..mag {
+                                let (sx, sy) = (cx as u32 * mag + mx, cy as u32 * mag + my);
+                                let old = sheet.get_pixel(sx, sy).0;
+                                let mix = |sh: u32, o: u8| (((px >> sh) & 255) as f32 + o as f32 * (1.0 - al)) as u8;
+                                sheet.put_pixel(sx, sy, image::Rgba([mix(16, old[0]), mix(8, old[1]), mix(0, old[2]), 255]));
+                            }
+                        }
+                    }
+                }
+                // the pointer's point: a red dot
+                sheet.put_pixel(ox * mag + 1, oy * mag + 1, image::Rgba([255, 0, 0, 255]));
+            }
+        }
+        sheet.save(format!("{dir}/morph.png")).unwrap();
     }
 }

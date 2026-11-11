@@ -30,6 +30,9 @@ pub struct Launcher {
     menu_cmds: Vec<crate::figlet::MenuCmd>,
     menu_program: String,
     pub files: Option<Arc<FileIndex>>,
+    /// search by meaning (while it is on in Settings -> Privacy)
+    pub semantic: Option<Arc<crate::semsearch::Searcher>>,
+    seen_semantic: u64,
     seen_index: u64,
     /// Figlet: sliding selection and list height (targets are set while drawing)
     sel_y: Spring,
@@ -54,6 +57,17 @@ pub struct Launcher {
     /// where a start menu sits along its bar, and whether the Plasma menu shows favourites as a grid (asked by the start button)
     pub align: MenuAlign,
     pub fav_grid: bool,
+    /// Plasma menu: what the last frame drew it as (the wheel scrolls it), the tab and sidebar entry shown, how far its
+    /// list is scrolled (in rows), rows shown / in all, the view switch, the pin and the clickable bits of the last frame
+    plasma: Cell<bool>,
+    kk_tab: Cell<u8>,
+    kk_sec: Cell<usize>,
+    kk_off: Cell<usize>,
+    kk_shown: Cell<usize>,
+    kk_total: Cell<usize>,
+    grid_flip: Cell<bool>,
+    pinned: Cell<bool>,
+    kk_hits: RefCell<Vec<([f32; 4], KHit)>>,
     page: Spring,
     page_to: Cell<usize>,
     pages: Cell<usize>,
@@ -101,6 +115,52 @@ impl MenuAlign {
     }
 }
 
+/// What a clickable part of the Plasma menu stands for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum KHit {
+    /// a sidebar entry: 0 favourites, 1 all applications, then the categories
+    Section(usize),
+    Tab(u8),
+    /// leave: the `systemctl` verb
+    System(&'static str),
+    Session,
+    Pin,
+    Config,
+    Place(u8),
+}
+
+/// The Plasma menu's Places: name, what is shown under it and its glyph.
+fn place_info(i: u8) -> (&'static str, String, &'static str) {
+    let (name, icon) = match i {
+        0 => ("Home", "house"),
+        1 => ("Desktop", "monitor"),
+        2 => ("Documents", "file-text"),
+        3 => ("Downloads", "download"),
+        4 => ("Pictures", "image"),
+        5 => ("Music", "music"),
+        6 => ("Videos", "video"),
+        _ => ("Root", "hard-drive"),
+    };
+    (name, place_path(i).to_string_lossy().to_string(), icon)
+}
+
+/// Where a Plasma menu place is (a folder the user does not have falls back to Home).
+pub fn place_path(i: u8) -> std::path::PathBuf {
+    let home = crate::fsops::home();
+    let sub = match i {
+        0 => return home,
+        1 => "Desktop",
+        2 => "Documents",
+        3 => "Downloads",
+        4 => "Pictures",
+        5 => "Music",
+        6 => "Videos",
+        _ => return std::path::PathBuf::from("/"),
+    };
+    let p = home.join(sub);
+    if p.is_dir() { p } else { home }
+}
+
 /// What a Launchpad rectangle stands for.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Hit {
@@ -135,6 +195,8 @@ impl Default for Launcher {
             menu_cmds: Vec::new(),
             menu_program: String::new(),
             files: None,
+            semantic: None,
+            seen_semantic: 0,
             seen_index: 0,
             sel_y: Spring::new(0.0, 620.0, 0.9),
             list_h: Spring::new(0.0, 520.0, 0.95),
@@ -150,6 +212,15 @@ impl Default for Launcher {
             forced: None,
             align: MenuAlign::Button,
             fav_grid: false,
+            plasma: Cell::new(false),
+            kk_tab: Cell::new(0),
+            kk_sec: Cell::new(0),
+            kk_off: Cell::new(0),
+            kk_shown: Cell::new(1),
+            kk_total: Cell::new(0),
+            grid_flip: Cell::new(false),
+            pinned: Cell::new(false),
+            kk_hits: RefCell::new(Vec::new()),
             page: Spring::new(0.0, 190.0, 0.92),
             page_to: Cell::new(0),
             pages: Cell::new(1),
@@ -179,6 +250,10 @@ pub enum LauncherClick {
     Item(usize),
     /// the power button of a start menu: (its rectangle, for placing a menu)
     Power([f32; 4]),
+    /// a leave button of the Plasma menu: the `systemctl` verb (suspend, hibernate, reboot, poweroff)
+    System(&'static str),
+    /// a place of the Plasma menu (see `place_path`)
+    Place(u8),
     /// an app dragged out of the grid and let go over the desktop behind it: make a launcher there
     Shortcut(usize),
     Inside,
@@ -266,6 +341,11 @@ impl Launcher {
             // (a key opens the menu at the button; the start button asks for more after this)
             self.align = MenuAlign::Button;
             self.fav_grid = false;
+            self.kk_tab.set(0);
+            self.kk_sec.set(0);
+            self.kk_off.set(0);
+            self.grid_flip.set(false);
+            self.pinned.set(false);
             self.menu_mode = false;
             self.menu_cmds.clear();
             self.query.clear();
@@ -487,6 +567,14 @@ impl Launcher {
 
     /// Launchpad: the wheel turns pages. True when the launcher took it.
     pub fn scroll(&self, dy: f64) -> bool {
+        if self.open && self.plasma.get() && !self.grid {
+            if dy.abs() > 0.5 {
+                let max = self.kk_total.get().saturating_sub(self.kk_shown.get());
+                let at = self.kk_off.get() as i64 + if dy > 0.0 { 2 } else { -2 };
+                self.kk_off.set(at.clamp(0, max as i64) as usize);
+            }
+            return true;
+        }
         if !(self.open && self.grid) {
             return false;
         }
@@ -524,17 +612,29 @@ impl Launcher {
         if let Some(f) = &self.files {
             v.extend(f.search(q, 5));
         }
-        v.truncate(8);
+        // by meaning: answered in the background (the list is redone when the answer is there)
+        let mut found = Vec::new();
+        if let Some(s) = self.semantic.as_ref().filter(|_| q.chars().count() >= 3) {
+            match s.results(q) {
+                Some(hits) => found = hits.into_iter().filter(|h| !v.iter().any(|i| i.target == Target::File(h.path.clone()))).take(4).map(semantic_item).collect(),
+                None => s.ask(q),
+            }
+        }
+        v.truncate(8 - found.len().min(3));
+        v.extend(found);
+        v.truncate(10);
         v.push(figlet::web_item(q));
         v
     }
 
-    /// Redo the search when the file index has finished a scan since the last one.
+    /// Redo the search when the file index has finished a scan since the last one (or search by meaning has an
+    /// answer).
     pub fn refresh_if_indexed(&mut self, list: &[AppEntry]) {
-        let Some(f) = &self.files else { return };
-        let g = f.generation();
-        if g != self.seen_index {
+        let g = self.files.as_ref().map_or(0, |f| f.generation());
+        let sg = self.semantic.as_ref().map_or(0, |s| s.generation());
+        if g != self.seen_index || sg != self.seen_semantic {
             self.seen_index = g;
+            self.seen_semantic = sg;
             if self.open && !self.query.is_empty() {
                 let sel = self.sel;
                 self.refresh(list);
@@ -610,6 +710,8 @@ impl Launcher {
         let mut v: Vec<usize> = self.results.clone();
         v.extend(self.items.iter().filter_map(|i| if let Target::App(a) = i.target { Some(a) } else { None }));
         v.extend(pinned.iter().copied().take(18));
+        // what the Plasma menu showed last frame (so what scrolls into view is loaded a frame later)
+        v.extend(self.hits.borrow().iter().map(|h| h.1));
         if self.grid {
             // what the first pages show (a folder shows its first nine), and all of the open folder
             let at = |id: &String| list.iter().position(|a| &a.id == id);
@@ -628,6 +730,11 @@ impl Launcher {
         v
     }
 
+    /// The Plasma menu is pinned: it stays open after a launch and when something else is clicked.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned.get()
+    }
+
     /// Is the pointer over an app of the last drawn frame?
     pub fn over_app(&self, p: [f32; 2]) -> bool {
         self.hits.borrow().iter().any(|(r, _)| inside(p, *r))
@@ -637,6 +744,29 @@ impl Launcher {
     pub fn click(&self, p: [f32; 2]) -> LauncherClick {
         if let Some((_, i)) = self.hits.borrow().iter().find(|(r, _)| inside(p, *r)) {
             return if self.figlet { LauncherClick::Item(*i) } else { LauncherClick::App(*i) };
+        }
+        let khit = self.kk_hits.borrow().iter().find(|(r, _)| inside(p, *r)).map(|(_, h)| *h);
+        if let Some(h) = khit {
+            match h {
+                KHit::Section(i) => {
+                    self.kk_sec.set(i);
+                    self.kk_off.set(0);
+                }
+                KHit::Tab(t) => {
+                    self.kk_tab.set(t);
+                    self.kk_sec.set(0);
+                    self.kk_off.set(0);
+                }
+                KHit::Pin => self.pinned.set(!self.pinned.get()),
+                KHit::Config => {
+                    self.grid_flip.set(!self.grid_flip.get());
+                    self.kk_off.set(0);
+                }
+                KHit::System(v) => return LauncherClick::System(v),
+                KHit::Session => return LauncherClick::Power(self.power_rect.get()),
+                KHit::Place(i) => return LauncherClick::Place(i),
+            }
+            return LauncherClick::Inside;
         }
         for (i, d) in self.dots.borrow().iter().enumerate() {
             if inside(p, *d) {
@@ -656,6 +786,8 @@ impl Launcher {
 
     pub fn draw(&self, ctx: &DrawCtx) -> (Vec<Panel>, Vec<Label>) {
         self.hits.borrow_mut().clear();
+        self.kk_hits.borrow_mut().clear();
+        self.plasma.set(false);
         self.pad_hits.borrow_mut().clear();
         self.power_rect.set([0.0; 4]);
         self.dots.borrow_mut().clear();
@@ -957,17 +1089,36 @@ impl Launcher {
 
     // ------------------------------------------------------------ Plasma
 
-    /// The Plasma "Kickoff" look: who is logged in and a search field on top, favourites as a list (or a grid), and the
-    /// leave button at the bottom. Search results replace the favourites.
+    /// The sidebar's categories that have apps: label, Launchpad group and glyph.
+    fn kickoff_cats(list: &[AppEntry]) -> Vec<(&'static str, &'static str, &'static str)> {
+        const ALL: [(&str, &str, &str); 9] = [
+            ("Development", "Development", "code"),
+            ("Games", "Games", "zap"),
+            ("Graphics", "Graphics", "palette"),
+            ("Internet", "Internet", "globe"),
+            ("Multimedia", "Media", "film"),
+            ("Office", "Office", "file-text"),
+            ("Settings", "Settings", "settings-2"),
+            ("System", "Utilities", "cpu"),
+            ("Other", "Other", "package"),
+        ];
+        ALL.into_iter().filter(|(_, g, _)| list.iter().any(|a| apps::group_of(a) == *g)).collect()
+    }
+
+    /// The Plasma "Kickoff" look: the user, a search field and the pin on top; a sidebar (favourites, all applications,
+    /// categories) beside the apps; Applications / Places tabs and the leave buttons at the bottom. Search results
+    /// replace the sidebar and the apps. The wheel scrolls long lists.
     fn draw_plasma(&self, ctx: &DrawCtx) -> (Vec<Panel>, Vec<Label>) {
-        const W: f32 = 600.0;
-        const H: f32 = 640.0;
+        const W: f32 = 760.0;
+        const H: f32 = 580.0;
+        const SIDE: f32 = 176.0;
         let theme = ctx.theme;
         let ink: [f32; 3] = if theme.dark { [0.96, 0.97, 1.0] } else { [0.10, 0.12, 0.17] };
         let faint = if theme.dark { [1.0, 1.0, 1.0, 0.10] } else { [1.0, 1.0, 1.0, 0.62] };
         let list = ctx.apps;
         let mut p = Vec::new();
         let mut l = Vec::new();
+        self.plasma.set(true);
 
         let k = (0.96 + 0.04 * self.k.x).clamp(0.9, 1.04);
         let (x, y) = self.place(ctx, W, H, 8.0);
@@ -982,116 +1133,215 @@ impl Launcher {
         panel.fx[0] = panel.fx[0].max(24.0);
         p.push(panel);
 
-        let grid_icon = |p: &mut Vec<Panel>, app: &AppEntry, cx: f32, cy: f32, size: f32| {
-            let ic = map(cx, cy);
-            push_icon(p, ctx, app, ic, size * k, size * 0.2 * k);
-        };
         let hover_bg = |p: &mut Vec<Panel>, r: [f32; 4]| {
             if inside(self.mouse, r) {
                 let c = map(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
-                p.push(Panel::solid(c[0], c[1], r[2] * k, r[3] * k, 5.0 * k, [1.0; 3], [1.0; 3]).flat().alpha(if theme.dark { 0.12 } else { 0.55 }));
+                p.push(Panel::solid(c[0], c[1], r[2] * k, r[3] * k, 6.0 * k, [1.0; 3], [1.0; 3]).flat().alpha(if theme.dark { 0.12 } else { 0.55 }));
             }
         };
+        let glyph_at = |p: &mut Vec<Panel>, cx: f32, cy: f32, size: f32, g: &str, op: f32| {
+            let c = map(cx, cy);
+            p.push(Panel::glyph(c[0], c[1], size * k, g, ink, op));
+        };
+        let text_at = |l: &mut Vec<Label>, px: f32, py: f32, s: &str, size: f32, bold: bool, op: f32| {
+            let c = map(px, py);
+            l.push(Label::new(s, c[0], c[1], size, bold, ink, op, Align::Left));
+        };
+        let fill = |p: &mut Vec<Panel>, r: [f32; 4], radius: f32, col: [f32; 3], a: f32| {
+            let c = map(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+            p.push(Panel::solid(c[0], c[1], r[2] * k, r[3] * k, radius * k, col, col).flat().alpha(a));
+        };
 
-        // header: the user, and the search field
-        let av = map(x + 44.0, y + 42.0);
-        p.push(Panel::solid(av[0], av[1], 44.0 * k, 44.0 * k, 22.0 * k, theme.accent, theme.accent).flat());
-        p.push(Panel::glyph(av[0], av[1], 24.0 * k, "user", [1.0; 3], 0.95));
-        let un = map(x + 74.0, y + 47.0);
-        l.push(Label::new(sysinfo::user_name(), un[0], un[1], 15.0, true, ink, 0.95, Align::Left));
-        let sf = [x + W - 24.0 - 250.0, y + 22.0, 250.0, 38.0];
-        let sc = map(sf[0] + sf[2] / 2.0, sf[1] + sf[3] / 2.0);
-        p.push(Panel::solid(sc[0], sc[1], sf[2] * k, sf[3] * k, 6.0 * k, [faint[0], faint[1], faint[2]], [faint[0], faint[1], faint[2]]).flat().alpha(faint[3]));
-        let sg = map(sf[0] + 20.0, sf[1] + sf[3] / 2.0);
-        p.push(Panel::glyph(sg[0], sg[1], 15.0 * k, "search", ink, 0.65));
-        let st = map(sf[0] + 38.0, sf[1] + sf[3] / 2.0 + 5.0);
+        let searching = !self.query.is_empty();
+        let tab = self.kk_tab.get();
+        let cats = Self::kickoff_cats(list);
+        let sec = self.kk_sec.get().min(1 + cats.len());
+        let grid = self.fav_grid ^ self.grid_flip.get();
+        let mut kh = self.kk_hits.borrow_mut();
+
+        // header: the user, the search field, the view switch and the pin
+        let av = map(x + 36.0, y + 32.0);
+        p.push(Panel::solid(av[0], av[1], 36.0 * k, 36.0 * k, 18.0 * k, theme.accent, theme.accent).flat());
+        p.push(Panel::glyph(av[0], av[1], 20.0 * k, "user", [1.0; 3], 0.95));
+        text_at(&mut l, x + 62.0, y + 37.0, &sysinfo::user_name(), 15.0, true, 0.95);
+        let pin_r = [x + W - 16.0 - 32.0, y + 14.0, 32.0, 36.0];
+        let cfg_r = [pin_r[0] - 36.0, y + 14.0, 32.0, 36.0];
+        let sf = [cfg_r[0] - 10.0 - 300.0, y + 14.0, 300.0, 36.0];
+        kh.push((pin_r, KHit::Pin));
+        kh.push((cfg_r, KHit::Config));
+        fill(&mut p, sf, 8.0, [faint[0], faint[1], faint[2]], faint[3]);
+        glyph_at(&mut p, sf[0] + 20.0, sf[1] + 18.0, 15.0, "search", 0.65);
         if self.query.is_empty() {
-            l.push(Label::new("Search…", st[0], st[1], 13.5, false, ink, 0.55, Align::Left));
+            text_at(&mut l, sf[0] + 38.0, sf[1] + 23.0, "Search…", 13.5, false, 0.55);
         } else {
-            l.push(Label::new(trunc(&self.query, 24), st[0], st[1], 13.5, false, ink, 0.95, Align::Left));
+            text_at(&mut l, sf[0] + 38.0, sf[1] + 23.0, &trunc(&self.query, 30), 13.5, false, 0.95);
             if (self.t * 1.6).fract() < 0.6 {
-                let cx = sf[0] + 38.0 + self.query.chars().count().min(24) as f32 * 7.2 + 2.0;
-                let cc = map(cx, sf[1] + sf[3] / 2.0);
-                p.push(Panel::solid(cc[0], cc[1], 1.5 * k, 18.0 * k, 0.7, ink, ink).flat().alpha(0.8));
+                let cx = sf[0] + 38.0 + self.query.chars().count().min(30) as f32 * 7.2 + 2.0;
+                fill(&mut p, [cx, sf[1] + 9.0, 1.5, 18.0], 0.7, ink, 0.8);
             }
         }
-        let hl = map(x + W / 2.0, y + 82.0);
-        p.push(Panel::solid(hl[0], hl[1], (W - 32.0) * k, 1.0, 0.5, ink, ink).flat().alpha(0.10));
+        for (r, g, on) in [(cfg_r, "sliders-horizontal", false), (pin_r, "pin", self.pinned.get())] {
+            if on {
+                fill(&mut p, [r[0], r[1] + 2.0, r[2], r[3] - 4.0], 6.0, theme.accent, 0.30);
+            } else {
+                hover_bg(&mut p, r);
+            }
+            glyph_at(&mut p, r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, 17.0, g, 0.85);
+        }
+        fill(&mut p, [x + 8.0, y + 64.0, W - 16.0, 1.0], 0.5, ink, 0.10);
+
+        // footer: the tabs and the leave buttons
+        let fy = y + H - 52.0;
+        fill(&mut p, [x + 8.0, fy, W - 16.0, 1.0], 0.5, ink, 0.10);
+        let mut tx = x + 12.0;
+        for (t, (name, icon)) in [("Applications", "layout-grid"), ("Places", "map-pin")].into_iter().enumerate() {
+            let w = 48.0 + name.len() as f32 * 7.4;
+            let r = [tx, fy + 6.0, w, 40.0];
+            kh.push((r, KHit::Tab(t as u8)));
+            hover_bg(&mut p, r);
+            if tab as usize == t {
+                fill(&mut p, [tx, fy - 1.0, w, 3.0], 1.5, theme.accent, 0.95);
+            }
+            glyph_at(&mut p, r[0] + 22.0, r[1] + 20.0, 18.0, icon, 0.85);
+            text_at(&mut l, r[0] + 40.0, r[1] + 25.0, name, 13.0, false, 0.92);
+            tx += w + 4.0;
+        }
+        let acts: [(&str, &str, KHit); 5] = [
+            ("Sleep", "moon", KHit::System("suspend")),
+            ("Hibernate", "hard-drive", KHit::System("hibernate")),
+            ("Restart", "rotate-cw", KHit::System("reboot")),
+            ("Shut Down", "power", KHit::System("poweroff")),
+            ("Session", "chevron-down", KHit::Session),
+        ];
+        let mut rx = x + W - 10.0;
+        for (name, icon, hit) in acts.into_iter().rev() {
+            let w = if hit == KHit::Session { 36.0 + name.len() as f32 * 7.2 } else { 44.0 + name.len() as f32 * 7.2 };
+            rx -= w;
+            let r = [rx, fy + 6.0, w, 40.0];
+            kh.push((r, hit));
+            hover_bg(&mut p, r);
+            if hit == KHit::Session {
+                self.power_rect.set(r);
+                text_at(&mut l, r[0] + 12.0, r[1] + 25.0, name, 13.0, false, 0.92);
+                glyph_at(&mut p, r[0] + w - 16.0, r[1] + 20.0, 15.0, icon, 0.85);
+            } else {
+                glyph_at(&mut p, r[0] + 20.0, r[1] + 20.0, 17.0, icon, 0.85);
+                text_at(&mut l, r[0] + 36.0, r[1] + 25.0, name, 13.0, false, 0.92);
+            }
+            rx -= 2.0;
+        }
 
         // body
-        let body_top = y + 94.0;
-        let body_bottom = y + H - 70.0;
-        if self.query.is_empty() {
-            let h = map(x + 28.0, body_top + 8.0);
-            l.push(Label::new("Favorites", h[0], h[1], 12.5, true, theme.accent, 0.95, Align::Left));
-            let favs: Vec<usize> = if ctx.pinned.is_empty() { (0..list.len()).take(16).collect() } else { ctx.pinned.iter().copied().take(16).collect() };
-            if self.fav_grid {
-                let cols = 5usize;
-                let cw = (W - 48.0) / cols as f32;
-                for (i, &ai) in favs.iter().enumerate() {
-                    let (col, row) = ((i % cols) as f32, (i / cols) as f32);
-                    let r = [x + 24.0 + col * cw, body_top + 22.0 + row * 100.0, cw, 94.0];
-                    if r[1] + r[3] > body_bottom {
-                        break;
-                    }
-                    self.hits.borrow_mut().push((r, ai));
-                    hover_bg(&mut p, r);
-                    grid_icon(&mut p, &list[ai], r[0] + cw / 2.0, r[1] + 34.0, 44.0);
-                    let t = map(r[0] + cw / 2.0, r[1] + 76.0);
-                    l.push(Label::new(trunc(&list[ai].name, 14), t[0], t[1], 11.5, false, ink, 0.95, Align::Center));
+        let body_top = y + 72.0;
+        let body_bottom = fy - 6.0;
+        let full = searching || tab == 1;
+        let pane = if full { [x + 14.0, body_top, W - 28.0, body_bottom - body_top] } else { [x + SIDE + 16.0, body_top, W - SIDE - 26.0, body_bottom - body_top] };
+        if !full {
+            let mut entries: Vec<(&str, &str)> = vec![("Favorites", "bookmark"), ("All Applications", "layout-grid")];
+            entries.extend(cats.iter().map(|(n, _, g)| (*n, *g)));
+            for (i, (name, icon)) in entries.into_iter().enumerate() {
+                let r = [x + 10.0, body_top + 4.0 + i as f32 * 38.0, SIDE - 4.0, 36.0];
+                if r[1] + r[3] > body_bottom {
+                    break;
                 }
-            } else {
-                let rows = (((body_bottom - body_top - 24.0) / 50.0) as usize).max(1);
-                for (i, &ai) in favs.iter().take(rows).enumerate() {
-                    let r = [x + 16.0, body_top + 24.0 + i as f32 * 50.0, W - 32.0, 48.0];
-                    self.hits.borrow_mut().push((r, ai));
-                    hover_bg(&mut p, r);
-                    grid_icon(&mut p, &list[ai], r[0] + 28.0, r[1] + 24.0, 32.0);
-                    let n = map(r[0] + 58.0, r[1] + 21.0);
-                    l.push(Label::new(trunc(&list[ai].name, 40), n[0], n[1], 13.5, false, ink, 0.97, Align::Left));
-                    if !list[ai].generic_name.is_empty() {
-                        let g = map(r[0] + 58.0, r[1] + 38.0);
-                        l.push(Label::new(trunc(&list[ai].generic_name, 48), g[0], g[1], 11.0, false, ink, 0.55, Align::Left));
-                    }
-                }
-            }
-        } else {
-            let h = map(x + 28.0, body_top + 8.0);
-            l.push(Label::new("Results", h[0], h[1], 12.5, true, theme.accent, 0.95, Align::Left));
-            if self.results.is_empty() {
-                let t = map(x + W / 2.0, body_top + 80.0);
-                l.push(Label::new("No matches", t[0], t[1], 13.0, false, ink, 0.55, Align::Center));
-            }
-            let rows = (((body_bottom - body_top - 24.0) / 50.0) as usize).max(1);
-            for (row, &ai) in self.results.iter().take(rows).enumerate() {
-                let r = [x + 16.0, body_top + 24.0 + row as f32 * 50.0, W - 32.0, 48.0];
-                self.hits.borrow_mut().push((r, ai));
-                if row == self.sel {
-                    let c = map(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
-                    p.push(Panel::solid(c[0], c[1], r[2] * k, r[3] * k, 5.0 * k, theme.accent, theme.accent).flat().alpha(0.22));
+                kh.push((r, KHit::Section(i)));
+                if i == sec {
+                    fill(&mut p, r, 7.0, theme.accent, 0.24);
                 } else {
                     hover_bg(&mut p, r);
                 }
-                grid_icon(&mut p, &list[ai], r[0] + 28.0, r[1] + 24.0, 32.0);
-                let n = map(r[0] + 58.0, r[1] + 21.0);
-                l.push(Label::new(trunc(&list[ai].name, 40), n[0], n[1], 13.5, false, ink, 0.97, Align::Left));
-                let sub = if list[ai].generic_name.is_empty() { "Application".to_string() } else { list[ai].generic_name.clone() };
-                let g = map(r[0] + 58.0, r[1] + 38.0);
-                l.push(Label::new(trunc(&sub, 48), g[0], g[1], 11.0, false, ink, 0.55, Align::Left));
+                glyph_at(&mut p, r[0] + 22.0, r[1] + 18.0, 18.0, icon, 0.9);
+                text_at(&mut l, r[0] + 44.0, r[1] + 23.0, name, 13.5, false, 0.95);
             }
+            fill(&mut p, [x + SIDE + 8.0, body_top + 4.0, 1.0, body_bottom - body_top - 8.0], 0.5, ink, 0.10);
         }
 
-        // footer: leave
-        let fy = y + H - 62.0;
-        let fl = map(x + W / 2.0, fy);
-        p.push(Panel::solid(fl[0], fl[1], (W - 32.0) * k, 1.0, 0.5, ink, ink).flat().alpha(0.10));
-        let pw = [x + W - 24.0 - 96.0, fy + 10.0, 96.0, 40.0];
-        self.power_rect.set(pw);
-        hover_bg(&mut p, pw);
-        let pc = map(pw[0] + 22.0, pw[1] + 20.0);
-        p.push(Panel::glyph(pc[0], pc[1], 17.0 * k, "power", ink, 0.85));
-        let pt = map(pw[0] + 40.0, pw[1] + 25.0);
-        l.push(Label::new("Leave", pt[0], pt[1], 13.0, false, ink, 0.9, Align::Left));
+        let off = self.kk_off.get();
+        // (rows shown, rows in all) of the scrolling content, for the bar and the clamp
+        #[allow(unused_assignments)]
+        let (mut shown, mut total, mut new_off) = (1usize, 0usize, off);
+        if tab == 1 && !searching {
+            const PLACES: usize = 8;
+            let rows = ((pane[3] / 58.0) as usize).max(1);
+            (shown, total) = (rows, PLACES);
+            new_off = off.min(total.saturating_sub(rows));
+            for (row, i) in (new_off..PLACES).take(rows).enumerate() {
+                let r = [pane[0], pane[1] + row as f32 * 58.0, pane[2], 54.0];
+                kh.push((r, KHit::Place(i as u8)));
+                hover_bg(&mut p, r);
+                let (name, sub, icon) = place_info(i as u8);
+                fill(&mut p, [r[0] + 10.0, r[1] + 9.0, 36.0, 36.0], 10.0, theme.accent, 0.85);
+                let ic = map(r[0] + 28.0, r[1] + 27.0);
+                p.push(Panel::glyph(ic[0], ic[1], 20.0 * k, icon, [1.0; 3], 0.95));
+                text_at(&mut l, r[0] + 58.0, r[1] + 23.0, name, 14.0, false, 0.97);
+                text_at(&mut l, r[0] + 58.0, r[1] + 41.0, &sub, 11.0, false, 0.55);
+            }
+        } else {
+            let apps_of: Vec<usize> = if searching {
+                self.results.clone()
+            } else if sec == 0 {
+                if ctx.pinned.is_empty() { (0..list.len()).take(24).collect() } else { ctx.pinned.to_vec() }
+            } else if sec == 1 {
+                (0..list.len()).collect()
+            } else {
+                let g = cats[sec - 2].1;
+                (0..list.len()).filter(|&i| apps::group_of(&list[i]) == g).collect()
+            };
+            total = apps_of.len();
+            if apps_of.is_empty() {
+                let t = map(pane[0] + pane[2] / 2.0, pane[1] + 80.0);
+                l.push(Label::new(if searching { "No matches" } else { "Nothing here yet" }, t[0], t[1], 13.0, false, ink, 0.55, Align::Center));
+            }
+            if sec == 0 && !searching && grid {
+                let cols = ((pane[2] / 140.0) as usize).clamp(3, 6);
+                let cw = pane[2] / cols as f32;
+                let rows = ((pane[3] / 100.0) as usize).max(1);
+                let total_rows = total.div_ceil(cols);
+                (shown, total) = (rows, total_rows);
+                new_off = off.min(total_rows.saturating_sub(rows));
+                for (n, &ai) in apps_of.iter().enumerate().skip(new_off * cols).take(rows * cols) {
+                    let (col, row) = ((n % cols) as f32, (n / cols - new_off) as f32);
+                    let r = [pane[0] + col * cw + 2.0, pane[1] + row * 100.0 + 2.0, cw - 4.0, 96.0];
+                    self.hits.borrow_mut().push((r, ai));
+                    if inside(self.mouse, r) {
+                        fill(&mut p, r, 8.0, theme.accent, 0.18);
+                    }
+                    let ic = map(r[0] + r[2] / 2.0, r[1] + 34.0);
+                    push_icon(&mut p, ctx, &list[ai], ic, 44.0 * k, 44.0 * 0.2 * k);
+                    let t = map(r[0] + r[2] / 2.0, r[1] + 78.0);
+                    l.push(Label::new(trunc(&list[ai].name, (cw / 7.0) as usize), t[0], t[1], 11.5, false, ink, 0.95, Align::Center));
+                }
+            } else {
+                let rows = ((pane[3] / 50.0) as usize).max(1);
+                shown = rows;
+                new_off = off.min(total.saturating_sub(rows));
+                for (row, (n, &ai)) in apps_of.iter().enumerate().skip(new_off).take(rows).enumerate() {
+                    let r = [pane[0], pane[1] + row as f32 * 50.0, pane[2] - 8.0, 48.0];
+                    self.hits.borrow_mut().push((r, ai));
+                    if searching && n == self.sel {
+                        fill(&mut p, r, 7.0, theme.accent, 0.22);
+                    } else {
+                        hover_bg(&mut p, r);
+                    }
+                    let ic = map(r[0] + 28.0, r[1] + 24.0);
+                    push_icon(&mut p, ctx, &list[ai], ic, 32.0 * k, 32.0 * 0.2 * k);
+                    let sub = if !list[ai].generic_name.is_empty() { list[ai].generic_name.as_str() } else if searching { "Application" } else { "" };
+                    let ny = if sub.is_empty() { 29.0 } else { 21.0 };
+                    text_at(&mut l, r[0] + 58.0, r[1] + ny, &trunc(&list[ai].name, 44), 13.5, false, 0.97);
+                    if !sub.is_empty() {
+                        text_at(&mut l, r[0] + 58.0, r[1] + 38.0, &trunc(sub, 52), 11.0, false, 0.55);
+                    }
+                }
+            }
+        }
+        self.kk_off.set(new_off);
+        self.kk_shown.set(shown);
+        self.kk_total.set(total);
+        if total > shown {
+            let th = (pane[3] * shown as f32 / total as f32).max(24.0);
+            let ty = pane[1] + (pane[3] - th) * new_off as f32 / (total - shown) as f32;
+            fill(&mut p, [pane[0] + pane[2] - 4.0, ty, 4.0, th], 2.0, ink, 0.28);
+        }
         (p, l)
     }
 
@@ -1444,4 +1694,23 @@ fn push_icon(p: &mut Vec<Panel>, ctx: &DrawCtx, app: &AppEntry, c: [f32; 2], siz
             p.push(Panel::glyph(c[0], c[1], size * 0.58, "app-window", [1.0; 3], 0.95));
         }
     }
+}
+
+/// A Figlet row for a file found by meaning or by the words in it.
+fn semantic_item(h: crate::semsearch::Hit) -> Item {
+    use crate::semsearch::{Kind, Why};
+    let title = h.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let (tag, glyph, tint) = match h.kind {
+        Kind::Photo => ("Photo", "image", [0.95, 0.55, 0.30]),
+        Kind::Screenshot => ("Screenshot", "image", [0.40, 0.60, 0.95]),
+        Kind::Document => ("Document", "file-text", [0.35, 0.70, 0.55]),
+    };
+    let parent = h.path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let home = crate::fsops::home().display().to_string();
+    let parent = parent.strip_prefix(&home).map(|r| format!("~{r}")).unwrap_or(parent);
+    let sub = match h.why {
+        Why::Words(s) => format!("“{s}”"),
+        Why::Meaning(_) => format!("{} · {parent}", if h.kind == Kind::Document { "about it" } else { "looks like it" }),
+    };
+    Item { target: Target::File(h.path), title, sub, tag, glyph, tint, key: String::new(), cell: None }
 }

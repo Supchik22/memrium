@@ -108,6 +108,7 @@ impl State {
             return Some(self.renderer.render(&target, &items, &shell));
         }
         self.renderer.set_glass_adapt(self.theme.glass.adapt);
+        self.renderer.set_corners(self.theme.ui.corners);
         // shell: Dock, Quick Settings, labels
         let (bar_p, bar_l) = self.bar_draw();
         let mut shell = bar_p;
@@ -242,6 +243,9 @@ impl State {
             let lp = self.renderer.label_panels(&labels);
             shell.extend(lp);
         }
+        // (worked out before the items borrow the windows)
+        let intro = if self.capturing { None } else { self.intro_rems() };
+        let wall_view = if self.capturing { None } else { Some(self.wall_view_now()) };
         let ime = self.ime_popup_origins();
         let mut items = build_items(&self.wins, &self.popups, &self.surfaces, ime, focus, &docks, &title_panels, &self.theme, self.hover_btn, shells, desktop, &self.ghosts, self.renderer.scale().max(1.0), &self.rules, (self.ws_pos.x, self.size[0]));
         if let Some(l) = &preview {
@@ -260,6 +264,15 @@ impl State {
         // the picked area's picture, over everything the screen shows
         if let Some(e) = &self.shot_edit {
             items.push(Item::Surface { tex: e.tex(), rect: e.rect(), clip: None, frosted: false, alpha: 1.0, veil: 1.0 });
+        }
+        // the opening of the session (the desktop slides in) and the wallpaper's view (parallax, the opening's zoom)
+        if let Some(r) = intro {
+            intro_shift(&mut shell, &mut items, r, self.size);
+        }
+        if let Some((off, zoom)) = wall_view {
+            if self.renderer.set_wall_view(off, zoom) {
+                self.last_hash = 0;
+            }
         }
         let hash = self.frame_hash(&shell, &items);
         self.frame_skipped = self.allow_skip && !self.renderer.is_live() && hash == self.last_hash;
@@ -292,6 +305,67 @@ impl State {
         }
         memrium_de::renderer::shift_scene(&mut items, &mut shell, off[0], off[1]);
         Some(self.renderer.render_damaged(&target, &items, &shell, damage))
+    }
+
+    /// How far the opening of the session still has to go for a part that starts `delay` s in and takes `dur` s: 1 = not
+    /// yet moving, 0 = in place (a slight overshoot on the way, as a spring). None: no opening (played, or turned off).
+    fn intro_left(&mut self, delay: f32, dur: f32) -> Option<f32> {
+        if self.intro_done || !self.theme.animations.on("session_start") {
+            return None;
+        }
+        // it waits (everything still out of place) until the wallpaper is read, so it does not play over the default one
+        if self.intro_t0.is_none() && self.wall_rx.is_some() && self.start.elapsed().as_secs_f32() < 4.0 {
+            return Some(1.0);
+        }
+        let t0 = *self.intro_t0.get_or_insert_with(Instant::now);
+        let t = t0.elapsed().as_secs_f32() / self.theme.animations.speed.clamp(0.2, 4.0);
+        // (the longest part: the wallpaper's zoom)
+        if t > 1.6 {
+            self.intro_done = true;
+            self.intro_t0 = None;
+            return None;
+        }
+        let u = ((t - delay) / dur).clamp(0.0, 1.0);
+        // ease out with a little overshoot: 1 + c3 (u-1)^3 + c1 (u-1)^2
+        let (c1, c3) = (1.15f32, 2.15f32);
+        let e = 1.0 + c3 * (u - 1.0).powi(3) + c1 * (u - 1.0).powi(2);
+        Some(1.0 - e)
+    }
+
+    /// How far the bars, the bottom and the middle still have to go in the opening (see `intro_shift`).
+    fn intro_rems(&mut self) -> Option<[f32; 3]> {
+        let (Some(top), Some(bottom), Some(mid)) = (self.intro_left(0.10, 0.70), self.intro_left(0.22, 0.75), self.intro_left(0.34, 0.80)) else { return None };
+        Some([top, bottom, mid])
+    }
+
+    /// Where the wallpaper is moved to and how much it is enlarged (shares of the picture): it lies behind all the
+    /// desktops and moves a little with each (more for a layered one, whose near layers move more than the far ones),
+    /// follows the pointer when asked, and comes from a little closer at the opening.
+    fn wall_view_now(&mut self) -> ([f32; 2], f32) {
+        let layered = self.renderer.wall_layers() > 1;
+        let mut off = [0.0f32; 2];
+        let mut margin = 0.0f32;
+        if self.theme.animations.on("wallpaper_desktops") {
+            let span = if layered { 0.06 } else { 0.03 };
+            let k = span / (WORKSPACES - 1).max(1) as f32;
+            off[0] -= (self.ws_pos.x - (WORKSPACES - 1) as f32 / 2.0) * k;
+            margin += span / 2.0;
+        }
+        if self.theme.animations.on("wallpaper_pointer") {
+            let amp = if layered { 0.022 } else { 0.012 };
+            let m = [(self.mouse[0] / self.size[0].max(1.0)).clamp(0.0, 1.0), (self.mouse[1] / self.size[1].max(1.0)).clamp(0.0, 1.0)];
+            // eased after the pointer (each frame drawn goes a part of the way)
+            for i in 0..2 {
+                self.wall_ptr[i] += (m[i] - self.wall_ptr[i]) * 0.18;
+                if (m[i] - self.wall_ptr[i]).abs() < 0.0005 {
+                    self.wall_ptr[i] = m[i];
+                }
+                off[i] -= (self.wall_ptr[i] - 0.5) * 2.0 * amp;
+            }
+            margin += amp;
+        }
+        let zoom_left = self.intro_left(0.0, 1.5).unwrap_or(0.0).max(0.0);
+        (off, 1.0 + 2.0 * margin + 0.10 * zoom_left)
     }
 
     /// Forget the last frame so the next `render` draws for sure (VT switch, resize).
@@ -404,5 +478,40 @@ impl State {
             }
         }
         h.finish().max(1)
+    }
+}
+
+/// The opening: the bars come down from above, what is at the bottom (the Dock) comes up, the sides come in from the
+/// sides, and what is in the middle (desktop icons, widgets) gathers from further out, one after the other. `r` = how far
+/// the top, the bottom and the middle still have to go (1 = all the way).
+fn intro_shift(shell: &mut [Panel], items: &mut [Item<'_>], r: [f32; 3], size: [f32; 2]) {
+    let [top, bottom, mid] = r;
+    let [w, h] = size;
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    let shift = |p: &mut Panel| {
+        let (x, y) = (p.rect[0], p.rect[1]);
+        if y < h * 0.16 {
+            p.rect[1] -= top * 90.0;
+        } else if y > h * 0.84 {
+            p.rect[1] += bottom * 140.0;
+        } else if x < w * 0.12 {
+            p.rect[0] -= mid * 120.0;
+        } else if x > w * 0.88 {
+            p.rect[0] += mid * 120.0;
+        } else {
+            // from a spread-out place towards its own
+            p.rect[0] += (x - cx) * mid * 0.45;
+            p.rect[1] += (y - cy) * mid * 0.45;
+        }
+    };
+    for p in shell.iter_mut() {
+        shift(p);
+    }
+    for it in items.iter_mut() {
+        if let Item::Layer { panels, .. } = it {
+            for p in panels.iter_mut() {
+                shift(p);
+            }
+        }
     }
 }

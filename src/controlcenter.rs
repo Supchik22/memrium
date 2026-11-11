@@ -7,6 +7,10 @@ use crate::renderer::{Align, Label, Panel};
 use chebrium::spring::Spring;
 use crate::sysctl::SysInfo;
 
+mod fettle;
+pub use fettle::{CcDevice, CcLists, CcNetwork, CcNode, CcWants};
+use fettle::{Liquid, RowAct};
+
 const FREE: usize = usize::MAX;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -31,6 +35,35 @@ pub enum Kind {
     FlatOn,
     /// takes clicks but draws nothing (slider rows, the menu-bar pill of a Windows layout)
     Clear,
+    /// Fettle: the one matte sheet every control sits on (it never moves under the pointer)
+    Sheet,
+    /// Fettle: a control that is off (a faint chip on the sheet), and one that is on (the accent colour)
+    Chip,
+    ChipOn,
+    /// Fettle: an opaque fill of the tile's own `color` (the day / night sky of the dark mode control)
+    Paint,
+}
+
+/// A level dragged near 0, a half or full sticks there a little (so they are easy to hit).
+fn snap_level(v: f32) -> f32 {
+    let v = v.clamp(0.0, 1.0);
+    [0.0, 0.5, 1.0].into_iter().find(|s| (v - s).abs() < 0.025).unwrap_or(v)
+}
+
+/// A key the open dropdown understands (Fettle).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CcKey {
+    Left,
+    Right,
+    Up,
+    Down,
+    Next,
+    Prev,
+    /// switch / run / mute
+    Enter,
+    /// open the control's list
+    Open,
+    Esc,
 }
 
 /// How the Quick Settings looks: macOS glass pills, or Fluent quick settings.
@@ -39,6 +72,8 @@ pub enum CcStyle {
     #[default]
     Mac,
     Windows,
+    /// Memrium's own: one sheet of controls that show their state, grow in place and pour like liquid (see `fettle`)
+    Fettle,
 }
 
 /// How the Now Playing tile looks: the classic player card, a whole record turning, or half a record peeking up
@@ -107,6 +142,30 @@ pub enum CcEvent {
     Layout(Vec<CcTile>),
     /// put a widget of this kind on the desktop (picked in the edit mode's gallery)
     AddWidget(String),
+    /// Fettle's lists: join this Wi-Fi network (saved or open), run `bluetoothctl` with these arguments, make this
+    /// PipeWire output the default, set the volume of a node (an app's stream)
+    WifiConnect(String),
+    Bluetooth(Vec<String>),
+    DefaultSink(u32),
+    NodeVolume(u32, f32),
+    /// open the shell's full card of this kind (`network`, `bluetooth`, `audio`, `notifications`): what the compact
+    /// list cannot do
+    Card(String),
+    /// Focus (do not disturb): off, or on for that long
+    Focus(FocusFor),
+}
+
+/// How long Focus (do not disturb) stays on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusFor {
+    Off,
+    Hour,
+    /// until the evening (18:00; later on, until the night)
+    Evening,
+    /// until 8 tomorrow morning
+    Morning,
+    /// until it is turned off
+    On,
 }
 
 /// What pressing a tile does.
@@ -115,9 +174,15 @@ enum TileAct {
     Wifi,
     Bluetooth,
     Mute,
+    /// Focus (do not disturb) on / off
+    Focus,
     Action(String),
     Slider(Slider),
     Media,
+    /// Fettle: grow this layout entry in place (or shrink it back)
+    Expand(usize),
+    /// Fettle: a row of a grown tile's list
+    Row(RowAct),
 }
 
 /// A press on a tile in edit mode: a tap steps through its options, a drag moves it.
@@ -132,6 +197,23 @@ struct TilePress {
     moved: bool,
 }
 
+/// A press on the open dropdown that is either a tap or, held still, the way into the edit mode.
+#[derive(Clone, Debug)]
+struct Hold {
+    from: [f32; 2],
+    /// seconds held so far, by the frames' steps; and when it began (the steps follow the animation speed, and an idle
+    /// desktop takes few of them: the clock decides as well)
+    t: f32,
+    since: std::time::Instant,
+    /// what a tap does (none: a press on the glass between the controls)
+    act: Option<TileAct>,
+    /// Fettle: held, this layout entry grows in place (instead of the edit mode opening)
+    expand: Option<usize>,
+}
+
+/// How long a press is held still to edit the controls, seconds.
+const HOLD_SECS: f32 = 0.45;
+
 /// the tile belongs to no layout entry (the bar pill, the Edit button)
 const NONE: usize = usize::MAX;
 /// top of the tile grid (just under the menu bar), as built
@@ -141,6 +223,8 @@ const GRID_TOP: f32 = 54.0;
 enum Slider {
     Display,
     Sound,
+    /// an app's stream in Fettle's mixer
+    Node(u32),
 }
 
 pub struct Tile {
@@ -149,6 +233,8 @@ pub struct Tile {
     pub size: [f32; 2],
     pub radius: f32,
     pub scale: Spring,
+    /// the fill of a `Kind::Paint` tile
+    pub color: [f32; 3],
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -208,6 +294,9 @@ pub struct ControlCenter {
     tracks: Vec<(usize, (f32, f32))>,
     drag_track: (f32, f32),
     press: Option<TilePress>,
+    /// a press held on the open dropdown (not in edit mode): released soon it is a tap (the tile's action runs then),
+    /// held still for `HOLD_SECS` it opens the edit mode instead (there is no Edit button)
+    hold: Option<Hold>,
     /// which list the edit mode's gallery shows: 0 = controls, 1 = desktop widgets
     pub(crate) gallery_tab: usize,
     media_tile: usize,
@@ -221,10 +310,31 @@ pub struct ControlCenter {
     disp_track: (f32, f32),
     snd_track: (f32, f32),
     drag: Option<Slider>,
+    /// Fettle's sliders follow the pointer from where they were (not from where it pressed): the press x and the value
+    /// then; whether the pointer has moved yet
+    drag_anchor: Option<[f32; 2]>,
+    drag_moved: bool,
+    /// Fettle: the control the keyboard is on (a layout entry)
+    kb_focus: Option<usize>,
+    /// what played last (title, artist): the Now Playing card shows it while nothing plays
+    last_played: Option<(String, String)>,
+    /// Focus (do not disturb) is on, and until when ("Until 18:00"; None: until turned off)
+    focus_on: bool,
+    focus_until: Option<String>,
     /// when a slider was last moved (the machine's reading is not trusted for a moment after)
     last_drag: Option<std::time::Instant>,
     events: Vec<CcEvent>,
     style: CcStyle,
+    /// what lies under Fettle's controls (nothing, a pane of glass, or the desktop blurred)
+    backing: crate::theme::QuickBacking,
+    /// Fettle: where a grown control shows its list
+    grow_mode: crate::theme::QuickGrow,
+    /// the tile of a control opened over the others, or of the list shown beside them (FREE: none)
+    side_tile: usize,
+    /// the control whose list is shown beside the controls (its chevron points at it)
+    list_beside: Option<usize>,
+    /// how far the sheet is glass although the backing says nothing (the list on one sheet with the controls)
+    sheet_glass: f32,
     dark: bool,
     accent: [f32; 3],
     /// vertical extent of the dropdown as built (it is moved to the real bar afterwards)
@@ -235,6 +345,17 @@ pub struct ControlCenter {
     /// which panels / labels belong to the bar itself (decided before they were moved)
     bar_p: Vec<bool>,
     bar_l: Vec<bool>,
+    /// Fettle: the lists the shell read (networks, devices, outputs, apps), the layout entry grown in place (and the
+    /// one still shrinking back), how far it has grown, night for the dark mode control, the two liquids, the size
+    /// badges of edit mode (layout entry, centre) and the sheet's tile
+    lists: CcLists,
+    expanded: Option<usize>,
+    exp_shown: Option<usize>,
+    exp_k: Spring,
+    dark_k: Spring,
+    liquid: [Liquid; 2],
+    size_hits: Vec<(usize, usize, [f32; 2])>,
+    sheet_tile: usize,
 }
 
 const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
@@ -281,6 +402,7 @@ impl ControlCenter {
             tracks: Vec::new(),
             drag_track: (0.0, 1.0),
             press: None,
+            hold: None,
             gallery_tab: 0,
             media_tile: FREE,
             wifi_tile: FREE,
@@ -293,9 +415,20 @@ impl ControlCenter {
             disp_track: (0.0, 1.0),
             snd_track: (0.0, 1.0),
             drag: None,
+            drag_anchor: None,
+            drag_moved: false,
+            kb_focus: None,
+            focus_on: false,
+            last_played: None,
+            focus_until: None,
             last_drag: None,
             events: Vec::new(),
             style: CcStyle::Mac,
+            backing: crate::theme::QuickBacking::None,
+            grow_mode: crate::theme::QuickGrow::Over,
+            side_tile: FREE,
+            list_beside: None,
+            sheet_glass: 0.0,
             dark: false,
             accent: [0.04, 0.52, 1.0],
             dd_top: 54.0,
@@ -304,6 +437,14 @@ impl ControlCenter {
             settings_tile: FREE,
             bar_p: Vec::new(),
             bar_l: Vec::new(),
+            lists: CcLists::default(),
+            expanded: None,
+            exp_shown: None,
+            exp_k: Spring::new(0.0, 260.0, 0.78),
+            dark_k: Spring::new(0.0, 120.0, 0.9),
+            liquid: [Liquid::default(), Liquid::default()],
+            size_hits: Vec::new(),
+            sheet_tile: FREE,
         };
         cc.build();
         cc.relocate();
@@ -324,17 +465,29 @@ impl ControlCenter {
     }
 
     fn rebuild(&mut self) {
+        // the hover / press springs carry over when the same tiles come back (a Fettle animation rebuilds every frame)
+        let springs: Vec<Spring> = self.tiles.iter().map(|t| t.scale.clone()).collect();
+        self.size_hits.clear();
+        self.sheet_tile = FREE;
         self.tiles.clear();
         self.panels.clear();
         self.labels.clear();
         self.acts.clear();
         self.owner.clear();
         self.spec_tile.clear();
+        self.side_tile = FREE;
+        self.list_beside = None;
+        self.sheet_glass = 0.0;
         self.media_hits.clear();
         self.tracks.clear();
         self.building = NONE;
         self.build();
         self.relocate();
+        if springs.len() == self.tiles.len() {
+            for (t, s) in self.tiles.iter_mut().zip(springs) {
+                t.scale = s;
+            }
+        }
     }
 
     /// The machine's state (Wi-Fi, Bluetooth, volume, brightness): the tiles show it.
@@ -352,6 +505,9 @@ impl ControlCenter {
     }
 
     pub fn set_media(&mut self, m: &CcMedia) {
+        if m.present && !m.title.is_empty() {
+            self.last_played = Some((m.title.clone(), m.artist.clone()));
+        }
         if &self.media != m {
             self.media = m.clone();
             self.rebuild();
@@ -388,12 +544,57 @@ impl ControlCenter {
         std::mem::take(&mut self.events)
     }
 
+    /// The level a slider shows now.
+    fn slider_value(&self, which: Slider) -> f32 {
+        match which {
+            Slider::Display => self.sys.brightness.unwrap_or(0.5),
+            Slider::Sound => self.sys.volume.unwrap_or(0.5).min(1.0),
+            Slider::Node(id) => self.lists.streams.iter().find(|n| n.id == id).map_or(0.5, |n| n.vol.min(1.0)),
+        }
+    }
+
+    /// The drag of a slider ends: sound pulled all the way down is muted, and keeps the level it had, so unmuting
+    /// brings that back.
+    fn end_drag(&mut self) {
+        if let (Some(Slider::Sound), Some([_, v0]), true) = (self.drag, self.drag_anchor, self.drag_moved) {
+            if self.sys.volume.is_some_and(|v| v <= 0.0) && v0 > 0.0 {
+                self.sys.volume = Some(v0);
+                self.events.push(CcEvent::SetVolume(v0));
+                if !self.sys.muted {
+                    self.sys.muted = true;
+                    self.events.push(CcEvent::ToggleMute);
+                }
+                self.rebuild();
+            }
+        }
+        self.drag = None;
+        self.drag_anchor = None;
+        self.drag_moved = false;
+    }
+
     /// Move the dragged slider to where the pointer is.
     fn drag_to(&mut self, x: f32) {
         let Some(which) = self.drag else { return };
         self.last_drag = Some(std::time::Instant::now());
         let (a, b) = self.drag_track;
-        let v = ((x - a) / (b - a)).clamp(0.0, 1.0);
+        let v = match self.drag_anchor {
+            Some([x0, v0]) => {
+                // a press alone changes nothing: the level follows the pointer once it moves, from where it was
+                if !self.drag_moved && (x - x0).abs() < 3.0 {
+                    return;
+                }
+                if !self.drag_moved {
+                    self.drag_moved = true;
+                    // turning a muted sound up unmutes it
+                    if which == Slider::Sound && self.sys.muted && x > x0 {
+                        self.sys.muted = false;
+                        self.events.push(CcEvent::ToggleMute);
+                    }
+                }
+                snap_level(v0 + (x - x0) / (b - a))
+            }
+            None => ((x - a) / (b - a)).clamp(0.0, 1.0),
+        };
         match which {
             Slider::Display if self.sys.brightness.is_some() => {
                 if self.sys.brightness.is_some_and(|c| (c - v).abs() < 0.01) {
@@ -408,6 +609,15 @@ impl ControlCenter {
                 }
                 self.sys.volume = Some(v);
                 self.events.push(CcEvent::SetVolume(v));
+            }
+            Slider::Node(id) => {
+                let Some(n) = self.lists.streams.iter_mut().find(|n| n.id == id) else { return };
+                if (n.vol.min(1.0) - v).abs() < 0.01 {
+                    return;
+                }
+                n.vol = v;
+                self.lists.held = Some(std::time::Instant::now());
+                self.events.push(CcEvent::NodeVolume(id, v));
             }
             _ => return,
         }
@@ -446,6 +656,8 @@ impl ControlCenter {
         self.open_k.target = if on { 1.0 } else { 0.0 };
         if !on {
             self.set_edit(false);
+            self.collapse_now();
+            self.kb_focus = None;
         }
     }
 
@@ -469,6 +681,7 @@ impl ControlCenter {
     pub fn set_edit(&mut self, on: bool) {
         if on {
             self.set_open(true);
+            self.collapse_now();
         }
         self.edit = on;
         self.edit_k.target = if on { 1.0 } else { 0.0 };
@@ -582,7 +795,7 @@ impl ControlCenter {
     }
 
     fn tile(&mut self, kind: Kind, cx: f32, cy: f32, w: f32, h: f32, r: f32) -> usize {
-        self.tiles.push(Tile { kind, c: [cx, cy], size: [w, h], radius: r, scale: Spring::new(1.0, 380.0, 0.5) });
+        self.tiles.push(Tile { kind, c: [cx, cy], size: [w, h], radius: r, scale: Spring::new(1.0, 380.0, 0.5), color: [0.0; 3] });
         self.owner.push(self.building);
         self.tiles.len() - 1
     }
@@ -605,16 +818,47 @@ impl ControlCenter {
         match self.style {
             CcStyle::Mac => self.build_mac(),
             CcStyle::Windows => self.build_windows(),
+            CcStyle::Fettle => self.build_fettle(),
         }
     }
 
     /// Switch between the macOS and the Windows look (and follow light / dark and the accent colour).
     pub fn set_style(&mut self, style: CcStyle, dark: bool, accent: [f32; 3]) {
         if self.style != style || self.dark != dark || self.accent != accent {
+            if self.style != style {
+                // a new look starts with its night already where it belongs (no sunset on switching)
+                self.dark_k = Spring::new(if dark { 1.0 } else { 0.0 }, 120.0, 0.9);
+                self.expanded = None;
+                self.exp_shown = None;
+                self.exp_k = Spring::new(0.0, 260.0, 0.78);
+            }
+            self.dark_k.target = if dark { 1.0 } else { 0.0 };
             self.style = style;
             self.dark = dark;
             self.accent = accent;
             self.rebuild();
+        }
+    }
+
+    /// What lies under Fettle's controls.
+    pub fn set_backing(&mut self, b: crate::theme::QuickBacking) {
+        self.backing = b;
+    }
+
+    /// Focus (do not disturb) as the shell has it: on or off, and until when.
+    pub fn set_focus(&mut self, on: bool, until: Option<String>) {
+        if self.focus_on != on || self.focus_until != until {
+            self.focus_on = on;
+            self.focus_until = until;
+            self.rebuild();
+        }
+    }
+
+    /// Where a Fettle control shows its list: beside the controls, or grown in place.
+    pub fn set_grow(&mut self, g: crate::theme::QuickGrow) {
+        if self.grow_mode != g {
+            self.grow_mode = g;
+            self.collapse_now();
         }
     }
 
@@ -647,14 +891,11 @@ impl ControlCenter {
         }
         self.building = NONE;
 
-        // ---- the Edit button under the last row
+        // ---- no Edit button: a press held still on the dropdown opens the edit mode (see `Hold`)
         let bottom = GRID_TOP + cctiles::rows(&layout) as f32 * (cctiles::CELL_H + cctiles::GAP) - cctiles::GAP;
-        let scx = x0 + 167.0;
-        let eb = self.tile(Kind::Dark, scx, bottom + 30.0, 112.0, 26.0, 13.0);
-        self.text(eb, "Edit controls", scx, bottom + 34.5, 11.5, true, WHITE, 1.0, Align::Center);
-        self.edit_btn = eb;
+        self.edit_btn = self.tile(Kind::Clear, -1000.0, -1000.0, 0.0, 0.0, 0.0);
         self.dd_top = GRID_TOP;
-        self.dd_bottom = bottom + 43.0;
+        self.dd_bottom = bottom + 14.0;
 
         // ---- edit mode only: free cells to drop a tile on, and the Accessibility-style pill on the bar
         let rows = (cctiles::rows(&layout) + 1).min(cctiles::MAX_ROWS);
@@ -666,7 +907,7 @@ impl ControlCenter {
                 }
             }
         }
-        self.panels.push(Att { tile: FREE, vis: Vis::Edit, item: Panel::glass(pill_x - 40.0, 19.0, 34.0, 26.0, 13.0).tinted([0.10, 0.42, 0.98, 0.80]).shadow(0.12, 10.0, 3.0) });
+        self.panels.push(Att { tile: FREE, vis: Vis::Edit, item: Panel::glass(pill_x - 40.0, 19.0, 34.0, 26.0, 13.0).tinted([self.accent[0], self.accent[1], self.accent[2], 0.80]).shadow(0.12, 10.0, 3.0) });
         self.panels.push(Att { tile: FREE, vis: Vis::Edit, item: Panel::glyph(pill_x - 40.0, 19.0, 15.0, "plus", WHITE, 1.0) });
     }
 
@@ -774,7 +1015,12 @@ impl ControlCenter {
         // y positions below were designed for a card 154 px tall centred on 131; `y(v)` maps them to this tile
         let y = |v: f32| cy + v - 131.0;
         let short = |s: &str, n: usize| if s.chars().count() > n { format!("{}…", s.chars().take(n).collect::<String>()) } else { s.to_string() };
-        let (title, artist) = if self.media.present { (short(&self.media.title, 17), short(&self.media.artist, 20)) } else { ("Not Playing".to_string(), String::new()) };
+        // nothing playing: what played last, rather than an empty card
+        let (title, artist) = match &self.last_played {
+            _ if self.media.present && !self.media.title.is_empty() => (short(&self.media.title, 17), short(&self.media.artist, 20)),
+            Some((t, a)) => (short(t, 17), short(&if a.is_empty() { "Last played".to_string() } else { format!("Last played · {a}") }, 22)),
+            None => ("Not Playing".to_string(), String::new()),
+        };
         let (back, play, next) = ("skip-back", if self.media.playing { "pause" } else { "play" }, "skip-forward");
         let mut hits: Vec<([f32; 2], f32, CcMediaCmd)> = Vec::new();
         match look {
@@ -906,50 +1152,21 @@ impl ControlCenter {
             return self.edit_mouse_down(m);
         }
         if self.open {
-            let eb = &self.tiles[self.edit_btn];
-            if Self::rect_hit(m, eb.c, eb.size) {
-                self.set_edit(true);
-                return true;
-            }
             // the tiles that do something (the one drawn last is on top)
             let hit = |t: usize| t != FREE && t < self.tiles.len() && Self::rect_hit(m, self.tiles[t].c, self.tiles[t].size);
+            if self.style == CcStyle::Fettle {
+                return self.fettle_mouse_down(m);
+            }
             for (tile, act) in self.acts.clone().into_iter().rev() {
                 if !hit(tile) {
                     continue;
                 }
-                match act {
-                    TileAct::Wifi => {
-                        if let Some(w) = &self.sys.wifi {
-                            self.events.push(CcEvent::SetWifi(!w.enabled));
-                        }
-                    }
-                    TileAct::Bluetooth => {
-                        if let Some(b) = &self.sys.bluetooth {
-                            self.events.push(CcEvent::SetBluetooth(!b.powered));
-                        }
-                    }
-                    TileAct::Mute => self.events.push(CcEvent::ToggleMute),
-                    TileAct::Action(name) => {
-                        // switching the look keeps the dropdown open; running something closes it
-                        let keep = name == "dark-mode";
-                        self.events.push(CcEvent::Action(name));
-                        if !keep {
-                            self.set_open(false);
-                        }
-                    }
-                    TileAct::Slider(which) => {
-                        self.drag = Some(which);
-                        self.drag_track = self.tracks.iter().find(|(t, _)| *t == tile).map_or((0.0, 1.0), |(_, tr)| *tr);
-                        self.drag_to(m[0]);
-                    }
-                    TileAct::Media => {
-                        let c = self.tiles[tile].c;
-                        let cmd = self.media_hits.iter().find(|(t, off, r, _)| *t == tile && (m[0] - (c[0] + off[0])).hypot(m[1] - (c[1] + off[1])) < *r).map(|h| h.3);
-                        if let Some(cmd) = cmd {
-                            self.events.push(CcEvent::Media(cmd));
-                        }
-                    }
+                // a switch or an action waits for the release: held still instead, the press edits the controls
+                if self.style == CcStyle::Mac && matches!(act, TileAct::Wifi | TileAct::Bluetooth | TileAct::Mute | TileAct::Action(_)) {
+                    self.hold = Some(Hold { from: m, t: 0.0, since: std::time::Instant::now(), act: Some(act), expand: None });
+                    return true;
                 }
+                self.run_act(tile, act, m);
                 return true;
             }
             // Windows quick settings keep their tiles in fields
@@ -1000,10 +1217,64 @@ impl ControlCenter {
             let inside = self.tiles.iter().enumerate().any(|(i, t)| i != self.menu_tile && Self::rect_hit(m, t.c, t.size));
             if !inside {
                 self.set_open(false);
+            } else if self.style == CcStyle::Mac {
+                self.hold = Some(Hold { from: m, t: 0.0, since: std::time::Instant::now(), act: None, expand: None });
             }
             return inside;
         }
         false
+    }
+
+    /// Run what a tile of the layout does (`m`: where it was pressed, for the player's buttons and the sliders).
+    fn run_act(&mut self, tile: usize, act: TileAct, m: [f32; 2]) {
+        match act {
+            TileAct::Wifi => {
+                if let Some(w) = &self.sys.wifi {
+                    self.events.push(CcEvent::SetWifi(!w.enabled));
+                }
+            }
+            TileAct::Bluetooth => {
+                if let Some(b) = &self.sys.bluetooth {
+                    self.events.push(CcEvent::SetBluetooth(!b.powered));
+                }
+            }
+            TileAct::Mute => self.events.push(CcEvent::ToggleMute),
+            TileAct::Focus => {
+                let to = if self.focus_on { FocusFor::Off } else { FocusFor::On };
+                self.events.push(CcEvent::Focus(to));
+                self.focus_on = to != FocusFor::Off;
+                self.focus_until = None;
+                self.rebuild();
+            }
+            TileAct::Action(name) => {
+                // switching the look keeps the dropdown open; running something closes it
+                let keep = name == "dark-mode";
+                self.events.push(CcEvent::Action(name));
+                if !keep {
+                    self.set_open(false);
+                }
+            }
+            TileAct::Slider(which) => {
+                self.drag = Some(which);
+                self.drag_track = self.tracks.iter().find(|(t, _)| *t == tile).map_or((0.0, 1.0), |(_, tr)| *tr);
+                if self.style == CcStyle::Fettle {
+                    // Fettle's liquid follows the pointer from its level: a stray press never blasts the sound
+                    self.drag_anchor = Some([m[0], self.slider_value(which)]);
+                    self.drag_moved = false;
+                } else {
+                    self.drag_to(m[0]);
+                }
+            }
+            TileAct::Media => {
+                let c = self.tiles[tile].c;
+                let cmd = self.media_hits.iter().find(|(t, off, r, _)| *t == tile && (m[0] - (c[0] + off[0])).hypot(m[1] - (c[1] + off[1])) < *r).map(|h| h.3);
+                if let Some(cmd) = cmd {
+                    self.events.push(CcEvent::Media(cmd));
+                }
+            }
+            TileAct::Expand(spec) => self.set_expanded(if self.expanded == Some(spec) { None } else { Some(spec) }),
+            TileAct::Row(row) => self.run_row(row),
+        }
     }
 
     /// Edit mode: Done, the gallery (add a control), and the tiles (remove, tap to change the look, drag to move).
@@ -1011,6 +1282,18 @@ impl ControlCenter {
         let (c, s) = self.done_rect();
         if Self::rect_hit(m, c, s) {
             self.set_edit(false);
+            return true;
+        }
+        // Fettle: the size badge in a tile's corner steps it through small, medium and large
+        let at = |t: usize, off: [f32; 2]| self.tiles.get(t).map_or([-1e4; 2], |t| [t.c[0] + off[0], t.c[1] + off[1]]);
+        if let Some(&(spec, _, _)) = self.size_hits.iter().find(|(_, t, off)| {
+            let c = at(*t, *off);
+            (m[0] - c[0]).hypot(m[1] - c[1]) < 13.0
+        }) {
+            if fettle::cycle_size(&mut self.layout, spec) {
+                self.events.push(CcEvent::Layout(self.layout.clone()));
+                self.rebuild();
+            }
             return true;
         }
         // the two tabs of the gallery
@@ -1100,11 +1383,17 @@ impl ControlCenter {
 
     pub fn update(&mut self, dt: f32, an: &crate::theme::AnimStyle, mouse: [f32; 2], pressed: bool, dragging: bool) {
         let dragging_tile = self.press.is_some_and(|p| p.moved);
+        let focus_tile = self.kb_focus.and_then(|f| self.spec_tile.get(f).copied());
         for (i, t) in self.tiles.iter_mut().enumerate() {
             let hit = Self::rect_hit(mouse, t.c, t.size);
             let carried = dragging_tile && self.press.is_some_and(|p| self.owner.get(i).copied() == Some(p.spec));
+            let sheet = t.kind == Kind::Sheet || t.kind == Kind::Clear;
             t.scale.target = match (hit, pressed, self.style) {
                 _ if carried => 1.06,
+                _ if sheet => 1.0,
+                _ if focus_tile == Some(i) && self.style == CcStyle::Fettle => 1.04,
+                (true, true, CcStyle::Fettle) if !dragging => 0.96,
+                (_, _, CcStyle::Fettle) => 1.0,
                 (true, true, CcStyle::Mac) if !dragging => 0.93,
                 (true, true, CcStyle::Windows) if !dragging => 0.97,
                 (true, true, _) => 1.0,
@@ -1115,6 +1404,9 @@ impl ControlCenter {
         }
         an.step("control_center", &mut self.edit_k, dt);
         an.step("control_center", &mut self.open_k, dt);
+        if self.style == CcStyle::Fettle && self.fettle_step(dt, an) {
+            self.rebuild();
+        }
         if let Some(mut p) = self.press {
             if pressed {
                 p.mouse = mouse;
@@ -1125,11 +1417,31 @@ impl ControlCenter {
                 self.finish_press(p);
             }
         }
+        if let Some(mut h) = self.hold.take() {
+            if !pressed {
+                // let go before the time: a tap
+                if let Some(act) = h.act.take() {
+                    self.run_act(NONE, act, h.from);
+                }
+            } else if (mouse[0] - h.from[0]).hypot(mouse[1] - h.from[1]) > 8.0 {
+                // slid away: neither a tap nor a hold
+            } else {
+                h.t += dt;
+                if h.t.max(h.since.elapsed().as_secs_f32()) >= HOLD_SECS {
+                    match h.expand {
+                        Some(spec) => self.set_expanded(Some(spec)),
+                        None => self.set_edit(true),
+                    }
+                } else {
+                    self.hold = Some(h);
+                }
+            }
+        }
         if self.drag.is_some() {
             if pressed {
                 self.drag_to(mouse[0]);
             } else {
-                self.drag = None;
+                self.end_drag();
             }
         }
     }
@@ -1163,6 +1475,27 @@ impl ControlCenter {
         if self.dark { [0.08, 0.08, 0.10, 0.52] } else { [0.84, 0.89, 0.98, 0.34] }
     }
 
+    /// By day on the accent sheet, a control that is off is white: what is written on it (and on the rows and buttons
+    /// inside it) is dark instead of Fettle's white.
+    fn dark_ink(&self, tile: usize) -> bool {
+        if self.dark || self.sheet_glass < 0.5 || tile >= self.tiles.len() {
+            return false;
+        }
+        let t = &self.tiles[tile];
+        match t.kind {
+            Kind::Chip => true,
+            Kind::Clear => {
+                // a row or a button: dark when it lies inside its control's white pane
+                let main = self.owner.get(tile).and_then(|&o| self.spec_tile.get(o)).copied().filter(|&m| m < self.tiles.len());
+                main.is_some_and(|m| {
+                    let p = &self.tiles[m];
+                    p.kind == Kind::Chip && (t.c[0] - p.c[0]).abs() <= p.size[0] / 2.0 && (t.c[1] - p.c[1]).abs() <= p.size[1] / 2.0
+                })
+            }
+            _ => false,
+        }
+    }
+
     fn is_ink(c: [f32; 3]) -> bool {
         let near = |a: [f32; 3], b: [f32; 3]| (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3 && (a[2] - b[2]).abs() < 1e-3;
         near(c, WHITE) || near(c, INK)
@@ -1175,10 +1508,53 @@ impl ControlCenter {
         match t.kind {
             Kind::Light => self.glass.panel(cx, cy, w, h, r).adaptive(),
             Kind::Dark => g(self.dark_tint()).adaptive(),
-            Kind::Active => g([0.10, 0.40, 0.98, 0.80]),
+            // what is on takes the accent colour, like every other "on" in the shell
+            Kind::Active => g([self.accent[0], self.accent[1], self.accent[2], 0.80]),
             Kind::Circle => g([0.78, 0.84, 0.96, 0.38]).shadow(0.0, 0.0, 0.0).adaptive(),
-            Kind::Glow => g([0.42, 0.58, 0.98, 0.60]).shadow(0.0, 0.0, 0.0),
+            Kind::Glow => {
+                let a = self.accent;
+                g([a[0] * 0.6 + 0.4, a[1] * 0.6 + 0.4, a[2] * 0.6 + 0.4, 0.60]).shadow(0.0, 0.0, 0.0)
+            }
             Kind::White => Panel::white(cx, cy, w, h, r),
+            // the controls are glass like the classic look's, floating on their own: the sheet under them only takes the
+            // clicks between them (a pane of glass behind glass washed them out)
+            // under Fettle's controls: nothing (it only takes the clicks between them), a pane of glass, or the desktop
+            // just blurred (no tint to speak of, no refraction, no rim)
+            // the list on one sheet with the controls: the sheet turns to the accent as the list comes out (and with no
+            // backing it is glass only that long)
+            Kind::Sheet if self.sheet_glass > 0.0 => {
+                let (d, a, k) = (self.dark_tint(), self.accent, self.sheet_glass);
+                let tint = [d[0] + (a[0] - d[0]) * k, d[1] + (a[1] - d[1]) * k, d[2] + (a[2] - d[2]) * k, d[3] + (0.80 - d[3]) * k];
+                let mut p = g(tint);
+                if self.backing == crate::theme::QuickBacking::None {
+                    p.fade_by(k);
+                }
+                p
+            }
+            Kind::Sheet => match self.backing {
+                crate::theme::QuickBacking::None => Panel::solid(cx, cy, w.max(1.0), h.max(1.0), r, [0.0; 3], [0.0; 3]).flat().alpha(0.0),
+                crate::theme::QuickBacking::Glass => g(self.dark_tint()).adaptive(),
+                crate::theme::QuickBacking::Blur => {
+                    let tint = if self.dark { [0.05, 0.05, 0.07, 0.14] } else { [1.0, 1.0, 1.0, 0.10] };
+                    let mut p = g(tint).shadow(0.0, 0.0, 0.0);
+                    p.params[3] = 0.0;
+                    p.fx = [p.fx[0].max(28.0), 0.0, 0.0, 0.0];
+                    p.color2 = [0.0; 4];
+                    p
+                }
+            },
+            // on the accent sheet (the list on one sheet with the controls) a control that is off is a denser, neutral
+            // pane: the accent under it must not show through and make it look on
+            Kind::Chip if self.sheet_glass > 0.0 => {
+                // white by day (its words and icons turn dark, see `dark_ink`), smoke by night
+                let (d, k) = (self.dark_tint(), self.sheet_glass);
+                let to = if self.dark { [0.10, 0.10, 0.12, 0.84] } else { [0.98, 0.98, 0.995, 0.88] };
+                let tint = [d[0] + (to[0] - d[0]) * k, d[1] + (to[1] - d[1]) * k, d[2] + (to[2] - d[2]) * k, d[3] + (to[3] - d[3]) * k];
+                g(tint)
+            }
+            Kind::Chip => g(self.dark_tint()).adaptive(),
+            Kind::ChipOn => g([self.accent[0], self.accent[1], self.accent[2], 0.80]),
+            Kind::Paint => Panel::solid(cx, cy, w, h, r, t.color, [t.color[0] * 0.8, t.color[1] * 0.8, t.color[2] * 0.85]).flat(),
             Kind::Acrylic => {
                 let tint = if self.dark { [0.12, 0.12, 0.12, 0.84] } else { [0.96, 0.97, 0.99, 0.84] };
                 let mut p = g(tint);
@@ -1216,9 +1592,9 @@ impl ControlCenter {
         [a[0] + (p[0] - a[0]) * k, a[1] + (p[1] - a[1]) * k]
     }
 
-    /// A big tile or card in the Mac look gets squircle corners (a negative radius says so to the shader).
+    /// A big tile or card in the Mac look and in Fettle gets squircle corners (a negative radius says so to the shader).
     fn squircle(&self, mut p: Panel) -> Panel {
-        if self.style == CcStyle::Mac && p.params[0] > 0.0 && matches!(p.params[1].floor() as u32, 0..=2) && p.rect[3] > 14.0 {
+        if matches!(self.style, CcStyle::Mac | CcStyle::Fettle) && p.params[0] > 0.0 && matches!(p.params[1].floor() as u32, 0..=2) && p.rect[3] > 14.0 {
             p.params[0] = -p.params[0];
         }
         p
@@ -1250,8 +1626,9 @@ impl ControlCenter {
                 let off = self.carried(i);
                 p.rect[0] += off[0];
                 p.rect[1] += off[1];
-                shapes[i] = Some(([p.rect[0], p.rect[1]], [p.rect[2], p.rect[3]], p.params[0]));
+                // the corner as the tile is drawn (squircle code and all), so a record cut to it follows the same curve
                 let mut p = self.squircle(p);
+                shapes[i] = Some(([p.rect[0], p.rect[1]], [p.rect[2], p.rect[3]], p.params[0]));
                 p.fade_by(fade);
                 if self.lifted(i) {
                     top.push(p);
@@ -1272,6 +1649,9 @@ impl ControlCenter {
                 continue;
             }
             let mut p = a.item;
+            if p.params[1] == 5.0 && (p.tint[..3] == PURE || p.tint[..3] == WHITE) && self.dark_ink(a.tile) {
+                p.tint[..3].copy_from_slice(&INK);
+            }
             // the pill's glyph with no glass under it sits on the bar itself: it takes the bar's ink like the other widgets
             // (the glass tint says nothing about an opaque bar, and over a dark wallpaper it made the glyph white on a white bar)
             let on_bare_bar = bar && a.tile == self.menu_tile && !(self.pill_on && fade > 0.01);
@@ -1350,8 +1730,10 @@ impl ControlCenter {
     }
 
     /// Is this tile (or a part of it) the one being carried in edit mode?
+    /// Drawn above the other tiles: the tile being carried, and a Fettle control opened over the others (with its rows).
     fn lifted(&self, tile: usize) -> bool {
-        self.press.is_some_and(|p| p.moved && self.owner.get(tile).copied() == Some(p.spec))
+        let carried = self.press.is_some_and(|p| p.moved && self.owner.get(tile).copied() == Some(p.spec));
+        carried || (self.side_tile != FREE && self.owner.get(tile).is_some() && self.owner.get(tile) == self.owner.get(self.side_tile))
     }
 
     pub fn labels(&self) -> Vec<Label> {
@@ -1365,6 +1747,12 @@ impl ControlCenter {
             let c = self.zoom_pt(t.c);
             Some(([c[0] + off[0], c[1] + off[1]], [t.size[0] * t.scale.x * k / 2.0, t.size[1] * t.scale.x * k / 2.0]))
         });
+        // ... or of a control opened over the others
+        let lift = lift.or_else(|| {
+            let t = self.tiles.get(self.side_tile)?;
+            let c = self.zoom_pt(t.c);
+            Some((c, [t.size[0] * t.scale.x * k / 2.0, t.size[1] * t.scale.x * k / 2.0]))
+        });
         for (li, a) in self.labels.iter().enumerate() {
             if a.vis == Vis::Edit && !self.edit {
                 continue;
@@ -1377,6 +1765,9 @@ impl ControlCenter {
                 continue;
             }
             let mut l = a.item.clone();
+            if (l.color == PURE || l.color == WHITE) && self.dark_ink(a.tile) {
+                l.color = INK;
+            }
             if Self::is_ink(l.color) {
                 if let Some(u) = self.under(a.tile, bar) {
                     l = l.auto_ink(u);
@@ -1651,14 +2042,40 @@ mod tests {
         let mut cc = cc();
         cc.set_open(true);
         let dark = cc.layout.iter().position(|t| t.opt("action") == Some("dark-mode")).unwrap();
+        // the action runs when the press is let go (held, it would edit the controls)
         cc.mouse_down(centre(&cc, dark));
+        assert!(cc.take_events().is_empty());
+        cc.update(0.016, &Default::default(), centre(&cc, dark), false, false);
         assert_eq!(cc.take_events(), vec![CcEvent::Action("dark-mode".into())]);
         // dark mode keeps the dropdown open, a screenshot closes it
         assert!(cc.open);
         let shot = cc.layout.iter().position(|t| t.opt("action") == Some("screenshot")).unwrap();
-        cc.mouse_down(centre(&cc, shot));
+        let at = centre(&cc, shot);
+        press_release(&mut cc, at, at);
         assert_eq!(cc.take_events(), vec![CcEvent::Action("screenshot".into())]);
         assert!(!cc.open);
+    }
+
+    #[test]
+    fn holding_a_press_edits_the_controls_instead() {
+        let mut cc = cc();
+        cc.set_open(true);
+        let dark = cc.layout.iter().position(|t| t.opt("action") == Some("dark-mode")).unwrap();
+        let at = centre(&cc, dark);
+        cc.mouse_down(at);
+        for _ in 0..40 {
+            cc.update(0.016, &Default::default(), at, true, false);
+        }
+        assert!(cc.edit, "held still: the edit mode");
+        cc.update(0.016, &Default::default(), at, false, false);
+        assert!(cc.take_events().is_empty(), "and the tile's action does not run");
+        // a press that slides away is neither
+        let mut cc = self::cc();
+        cc.set_open(true);
+        cc.mouse_down(at);
+        cc.update(0.016, &Default::default(), [at[0] + 30.0, at[1]], true, false);
+        cc.update(0.016, &Default::default(), [at[0] + 30.0, at[1]], false, false);
+        assert!(!cc.edit && cc.take_events().is_empty());
     }
 
     #[test]

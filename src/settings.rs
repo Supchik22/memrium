@@ -116,6 +116,8 @@ pub struct WallItem {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SettingsAction {
+    /// delete the index of search by meaning (Privacy)
+    ForgetSearchIndex,
     /// some theme field changed
     ThemeChanged,
     /// switch to a built-in or user template (by id); drops per-field overrides
@@ -169,6 +171,8 @@ pub struct SettingsCtx<'a> {
     pub icon_names: &'a [String],
     /// what the gesture service says about the camera ("" while it is off)
     pub camera_status: &'a str,
+    /// how far search by meaning got ("Indexing 120 of 900 new files"), for the Privacy page
+    pub search_status: &'a str,
 }
 
 pub struct Settings {
@@ -1408,6 +1412,31 @@ fn page_panels(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, st: 
 
 fn page_wallpaper(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, first_row: usize, actions: &mut Vec<SettingsAction>) {
     ui.text(x, y + 52.0, "Wallpaper", 22.0, true, ui.ink, 0.97, Align::Left);
+    // parallax: the wallpaper moves a little with the desktops, and with the pointer too (the same switches as on the
+    // Animations page)
+    {
+        let an = &mut ctx.theme.animations;
+        let on = |an: &theme::AnimStyle, id: &str| an.effects.get(id).copied().unwrap_or_else(|| theme::default_effect(id)).on;
+        let mut sel = match (on(an, "wallpaper_desktops"), on(an, "wallpaper_pointer")) {
+            (_, true) => 2,
+            (true, false) => 1,
+            _ => 0,
+        };
+        let sw = 300.0f32.min(cw * 0.5);
+        ui.text(x + cw - sw - 10.0, y + 48.0, "Parallax", 12.5, false, ui.ink, 0.7, Align::Right);
+        if ui.segmented([x + cw - sw, y + 30.0, sw, 28.0], &["Off", "Desktops", "+ Pointer"], &mut sel) {
+            for (id, want) in [("wallpaper_desktops", sel >= 1), ("wallpaper_pointer", sel == 2)] {
+                let mut e = an.effects.get(id).copied().unwrap_or_else(|| theme::default_effect(id));
+                e.on = want;
+                if e == theme::default_effect(id) {
+                    an.effects.remove(id);
+                } else {
+                    an.effects.insert(id.to_string(), e);
+                }
+            }
+            ui.changed = true;
+        }
+    }
     ui.section(x, y + 86.0, "CHOOSE ONE");
     let cols = 4.0;
     let gap = 14.0;
@@ -1461,6 +1490,18 @@ fn page_layout(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
         ctx.theme.layout = layout;
         // each layout brings its own panels
         ctx.theme.bars = if layout == Layout::Macos { widget::default_bars() } else { theme::preset("windows11").map(|t| t.bars).unwrap_or_default() };
+    }
+    if layout == Layout::Macos {
+        f.pick(ui, "Controls (Fettle)", &mut ctx.theme.quick, &[(theme::QuickLook::Fettle, "Fettle"), (theme::QuickLook::Classic, "Classic")]);
+        if ctx.theme.quick == theme::QuickLook::Fettle {
+            f.pick(ui, "Under the controls", &mut ctx.theme.quick_backing, &[(theme::QuickBacking::None, "Nothing"), (theme::QuickBacking::Glass, "Glass"), (theme::QuickBacking::Blur, "Blur")]);
+            f.pick(
+                ui,
+                "Lists open",
+                &mut ctx.theme.quick_grow,
+                &[(theme::QuickGrow::Over, "Over the others"), (theme::QuickGrow::InPlace, "In place"), (theme::QuickGrow::Column, "Column"), (theme::QuickGrow::Beside, "Next to it"), (theme::QuickGrow::Sheet, "One sheet")],
+            );
+        }
     }
     f.pick(
         ui,
@@ -1535,6 +1576,8 @@ fn page_windows(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
         f.y += 14.0;
     }
     f.slider(ui, "Corner radius", &mut w.radius, 0.0, 32.0, " px");
+    // (everything rounded follows it: windows, panels, buttons, the programs' own controls)
+    f.slider(ui, "Corner smoothing", &mut ctx.theme.ui.corners, 0.0, 1.0, "");
     f.slider(ui, "Title bar height", &mut w.titlebar, 24.0, 52.0, " px");
     f.slider(ui, "Gap around maximized", &mut w.max_gap, 0.0, 60.0, " px");
     f.toggle(ui, "Hide the title bar when maximized", &mut w.hide_title_max);
@@ -1581,17 +1624,17 @@ fn page_keywords(page: Page) -> &'static str {
         Page::Appearance => "light dark mode accent colour color highlight wallpaper tint",
         Page::Glass => "blur refraction rim dispersion tint saturation bezel material paper wood clay",
         Page::Panels => "bar dock taskbar widget menu bar tray clock start",
-        Page::Wallpaper => "background picture image live shader",
-        Page::Layout => "launcher dock size magnify menu bar style figlet launchpad start menu",
-        Page::Windows => "title bar buttons frame border corner radius shadow opacity traffic lights decoration custom",
-        Page::Animations => "motion speed jelly genie minimize open close effects sounds volume transition",
+        Page::Wallpaper => "background picture image live shader parallax depth layers pointer mouse",
+        Page::Layout => "fettle lists over column sheet beside in place grow backing under controls glass blur launcher dock size magnify menu bar style figlet launchpad start menu fettle controls quick settings",
+        Page::Windows => "title bar buttons frame border corner radius squircle smoothing continuous shadow opacity traffic lights decoration custom",
+        Page::Animations => "motion speed jelly genie minimize open close effects sounds volume transition parallax wallpaper pointer mouse start intro",
         Page::Keys => "keyboard shortcut keys layout run program",
-        Page::Mouse => "cursor pointer speed acceleration scroll natural tap touchpad left-handed size launch icon bounce starting program hide typing",
+        Page::Mouse => "cursor pointer speed acceleration scroll natural tap touchpad left-handed size launch icon bounce starting program hide typing smooth morph animate shape change",
         Page::Icons => "icon shape plate tile padding theme",
         Page::About => "version info credits",
         Page::Notifications => "notification toast do not disturb dnd corner position time",
         Page::Osd => "osd on-screen indicator volume brightness keys bar pill popup hud media",
-        Page::Privacy => "privacy camera gestures hand thumbs up like peace reactions effects confetti indicator dot permission microphone",
+        Page::Privacy => "privacy search by meaning semantic index photos screenshots camera gestures hand thumbs up like peace reactions effects confetti indicator dot permission microphone",
         Page::DateTime => "clock time date 24 hour seconds calendar week monday sunday format",
         Page::Sound => "volume mute speaker output sound effects audio",
         Page::Network => "wifi wi-fi wireless bluetooth internet connection",
@@ -1764,6 +1807,27 @@ fn page_icons(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) -> [f
             }
         }
         f.skip(((crate::theme::OWN_LOOKS.len() + cols - 1) / cols) as f32 * (card_h + gap) + 4.0);
+        // how the clear icons stand out of their glass (kept with the icons' glass, not in the theme)
+        if icons.live_look() {
+            use crate::iconrender::ClearStyle;
+            static CLEAR: std::sync::OnceLock<std::sync::Mutex<ClearStyle>> = std::sync::OnceLock::new();
+            let cell = CLEAR.get_or_init(|| {
+                let t = crate::iconrender::GlassTune::load();
+                std::sync::Mutex::new(if t.colour_clear { ClearStyle::Colour } else { t.clear })
+            });
+            let mut style = *cell.lock().unwrap();
+            let opts = [(ClearStyle::Frost, "Frost"), (ClearStyle::Contrast, "Contrast"), (ClearStyle::Ink, "Ink"), (ClearStyle::Colour, "Colour")];
+            if f.pick(ui, "Clear style", &mut style, &opts) {
+                *cell.lock().unwrap() = style;
+                crate::iconrender::set_clear(style);
+            }
+            f.note(ui, match style {
+                ClearStyle::Frost => "The symbols take the colour of what is behind them",
+                ClearStyle::Contrast => "White symbols with a shadow on smoky glass",
+                ClearStyle::Ink => "Dark symbols on milky glass",
+                ClearStyle::Colour => "The symbols keep their own colours",
+            }, true);
+        }
     }
     f.pick(ui, "Shape", &mut icons.shape, &[(IconShape::None, "Original"), (IconShape::Squircle, "Squircle"), (IconShape::Circle, "Circle"), (IconShape::Rounded, "Rounded")]);
     if f.pick(ui, "Plate behind icons", &mut icons.plate, &[(Plate::None, "None"), (Plate::Glass, "Glass"), (Plate::Solid, "Solid"), (Plate::Tile, "Tile")]) && icons.plate == Plate::Tile && icons.padding < 0.04 {

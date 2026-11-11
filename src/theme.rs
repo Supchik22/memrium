@@ -558,13 +558,15 @@ pub struct UiStyle {
     pub clock: ClockPrefs,
     /// how dense the popups of other programs (menus, tool tips) are, 0 = like the windows
     pub popup_opacity: f32,
+    /// how far rounded corners are smoothed into squircles ("continuous" corners): 0 circular arcs .. 1
+    pub corners: f32,
     /// the highlight of a menu or a list glides from one row to the next
     pub slide: bool,
 }
 
 impl Default for UiStyle {
     fn default() -> Self {
-        UiStyle { sidebar: SidebarSize::Medium, wall_tint: true, scrollbars: ScrollShow::Auto, scroll_click: ScrollClick::Page, highlight: None, controls: ControlStyle::default(), follow_gtk: false, style_apps: true, icon_theme: None, clock: ClockPrefs::default(), popup_opacity: 0.0, slide: true }
+        UiStyle { sidebar: SidebarSize::Medium, wall_tint: true, scrollbars: ScrollShow::Auto, scroll_click: ScrollClick::Page, highlight: None, controls: ControlStyle::default(), follow_gtk: false, style_apps: true, icon_theme: None, clock: ClockPrefs::default(), popup_opacity: 0.0, slide: true, corners: 0.6 }
     }
 }
 
@@ -790,16 +792,20 @@ pub const EFFECTS: &[(&str, &str, &str)] = &[
     ("Menus", "submenu", "Submenus"),
     ("Menus", "menu_highlight", "Sliding highlight"),
     ("Shell", "launcher", "Launcher"),
-    ("Shell", "control_center", "Quick Settings"),
+    ("Shell", "control_center", "Fettle"),
     ("Shell", "dock", "Dock (magnify, bounce)"),
     ("Shell", "notifications", "Notifications"),
     ("Shell", "popups", "Previews and tooltips"),
+    ("Shell", "session_start", "Desktop slides in at the start"),
+    ("Wallpaper", "wallpaper_desktops", "Moves with the desktops (parallax)"),
+    ("Wallpaper", "wallpaper_pointer", "Follows the pointer (parallax)"),
 ];
 
 /// How an effect is set when the theme says nothing about it: everything plays, except the jelly wobble of a window
 /// being dragged, which is an option to turn on.
 pub fn default_effect(id: &str) -> Effect {
-    Effect { on: id != "window_jelly", speed: 1.0 }
+    // (the wallpaper following the pointer redraws the whole screen on every move: an option to turn on)
+    Effect { on: id != "window_jelly" && id != "wallpaper_pointer", speed: 1.0 }
 }
 
 impl Default for AnimStyle {
@@ -1033,6 +1039,47 @@ impl Default for WallpaperSpec {
     }
 }
 
+/// How the controls dropdown of the menu bar looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuickLook {
+    /// Memrium's own (see `controlcenter::fettle`)
+    #[default]
+    Fettle,
+    /// the macOS-like glass pills (the taskbar layout keeps its Fluent panel either way)
+    Classic,
+}
+
+/// Where a Fettle control shows its list (Wi-Fi networks, devices, the mixer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuickGrow {
+    /// the control itself opens over the others, to the left and down from its own corner
+    #[default]
+    Over,
+    /// the control grows where it is and pushes the others down
+    InPlace,
+    /// the list in a column of its own left of the controls, as tall as they are
+    Column,
+    /// the list in a card left of the controls, level with the control, with a tab pointing at it
+    Beside,
+    /// the list left of the controls on one sheet of glass with them (the sheet widens to take it)
+    Sheet,
+}
+
+/// What lies under Fettle's controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuickBacking {
+    /// nothing: the controls float on the desktop
+    #[default]
+    None,
+    /// one pane of glass behind them all
+    Glass,
+    /// the desktop behind them only blurred, no pane, no rim
+    Blur,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Theme {
@@ -1055,6 +1102,12 @@ pub struct Theme {
     pub ui: UiStyle,
     /// follow the time of day: dark in the evening and at night (the `dark` field is then set by the shell)
     pub auto_dark: bool,
+    /// the look of Fettle, the controls dropdown of the menu bar
+    pub quick: QuickLook,
+    /// what lies under Fettle's controls
+    pub quick_backing: QuickBacking,
+    /// where a Fettle control shows its list
+    pub quick_grow: QuickGrow,
 }
 
 impl Default for Theme {
@@ -1077,6 +1130,9 @@ impl Default for Theme {
             animations: AnimStyle::default(),
             ui: UiStyle::default(),
             auto_dark: false,
+            quick: QuickLook::default(),
+            quick_backing: QuickBacking::default(),
+            quick_grow: QuickGrow::default(),
         }
     }
 }
@@ -1174,13 +1230,14 @@ pub fn set_live_icon(cell: u32, live: bool) {
 }
 
 /// The live plate of the icon in `cell` of `size` px: its side and corner radius (see `iconrender::live_plate`).
-fn live_plate(cell: u32, size: f32) -> Option<(f32, f32)> {
+fn live_plate(cell: u32, size: f32) -> Option<(f32, f32, crate::iconrender::ClearStyle)> {
     let l = LIVE_ICONS.read().ok()?;
     let l = l.as_ref()?;
     if !l.cells.contains(&cell) {
         return None;
     }
-    crate::iconrender::live_plate(&l.tune, size)
+    let style = if l.tune.colour_clear { crate::iconrender::ClearStyle::Colour } else { l.tune.clear };
+    crate::iconrender::live_plate(&l.tune, size).map(|(s, r)| (s, r, style))
 }
 
 /// Push the panels of an application icon (optional plate, then the icon) in the theme's icon style.
@@ -1190,7 +1247,7 @@ pub fn push_app_icon(theme: &Theme, out: &mut Vec<crate::renderer::Panel>, cx: f
     let r = st.radius(size);
     // a clear icon of ours: its plate is glass drawn here, over what is really behind it (the picture holds the layers only)
     if st.is_own() && st.live_look() {
-        if let Some((side, radius)) = live_plate(cell, size) {
+        if let Some((side, radius, style)) = live_plate(cell, size) {
             let dark = st.own_look == "clear-dark";
             let mut g = theme.glass.panel(cx, cy, side, side, radius);
             // a small slab, not a big lens: the bending and bezel scale with it (as the glass plates of the simple icons)
@@ -1199,12 +1256,17 @@ pub fn push_app_icon(theme: &Theme, out: &mut Vec<crate::renderer::Panel>, cx: f
             g.fx[0] = g.fx[0].clamp(6.0, 9.0);
             g.fx[1] = g.fx[1].min(0.04);
             // the clear plates of the editor: a pale frost in the light look, a smoky one in the dark
-            g.tint = if dark { [0.10, 0.10, 0.12, 0.42] } else { [0.97, 0.97, 1.0, 0.24] };
+            g.tint = style.plate_tint(dark);
             g.extra = [shadow.0, shadow.1, shadow.2, theme.glass.saturation];
             out.push(g);
             let mut ic = Panel::app_icon(cx, cy, size, cell, 1.0);
             ic.params[0] = r;
             ic.params[3] = 0.0;
+            if style.follows_backdrop() {
+                // the symbol takes the colour of what is behind it (glass.wgsl, kind 7)
+                ic.fx[1] = 2.0;
+                ic.color2 = [0.0, 0.0, 0.0, if dark { 1.0 } else { 0.0 }];
+            }
             out.push(ic);
             return;
         }
@@ -1289,8 +1351,8 @@ pub fn appearance_text(theme: &Theme, language: &str) -> String {
     };
     let g = &theme.glass;
     format!(
-        "# written by the shell: the look the programs follow\ndark = {}\naccent = [{:.4}, {:.4}, {:.4}]\nradius = {:.1}\ntitlebar = {:.1}\ndecoration = \"{deco}\"\nopacity = {:.3}\nlanguage = \"{}\"\nglass_tint = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_border = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_look = [{:.3}, {:.3}, {:.3}, {:.4}, {:.3}, {:.3}, {:.3}]\ncontrols = \"{}\"\ncontrols_depth = {:.3}\ncontrols_round = {:.3}\ncontrols_accent = {}\ncontrols_multi = {}\ncontrols_thickness = {:.3}\nmenubar = {}\npopup_opacity = {:.3}\nslide = {}\n",
-        theme.dark, theme.accent[0], theme.accent[1], theme.accent[2], theme.window.radius, theme.window.titlebar, theme.window.client_opacity, language, g.tint[0], g.tint[1], g.tint[2], g.tint[3], g.border[0], g.border[1], g.border[2], g.border[3], g.blur, g.refraction, g.bezel, g.dispersion, g.rim, g.rim_sharp, g.saturation, if theme.ui.controls.look == ControlLook::Flat { "flat" } else { "keys" }, theme.ui.controls.depth, theme.ui.controls.round, theme.ui.controls.accent_pick, theme.ui.controls.multi, theme.ui.controls.thickness, theme.bars.iter().any(|b| b.left.iter().chain(&b.center).chain(&b.right).any(|w| w.kind == "app-menu")), theme.ui.popup_opacity, theme.ui.slide
+        "# written by the shell: the look the programs follow\ndark = {}\naccent = [{:.4}, {:.4}, {:.4}]\nradius = {:.1}\ntitlebar = {:.1}\ndecoration = \"{deco}\"\nopacity = {:.3}\nlanguage = \"{}\"\nglass_tint = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_border = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_look = [{:.3}, {:.3}, {:.3}, {:.4}, {:.3}, {:.3}, {:.3}]\ncontrols = \"{}\"\ncontrols_depth = {:.3}\ncontrols_round = {:.3}\ncontrols_accent = {}\ncontrols_multi = {}\ncontrols_thickness = {:.3}\nmenubar = {}\npopup_opacity = {:.3}\nslide = {}\ncorners = {:.3}\n",
+        theme.dark, theme.accent[0], theme.accent[1], theme.accent[2], theme.window.radius, theme.window.titlebar, theme.window.client_opacity, language, g.tint[0], g.tint[1], g.tint[2], g.tint[3], g.border[0], g.border[1], g.border[2], g.border[3], g.blur, g.refraction, g.bezel, g.dispersion, g.rim, g.rim_sharp, g.saturation, if theme.ui.controls.look == ControlLook::Flat { "flat" } else { "keys" }, theme.ui.controls.depth, theme.ui.controls.round, theme.ui.controls.accent_pick, theme.ui.controls.multi, theme.ui.controls.thickness, theme.bars.iter().any(|b| b.left.iter().chain(&b.center).chain(&b.right).any(|w| w.kind == "app-menu")), theme.ui.popup_opacity, theme.ui.slide, theme.ui.corners
     )
 }
 

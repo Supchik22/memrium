@@ -509,7 +509,7 @@ pub(super) fn page_mouse(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw:
 
     // ---- which cursor, and how big
     let c = &mut input.cursor;
-    let (mut f, mut next) = card(ui, y + 94.0, "CURSOR", 5);
+    let (mut f, mut next) = card(ui, y + 94.0, "CURSOR", if c.morph { 7 } else { 6 });
     let mut themes = vec![String::new()];
     themes.extend(crate::cursor_theme::installed());
     let missing = !c.theme.is_empty() && !themes.contains(&c.theme);
@@ -528,6 +528,11 @@ pub(super) fn page_mouse(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw:
     f.toggle(ui, "Change the cursor by what it points at", &mut c.dynamic);
     f.toggle(ui, "Shake to find the cursor", &mut c.shake_to_find);
     f.toggle(ui, "Hide the cursor while typing", &mut c.hide_typing);
+    f.toggle(ui, "Change shape smoothly", &mut c.morph);
+    if c.morph {
+        f.slider(ui, "Change speed", &mut c.morph_speed, 0.5, 2.0, "×");
+        c.morph_speed = (c.morph_speed * 20.0).round() / 20.0;
+    }
     let drawn = c.theme.is_empty() || missing;
     if !c.theme.is_empty() {
         let note = if missing { "This theme is not installed any more: the drawn cursor is shown." } else { "The theme's own pictures are shown, and programs are told to use it too." };

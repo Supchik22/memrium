@@ -50,6 +50,9 @@ impl State {
     fn unlock(&mut self) {
         self.ui_sound(memrium_de::sound::Sound::Unlock);
         self.lock = None;
+        // the desktop comes in again, as at the start
+        self.intro_t0 = None;
+        self.intro_done = false;
         self.apply_focus();
         self.invalidate();
     }

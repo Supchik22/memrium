@@ -64,6 +64,10 @@ pub fn apply_test_hooks(state: &mut State, args: &mut Args, socket: &str) {
     if args.cc {
         state.scene.set_cc_open(true);
     }
+    // `MEMRIUM_TEST_CC_GROW=wifi|bluetooth|sound`: Fettle open with that control grown
+    if let Ok(kind) = std::env::var("MEMRIUM_TEST_CC_GROW") {
+        state.scene.cc_open_grown(&kind);
+    }
     if std::env::var_os("MEMRIUM_TEST_MAXIMIZE").is_some() {
         state.toggle_shell_maximize(crate::state::Sw::Settings);
     }
@@ -425,10 +429,29 @@ impl ApplicationHandler for App {
 
                 let mut frame = None;
                 let surface = &g.surface;
+                let want = g.state.renderer.capture_px(false);
+                let mut off_size = false;
                 let enc = g.state.render_lazy(|| {
                     frame = surface.get_current_texture().ok();
+                    // the window's picture of another size than the frame (a resize half done): drawing into it would put
+                    // the clip boxes past its edge, which wgpu does not forgive; this frame is skipped and the sizes made one
+                    if let Some(f) = frame.as_ref().filter(|f| (f.texture.width(), f.texture.height()) != want) {
+                        let _ = f;
+                        off_size = true;
+                        frame = None;
+                    }
                     frame.as_ref().map(|f| f.texture.create_view(&Default::default()))
                 });
+                if off_size {
+                    let size = g.window.inner_size();
+                    g.config.width = size.width.max(1);
+                    g.config.height = size.height.max(1);
+                    g.surface.configure(g.state.renderer.device(), &g.config);
+                    let sf = g.window.scale_factor() as f32;
+                    nested_layout(&mut g.state, g.config.width, g.config.height, sf);
+                    g.state.invalidate();
+                    g.window.request_redraw();
+                }
                 g.idle = enc.is_none() && g.state.frame_skipped;
                 if let (Some(enc), Some(frame)) = (enc, frame) {
                     g.state.renderer.queue().submit([enc.finish()]);

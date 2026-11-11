@@ -256,6 +256,8 @@ impl Scene {
         let dock = default_dock().into_iter().map(new_entry).collect();
         // the Quick Settings is available in every layout (any bar can host its pill)
         let mut c = ControlCenter::new(w, h);
+        c.set_backing(theme.quick_backing);
+        c.set_grow(theme.quick_grow);
         c.set_style(Self::cc_style(theme), theme.dark, theme.accent);
         c.set_glass(&theme.glass);
         c.set_bar_under(Self::bar_under_of(theme));
@@ -303,6 +305,8 @@ impl Scene {
         }
         self.theme = theme.clone();
         if let Some(c) = &mut self.cc {
+            c.set_backing(theme.quick_backing);
+            c.set_grow(theme.quick_grow);
             c.set_style(Self::cc_style(theme), theme.dark, theme.accent);
             c.set_glass(&theme.glass);
             c.set_bar_under(Self::bar_under_of(theme));
@@ -613,6 +617,40 @@ impl Scene {
     }
 
     /// What the Quick Settings wants done (toggle Wi-Fi, set the volume, ...).
+    /// Fettle's lists, read by the shell (see `CcWants`).
+    pub fn cc_set_lists(&mut self, lists: &crate::controlcenter::CcLists) {
+        if let Some(c) = &mut self.cc {
+            c.set_lists(lists);
+        }
+    }
+
+    pub fn cc_wants_lists(&self) -> crate::controlcenter::CcWants {
+        self.cc.as_ref().map(|c| c.wants_lists()).unwrap_or_default()
+    }
+
+    /// Open Fettle with this control grown (`wifi`, `bluetooth`, `sound`); false when it cannot (another look).
+    pub fn cc_open_grown(&mut self, kind: &str) -> bool {
+        self.cc.as_mut().is_some_and(|c| c.open_grown(kind))
+    }
+
+    /// The wheel over Fettle (it pours a liquid slider); true when it was taken.
+    /// Focus (do not disturb) as the shell has it, for the Focus control.
+    pub fn cc_set_focus(&mut self, on: bool, until: Option<String>) {
+        if let Some(c) = &mut self.cc {
+            c.set_focus(on, until);
+        }
+    }
+
+    /// A key for the open Fettle (arrows, Tab, Enter, Esc); true when it took it.
+    pub fn cc_key(&mut self, key: crate::controlcenter::CcKey) -> bool {
+        self.cc.as_mut().is_some_and(|c| c.key(key))
+    }
+
+    pub fn cc_scroll(&mut self, dy: f32) -> bool {
+        let m = self.mouse;
+        self.cc.as_mut().is_some_and(|c| c.scroll(m, dy))
+    }
+
     pub fn take_cc_events(&mut self) -> Vec<crate::controlcenter::CcEvent> {
         self.cc.as_mut().map(|c| c.take_events()).unwrap_or_default()
     }
@@ -624,6 +662,7 @@ impl Scene {
     /// The Quick Settings looks like Windows quick settings in the taskbar layout.
     fn cc_style(theme: &Theme) -> crate::controlcenter::CcStyle {
         match theme.layout {
+            crate::theme::Layout::Macos if theme.quick == crate::theme::QuickLook::Fettle => crate::controlcenter::CcStyle::Fettle,
             crate::theme::Layout::Macos => crate::controlcenter::CcStyle::Mac,
             crate::theme::Layout::Taskbar => crate::controlcenter::CcStyle::Windows,
         }

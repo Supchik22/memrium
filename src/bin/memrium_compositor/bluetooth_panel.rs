@@ -63,7 +63,7 @@ fn run(args: &[&str]) -> Option<String> {
     std::process::Command::new("bluetoothctl").args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).to_string())
 }
 
-fn fetch() -> BtData {
+pub(crate) fn fetch() -> BtData {
     let Some(powered) = run(&["show"]).and_then(|o| memrium_de::sysctl::parse_powered(&o)) else { return BtData::default() };
     if !powered {
         return BtData { adapter: true, powered, devices: Vec::new() };

@@ -478,7 +478,17 @@ pub fn open_external(path: &Path, socket: &str) {
     let quiet = |c: &mut std::process::Command| {
         c.env("WAYLAND_DISPLAY", socket).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     };
+    // a program the user chose for this type ("Open With…", "Always use") beats the desktop's own viewers
+    if !path.is_dir() {
+        if let Some(h) = crate::mimeapps::user_default(&crate::mimeapps::mime_of(path)) {
+            match crate::mimeapps::open_with(&h, &[path.to_path_buf()], socket) {
+                Ok(()) => return,
+                Err(e) => eprintln!("{} did not start: {e}", h.name),
+            }
+        }
+    }
     if let Some(program) = own_opener(path) {
+        crate::recent::add(path, program, program);
         let mut c = std::process::Command::new(own_program(program));
         c.arg(path);
         quiet(&mut c);
@@ -491,6 +501,7 @@ pub fn open_external(path: &Path, socket: &str) {
     let mut c = std::process::Command::new("xdg-open");
     c.arg(path);
     quiet(&mut c);
+    crate::recent::add(path, "xdg-open", "xdg-open %u");
     if let Err(e) = c.spawn() {
         eprintln!("xdg-open failed: {e}");
     }
@@ -628,7 +639,8 @@ impl Fm {
         !self.pending().0.is_empty()
     }
 
-    fn record(&mut self, group: Vec<Undo>) {
+    /// Keep a group of changes for Undo (and tell the views to reload).
+    pub fn record(&mut self, group: Vec<Undo>) {
         if !group.is_empty() {
             self.undo.push(group);
             if self.undo.len() > 50 {
@@ -636,6 +648,22 @@ impl Fm {
             }
         }
         self.gen += 1;
+    }
+
+    /// What a paste brings and whether it was a cut, for a paste done on a thread (`paste_into` is the one done at once).
+    /// A cut is taken off the clipboard: its files are about to leave the place it names.
+    pub fn take_paste(&mut self) -> (Vec<PathBuf>, bool) {
+        let (files, cut) = self.pending();
+        if cut {
+            self.clip.clear();
+            self.cut = false;
+            if let Ok(mut g) = SYSTEM_CLIP.lock() {
+                if g.is_some() {
+                    *g = Some((Vec::new(), false));
+                }
+            }
+        }
+        (files, cut)
     }
 
     /// Paste the clipboard into `dir`; returns the new paths.

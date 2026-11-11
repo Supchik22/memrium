@@ -180,6 +180,22 @@ impl Panel {
         }
     }
 
+    /// Liquid in a tube (kind 16, see `glass.wgsl`): the tube's centre, size and corner radius (negative: squircle, as
+    /// `sd_shape` takes it), the colour at the top and at the bottom, its opacity; `surf` = where the surface is (share of
+    /// the half width, -1 left end .. 1 right end), `tilt` and `bulge` = how far it leans (at the top) and how far its
+    /// middle reaches ahead (shares of the half height), `sheen` = a soft light band along the top.
+    #[allow(clippy::too_many_arguments)]
+    pub fn liquid(cx: f32, cy: f32, w: f32, h: f32, radius: f32, top: [f32; 3], bottom: [f32; 3], alpha: f32, surf: f32, tilt: f32, bulge: f32, sheen: f32) -> Self {
+        Self {
+            rect: [cx, cy, w / 2.0, h / 2.0],
+            params: [radius, 16.0, 0.0, 0.0],
+            tint: [top[0], top[1], top[2], alpha],
+            color2: [bottom[0], bottom[1], bottom[2], 1.0],
+            fx: [surf, tilt, bulge, sheen],
+            ..Default::default()
+        }
+    }
+
     /// Cut a record (or anything of kind 15) to a rounded rectangle: centre, half size and corner radius.
     pub fn clipped_to(mut self, centre: [f32; 2], half: [f32; 2], radius: f32) -> Self {
         self.color2 = [centre[0], centre[1], half[0], half[1]];
@@ -800,6 +816,8 @@ pub struct Renderer {
     ss: f32,
     /// the next frame goes to a target of the supersampled size as it is, not shrunk (a screenshot or a recording that keeps the detail)
     pub hi_capture: bool,
+    /// how the wallpaper is shown: moved (x, y as shares of the picture), enlarged, and how many layers it holds
+    wall_view: [f32; 4],
     /// the output in device pixels, and the interface scale before `ss` was applied
     out_px: (u32, u32),
     ui_scale: f32,
@@ -807,6 +825,8 @@ pub struct Renderer {
     down_tex: Option<DownTex>,
     started: std::time::Instant,
     glass_adapt: f32,
+    /// corner smoothing of every rounded shape (the theme's `ui.corners`, `g.fade.y` in glass.wgsl)
+    corners: f32,
 }
 
 impl Renderer {
@@ -1027,12 +1047,14 @@ impl Renderer {
             reveal: None,
             ss: 1.0,
             hi_capture: false,
+            wall_view: [0.0, 0.0, 1.0, 1.0],
             out_px: (w, h),
             ui_scale: scale,
             down_pipe: None,
             down_tex: None,
             started: std::time::Instant::now(),
             glass_adapt: 0.0,
+            corners: 0.0,
         };
         r.rebuild_groups();
         r.bake_wallpaper();
@@ -1208,6 +1230,15 @@ impl Renderer {
         self.epoch.set(self.epoch.get() + 1);
     }
 
+    pub fn set_corners(&mut self, c: f32) {
+        if c != self.corners {
+            self.touch();
+        }
+        self.corners = c;
+        // the shell's own processor drawing (chebrium canvas) on this thread follows too
+        chebrium::canvas::set_corner_smoothing(c);
+    }
+
     pub fn set_glass_adapt(&mut self, a: f32) {
         if a != self.glass_adapt {
             self.touch();
@@ -1216,6 +1247,12 @@ impl Renderer {
     }
 
     pub fn set_wallpaper(&mut self, img: Option<&image::RgbaImage>) {
+        self.set_wallpaper_layers(img, 1);
+    }
+
+    /// A wallpaper of `layers` pictures stacked top to bottom in `img` (the furthest first), moved apart by `set_wall_view`.
+    pub fn set_wallpaper_layers(&mut self, img: Option<&image::RgbaImage>, layers: u32) {
+        self.wall_view[3] = layers.max(1) as f32;
         self.touch();
         self.video = false;
         self.has_image = img.is_some();
@@ -1240,6 +1277,27 @@ impl Renderer {
         self.generation += 1;
         self.rebuild_groups();
         self.bake_wallpaper();
+    }
+
+    /// Move and enlarge the wallpaper (parallax: a layered one's layers move apart). `off` in shares of the picture.
+    /// Returns whether it changed (then the whole frame is drawn again).
+    pub fn set_wall_view(&mut self, off: [f32; 2], zoom: f32) -> bool {
+        let v = [off[0], off[1], zoom.max(1.0), self.wall_view[3]];
+        if (0..3).all(|i| (v[i] - self.wall_view[i]).abs() < 1e-4) {
+            return false;
+        }
+        self.wall_view = v;
+        // a live wallpaper or a film draws its own picture every frame
+        if self.live.is_none() && !self.video {
+            self.bake_wallpaper();
+        }
+        self.touch();
+        true
+    }
+
+    /// How many layers the wallpaper has (more than one: it is a parallax wallpaper).
+    pub fn wall_layers(&self) -> u32 {
+        self.wall_view[3] as u32
     }
 
     /// Compile a live wallpaper (WGSL defining `live_wall`) and start drawing it every frame.
@@ -1760,7 +1818,9 @@ impl Renderer {
             }
         }
         let n = panels.len().min(MAX_PANELS);
-        let mut header = Header { res: self.size, count: n as u32, scale: self.scale, flags: [self.has_image as u32, self.started.elapsed().as_secs_f32().to_bits(), self.glass_adapt.to_bits(), 0], grid: [0.0; 4], fade: [self.fade.get(), 0.0, 0.0, 0.0], warp: self.warp.get(), genie: self.genie.get() };
+        // (the wallpaper pass reads its view from `grid`, which only the binned draws use otherwise)
+        let grid = if slot == 0 { self.wall_view } else { [0.0; 4] };
+        let mut header = Header { res: self.size, count: n as u32, scale: self.scale, flags: [self.has_image as u32, self.started.elapsed().as_secs_f32().to_bits(), self.glass_adapt.to_bits(), 0], grid, fade: [self.fade.get(), self.corners, 0.0, 0.0], warp: self.warp.get(), genie: self.genie.get() };
         if let Some(bb) = bbox.filter(|_| n > 6) {
             let (x0, y0) = (bb[0].max(0.0), bb[1].max(0.0));
             let tx = (((bb[2].min(self.size[0]) - x0) / TILE_PX).ceil() as usize).max(1);
@@ -2006,8 +2066,11 @@ impl Renderer {
             items.iter().enumerate().filter_map(|(i, it)| if let Item::Opaque(b) = it { self.inner_px(*b).filter(|_| i > 0).map(|r| (i - 1, r)) } else { None }).collect()
         };
         // an item's scissor rect cut to the redone pieces, less what the windows above it hide
+        // every clip box stays inside the frame: a panel reaching past its edge (a sidebar a pixel or two taller than the
+        // window) gives a box past it, which wgpu does not forgive
+        let frame_px = ((self.size[0] * self.scale).round().max(1.0) as u32, (self.size[1] * self.scale).round().max(1.0) as u32);
         let pieces = |s: Option<(u32, u32, u32, u32)>, idx: usize| -> Vec<(u32, u32, u32, u32)> {
-            let Some(s) = s else { return Vec::new() };
+            let Some(s) = s.and_then(|s| clip_to(s, Some((0, 0, frame_px.0, frame_px.1)))) else { return Vec::new() };
             let mine: Vec<(u32, u32, u32, u32)> = if parts.is_empty() { vec![s] } else { parts.iter().filter_map(|r| clip_to(s, Some(*r))).collect() };
             mine.into_iter().flat_map(|c| uncovered(c, &opaque, idx)).collect()
         };
@@ -2514,7 +2577,7 @@ fn tier_of(panels: &[Panel]) -> u8 {
 }
 
 fn is_exotic(p: &Panel) -> bool {
-    matches!(p.params[1].floor() as u32, 9 | 10 | 12 | 13 | 14 | 15)
+    matches!(p.params[1].floor() as u32, 9 | 10 | 12 | 13 | 14 | 15 | 16)
 }
 
 /// Intersect a scissor rectangle with the redrawn region (None = the whole frame): `None` when nothing is left.
@@ -2699,6 +2762,20 @@ fn glass_idx(kind: f32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The panel shader (with the icon shader after it, as the renderer builds it) is valid WGSL for the card.
+    #[test]
+    fn the_glass_shader_compiles() {
+        let Ok(off) = chebrium::scene::Offscreen::new(true) else { return };
+        off.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _ = off.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("glass"),
+            source: wgpu::ShaderSource::Wgsl(concat!(include_str!("glass.wgsl"), "\n", include_str!("icons.wgsl")).into()),
+        });
+        let err = pollster::block_on(off.device.pop_error_scope());
+        assert!(err.is_none(), "{err:?}");
+    }
+
     use super::*;
     use chebrium::draw::Draw;
 

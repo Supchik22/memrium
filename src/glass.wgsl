@@ -28,6 +28,7 @@ struct Globals {
     grid: vec4<f32>,
     // x = opacity of the whole draw
     fade: vec4<f32>,
+    // fade.y: how far corners are smoothed into squircles (0 circular .. 1), the theme's `ui.corners`
     // genie warp: window rect (x, y, w, h); (progress, dock x, dock y, icon width)
     warp: vec4<f32>,
     genie: vec4<f32>,
@@ -94,9 +95,25 @@ fn sd_round_rect(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
     return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
-// A rounded rectangle whose corners are superellipses (Apple's "continuous" corners, a squircle) when r < 0.
+// A rounded rectangle with the theme's corner smoothing (g.fade.y), made as chebrium's `canvas::corner_shape` makes it:
+// the curve reaches further along the sides and is a superellipse; pills and circles keep round ends.
+fn sd_smooth(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
+    let m = min(b.x, b.y);
+    let k = g.fade.y * clamp((0.92 * m - r) / (0.3 * m), 0.0, 1.0);
+    if (k <= 0.0 || r < 0.75) { return sd_round_rect(p, b, r); }
+    let rr = min(r * (1.0 + 0.45 * k), m);
+    let n = 2.0 + 2.6 * k;
+    let q = abs(p) - b + vec2(rr);
+    if (q.x > 0.0 && q.y > 0.0) {
+        return pow(pow(q.x, n) + pow(q.y, n), 1.0 / n) - rr;
+    }
+    return max(q.x, q.y) - rr;
+}
+
+// A rounded rectangle whose corners are superellipses (Apple's "continuous" corners, a squircle) when r < 0; a positive
+// radius follows the theme's smoothing.
 fn sd_shape(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
-    if (r >= 0.0) { return sd_round_rect(p, b, r); }
+    if (r >= 0.0) { return sd_smooth(p, b, r); }
     let rr = -r;
     let q = abs(p) - b + vec2(rr);
     let qp = max(q, vec2(0.0));
@@ -454,6 +471,32 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
     if (EXOTIC && (kind == 9u || kind == 10u)) {
         return glass_glyph(px, pn, acc, kind == 10u);
     }
+    if (EXOTIC && kind == 16u) {
+        // Liquid in a tube (`Panel::liquid`): rect = the tube, params.x = its corners, tint = colour at the top + opacity,
+        // color2 = colour at the bottom, fx = surface (share of the half width), lean at the top and middle bulge (shares
+        // of the half height), sheen. One shape, so the surface is as smooth as any edge.
+        let b = pn.rect.zw;
+        let fy = clamp(local.y / b.y, -1.0, 1.0);
+        let surf = pn.fx.x * b.x + (-pn.fx.y * fy + pn.fx.z * (1.0 - fy * fy)) * b.y;
+        let ahead = local.x - surf;
+        let d = max(sd, ahead);
+        let cover = clamp(0.5 - d * g.scale, 0.0, 1.0);
+        if (cover <= 0.0) { return acc; }
+        var col = mix(pn.tint.rgb, pn.color2.rgb, smoothstep(-1.0, 1.0, fy));
+        // light gathers just behind the surface, and a soft band of sheen runs along the top, fading before the surface
+        let lit = clamp(1.0 + ahead / 7.0, 0.0, 1.0);
+        col = mix(col, min(col * 1.18 + vec3(0.06), vec3(1.0)), lit * 0.55);
+        let band = exp(-pow((fy + 0.62) / 0.16, 2.0)) * clamp(-ahead / 12.0, 0.0, 1.0) * clamp(-sd / 3.0, 0.0, 1.0);
+        col = mix(col, vec3(1.0), band * pn.fx.w);
+        // edge light, as on the glass: a thin bright line just inside the edge, strongest along the top where the light
+        // falls, faint along the bottom, and a softer glow a few px further in
+        let inside = -d;
+        let top_lit = mix(0.30, 1.0, smoothstep(0.6, -1.0, fy));
+        let line = clamp(1.0 - (inside * g.scale - 0.5) / (1.4 * g.scale), 0.0, 1.0);
+        let glow = clamp(1.0 - inside / 5.0, 0.0, 1.0);
+        col = mix(col, vec3(1.0), clamp(line * 0.62 + glow * glow * 0.16, 0.0, 1.0) * top_lit);
+        return over_rgb(acc, col, cover * pn.tint.a);
+    }
     if (EXOTIC && kind == 15u) {
         // A vinyl record in one panel: grooves, light wedges and a label that turn, optionally cut to a rounded rect.
         // rect = the disc (centre, radius, radius), tint = the vinyl's colour and opacity, params.z = label atlas cell
@@ -461,7 +504,7 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
         // color2 = clip rect (centre, half size; z = 0 means none), extra.w = clip corner radius.
         var clip = 1.0;
         if (pn.color2.z > 0.0) {
-            clip = clamp(0.5 - sd_round_rect(px - pn.color2.xy, pn.color2.zw, pn.extra.w) * g.scale, 0.0, 1.0);
+            clip = clamp(0.5 - sd_shape(px - pn.color2.xy, pn.color2.zw, pn.extra.w) * g.scale, 0.0, 1.0);
         }
         let rad = pn.rect.z;
         let u = local / rad;
@@ -546,7 +589,25 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
                 }
                 t = sum / 16.0;
             }
-            if (pn.fx.y > 0.5) {
+            if (pn.fx.y > 1.5) {
+                // a clear icon in the Frost style takes its colour from what is behind it: the symbol is a light (dark
+                // look: deep) shade of the backdrop's hue; color2.a = 1 for the dark look (iconrender::frost_ink)
+                let lum = luma(t.rgb / max(t.a, 0.0001));
+                let bd = blur_bg(pn.rect.xy, pn.rect.z * 0.8);
+                let m = max(max(bd.r, bd.g), bd.b);
+                let hue = clamp(saturate_col(bd / max(m, 0.05), 1.25), vec3(0.0), vec3(1.0));
+                // (the picture holds the symbol in the grey of the clear look, 0.5..1 light, 0.32..0.94 dark: its own shades
+                // spread out again, so the dark details of the artwork stay apart from the light parts)
+                if (pn.color2.a > 0.5) {
+                    let l = clamp((lum - 0.32) / 0.62, 0.0, 1.0);
+                    t = vec4(mix(hue * 0.22, mix(hue, vec3(1.0), 0.45), l) * t.a, t.a);
+                } else {
+                    let l = clamp((lum - 0.5) / 0.5, 0.0, 1.0);
+                    t = vec4(mix(hue * 0.62, vec3(1.0), 0.15 + 0.85 * l) * t.a, t.a);
+                }
+                let ink = t.rgb;
+                t = vec4(ink, t.a);
+            } else if (pn.fx.y > 0.5) {
                 let lum = luma(t.rgb / max(t.a, 0.0001));
                 t = vec4(pn.color2.rgb * lum * t.a, t.a);
             }
@@ -564,7 +625,7 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
             }
             // a picture cut to a rounded rectangle (color2 = centre + half size, extra.w = radius), when asked to
             if (pn.fx.y <= 0.5 && pn.color2.z > 0.0) {
-                t = t * clamp(0.5 - sd_round_rect(px - pn.color2.xy, pn.color2.zw, pn.extra.w) * g.scale, 0.0, 1.0);
+                t = t * clamp(0.5 - sd_shape(px - pn.color2.xy, pn.color2.zw, pn.extra.w) * g.scale, 0.0, 1.0);
             }
             let o = pn.tint.a;
             acc = vec4(t.rgb * o + acc.rgb * (1.0 - t.a * o), t.a * o + acc.a * (1.0 - t.a * o));
@@ -905,7 +966,7 @@ fn fs_surface(in: VOut) -> @location(0) vec4<f32> {
     if (pn.params.z > 0.0) { s = s * pn.params.z; }
     var cov = 1.0;
     if (pn.extra.x > 0.5) {
-        let sd = sd_round_rect(q - pn.color2.xy, pn.color2.zw, pn.params.x);
+        let sd = sd_smooth(q - pn.color2.xy, pn.color2.zw, pn.params.x);
         cov = clamp(0.5 - sd * g.scale, 0.0, 1.0);
     }
     var rgb = s.rgb;
@@ -925,15 +986,35 @@ fn fs_surface(in: VOut) -> @location(0) vec4<f32> {
 // Wallpaper bake pass: the bound texture is the source image (cover-fit), or procedural fallback.
 @fragment
 fn fs_wall(in: VOut) -> @location(0) vec4<f32> {
-    let uv0 = in.px / g.res;
+    // the wallpaper's view (written for this pass in `grid`): xy = how far it is moved (shares of the picture, the
+    // nearest layer; a further one moves less), z = how much it is enlarged, w = how many layers the picture holds,
+    // stacked top to bottom (a parallax wallpaper: the furthest first)
+    let zoom = select(g.grid.z, 1.0, g.grid.z <= 0.0);
+    let uvs = (in.px / g.res - vec2(0.5)) / zoom + vec2(0.5);
     if (g.flags.x == 0u) {
-        return vec4(wallpaper(uv0), 1.0);
+        return vec4(wallpaper(uvs - g.grid.xy), 1.0);
     }
-    let d = vec2<f32>(textureDimensions(bg));
+    let n = max(u32(g.grid.w + 0.5), 1u);
+    let d = vec2<f32>(textureDimensions(bg)) / vec2(1.0, f32(n));
     let a = g.res.x / g.res.y;
     let ia = d.x / d.y;
     var sc = vec2(1.0, ia / a);
     if (a < ia) { sc = vec2(a / ia, 1.0); }
-    let uv = (uv0 - vec2(0.5)) * sc + vec2(0.5);
-    return vec4(textureSampleLevel(bg, bgs, uv, 0.0).rgb, 1.0);
+    var col = vec3<f32>(0.0);
+    for (var i = 0u; i < n; i = i + 1u) {
+        let depth = f32(i + 1u) / f32(n);
+        let uv = (uvs - g.grid.xy * depth - vec2(0.5)) * sc + vec2(0.5);
+        // (each layer is a band of the texture: kept inside its own band, half a texel from the next)
+        let half = 0.5 / (d.y * f32(n));
+        let v = (f32(i) + clamp(uv.y, 0.0, 1.0)) / f32(n);
+        let lo = f32(i) / f32(n) + half;
+        let hi = f32(i + 1u) / f32(n) - half;
+        let c = textureSampleLevel(bg, bgs, vec2(uv.x, clamp(v, lo, hi)), 0.0);
+        if (i == 0u) {
+            col = c.rgb;
+        } else {
+            col = mix(col, c.rgb, c.a);
+        }
+    }
+    return vec4(col, 1.0);
 }

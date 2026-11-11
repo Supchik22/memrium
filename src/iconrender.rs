@@ -337,13 +337,100 @@ pub struct GlassTune {
     pub soft_light: f32,
     /// the shape of the plate of every icon in every look (None: no plate at all); only how the icons are drawn, never kept in a document
     pub plate: Shape,
+    /// how the symbols of the clear looks stand out of their glass (see `ClearStyle`)
+    pub clear: ClearStyle,
+}
+
+/// How a clear icon is made: its symbol and its plate. The colours of the artwork go in all but `Colour`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ClearStyle {
+    /// pale frosted symbols on pale frost (the first clear look: soft, but it washes out on a light picture)
+    #[default]
+    Frost,
+    /// bright white symbols with a shadow under them, on a smoky plate: reads on any picture (Apple's clear look)
+    Contrast,
+    /// dark ink symbols on a milky plate (the monochrome look of a light desktop)
+    Ink,
+    /// the symbols keep their colours on clear glass
+    Colour,
+}
+
+impl ClearStyle {
+    pub const ALL: [ClearStyle; 4] = [ClearStyle::Frost, ClearStyle::Contrast, ClearStyle::Ink, ClearStyle::Colour];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ClearStyle::Frost => "Frost",
+            ClearStyle::Contrast => "Contrast",
+            ClearStyle::Ink => "Ink",
+            ClearStyle::Colour => "Colour",
+        }
+    }
+
+    fn code(self) -> u8 {
+        self as u8
+    }
+
+    fn from_code(c: u8) -> ClearStyle {
+        ClearStyle::ALL.get(c as usize).copied().unwrap_or_default()
+    }
+
+    /// The symbols are coloured by what is behind the icon (by the shell's shader; `frost_ink` is the same on the processor).
+    pub fn follows_backdrop(self) -> bool {
+        self == ClearStyle::Frost
+    }
+
+    /// The tint of the live plate the shell draws under a clear icon (rgb + strength), light or dark look.
+    pub fn plate_tint(self, dark: bool) -> [f32; 4] {
+        match (self, dark) {
+            (ClearStyle::Contrast, false) => [0.26, 0.27, 0.32, 0.34],
+            (ClearStyle::Contrast, true) => [0.06, 0.06, 0.08, 0.55],
+            (ClearStyle::Ink, false) => [1.0, 1.0, 1.0, 0.62],
+            (ClearStyle::Ink, true) => [0.92, 0.93, 0.96, 0.50],
+            // Frost: the backdrop shows through in its own colour, a little deeper, so the light symbol of that colour reads
+            (ClearStyle::Frost, false) => [0.40, 0.42, 0.48, 0.20],
+            (ClearStyle::Frost, true) => [0.06, 0.06, 0.08, 0.30],
+            (_, false) => [0.97, 0.97, 1.0, 0.24],
+            (_, true) => [0.10, 0.10, 0.12, 0.42],
+        }
+    }
+}
+
+/// The colour of a Frost symbol of lightness `lum` over a backdrop of colour `back` (as `glass.wgsl` draws it): a light
+/// shade of the backdrop's hue, or a deep one in the dark look.
+pub fn frost_ink(back: [f32; 3], lum: f32, dark: bool) -> [f32; 3] {
+    let m = back[0].max(back[1]).max(back[2]).max(0.05);
+    let n = back.map(|v| v / m);
+    let g = 0.299 * n[0] + 0.587 * n[1] + 0.114 * n[2];
+    let hue = n.map(|v| (g + (v - g) * 1.25).clamp(0.0, 1.0));
+    let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    // (the symbol comes in the grey of the clear look, 0.5..1 light, 0.32..0.94 dark: its shades are spread out again)
+    if dark {
+        let l = ((lum - 0.32) / 0.62).clamp(0.0, 1.0);
+        hue.map(|h| mix(h * 0.22, mix(h, 1.0, 0.45), l))
+    } else {
+        let l = ((lum - 0.5) / 0.5).clamp(0.0, 1.0);
+        hue.map(|h| mix(h * 0.62, 1.0, 0.15 + 0.85 * l))
+    }
+}
+
+/// The clear style the looks are drawn in now (the property functions are plain functions the documents call, so the
+/// tuning they follow is kept here; `Renderer` and `GlassTune::load` set it).
+static CLEAR_STYLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn clear_style() -> ClearStyle {
+    ClearStyle::from_code(CLEAR_STYLE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub fn set_clear_style(c: ClearStyle) {
+    CLEAR_STYLE.store(c.code(), std::sync::atomic::Ordering::Relaxed);
 }
 
 impl GlassTune {
     /// the settings that change nothing: every factor 1, nothing added
     const NEUTRAL: GlassTune = GlassTune {
         specular: 1.0, blur: 1.0, refraction: 1.0, translucency: 1.0, shadow: 1.0, light: 231.5, shadow_dist: 1.0, shadow_soft: 1.0, corner: 1.0, sharp: 1.0, colour_clear: false,
-        bevel: 0.0, bevel_width: 1.0, inner_shadow: 0.0, glow: 0.0, rim: 1.0, sheen: 1.0, edge_line: 1.0, edge_width: 1.0, edge_sharp: 1.0, lens_width: 1.0, dispersion: 1.0, inner_bend: 1.0, soft_light: 1.0, plate: Shape::Squircle,
+        bevel: 0.0, bevel_width: 1.0, inner_shadow: 0.0, glow: 0.0, rim: 1.0, sheen: 1.0, edge_line: 1.0, edge_width: 1.0, edge_sharp: 1.0, lens_width: 1.0, dispersion: 1.0, inner_bend: 1.0, soft_light: 1.0, plate: Shape::Squircle, clear: ClearStyle::Frost,
     };
 }
 
@@ -393,10 +480,19 @@ impl GlassTune {
         }
         let at = |i: usize, d: f32| v.get(i).copied().unwrap_or(d);
         let n = GlassTune::NEUTRAL;
+        let colour_clear = at(10, 0.0) > 0.5;
+        // (a file from before the clear styles has only "keeps colours": that is the Colour style)
+        let clear = match v.get(25) {
+            Some(c) => ClearStyle::from_code(*c as u8),
+            None if colour_clear => ClearStyle::Colour,
+            None => ClearStyle::Frost,
+        };
+        set_clear_style(clear);
         GlassTune {
+            clear,
             specular: at(0, t.specular), blur: at(1, t.blur), refraction: at(2, t.refraction), translucency: at(3, t.translucency), shadow: at(4, t.shadow),
             light: at(5, t.light), shadow_dist: at(6, t.shadow_dist), shadow_soft: at(7, t.shadow_soft), corner: at(8, t.corner), sharp: at(9, t.sharp),
-            colour_clear: at(10, 0.0) > 0.5,
+            colour_clear: clear == ClearStyle::Colour,
             plate: Shape::from_code(at(11, t.plate.code() as f32) as u8).unwrap_or(t.plate),
             bevel: at(12, n.bevel), bevel_width: at(13, n.bevel_width), inner_shadow: at(14, n.inner_shadow), glow: at(15, n.glow),
             rim: at(16, n.rim), sheen: at(17, n.sheen), edge_line: at(18, n.edge_line), lens_width: at(19, n.lens_width), dispersion: at(20, n.dispersion), inner_bend: at(21, n.inner_bend), soft_light: at(22, n.soft_light), edge_width: at(23, n.edge_width), edge_sharp: at(24, n.edge_sharp),
@@ -412,6 +508,7 @@ impl GlassTune {
             self.specular, self.blur, self.refraction, self.translucency, self.shadow, self.light, self.shadow_dist, self.shadow_soft, self.corner, self.sharp,
             self.colour_clear as u8 as f32, self.plate.code() as f32, self.bevel, self.bevel_width, self.inner_shadow, self.glow, self.rim, self.sheen,
             self.edge_line, self.lens_width, self.dispersion, self.inner_bend, self.soft_light, self.edge_width, self.edge_sharp,
+            self.clear.code() as f32,
         ];
         let _ = std::fs::write(path, v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ") + "\n");
     }
@@ -462,6 +559,15 @@ impl Renderer {
     }
 
     /// The colour the tinted looks are drawn in now.
+    /// The clear style drawn: the tuning's ("keeps colours" set in an older way is the Colour style).
+    fn clear(&self) -> ClearStyle {
+        if self.tune.colour_clear {
+            ClearStyle::Colour
+        } else {
+            self.tune.clear
+        }
+    }
+
     fn tint(&self) -> [f32; 3] {
         self.tint_override.unwrap_or_else(tint)
     }
@@ -509,12 +615,14 @@ impl Renderer {
 
     /// The drawn layer (straight alpha, `n` x `n`), recoloured when its settings or the look ask for it.
     pub fn raster(&mut self, layer: &Layer, props: &Props, doc: &IconDoc, app: Appearance, n: u32) -> Arc<RgbaImage> {
-        let treated = (app.is_clear() && !self.tune.colour_clear) || app.is_tinted();
+        let style = self.clear();
+        set_clear_style(style);
+        let treated = (app.is_clear() && style != ClearStyle::Colour) || app.is_tinted();
         let key = hash_of(&[
             &|h| layer.svg.hash(h),
             &|h| props.fill.map(|c| c.map(|v| v.to_bits())).hash(h),
             &|h| props.gradient.map(|g| (g.a.map(f32::to_bits), g.b.map(f32::to_bits), g.angle.to_bits(), g.radial, g.blobs.used().iter().map(|b| (b.at.map(f32::to_bits), b.size.to_bits(), b.colour.map(f32::to_bits))).collect::<Vec<_>>())).hash(h),
-            &|h| (if treated { Some(app.label()) } else { None }, if app.is_tinted() { self.tint().map(|v| v.to_bits()) } else { [0; 3] }).hash(h),
+            &|h| (if treated { Some(app.label()) } else { None }, if app.is_tinted() { self.tint().map(|v| v.to_bits()) } else { [0; 3] }, if app.is_clear() { style.code() } else { 0 }).hash(h),
         ]);
         if let Some(img) = self.rasters.get(&(key, n)) {
             return img.clone();
@@ -535,7 +643,7 @@ impl Renderer {
             // (read once: it is behind a lock, and every thread drawing at once would queue on it for each pixel)
             let tint = self.tint();
             for p in img.pixels_mut() {
-                let c = treat([p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0], app, tint);
+                let c = treat([p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0], app, tint, style);
                 *p = Rgba([(c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8, p[3]]);
             }
         }
@@ -550,6 +658,7 @@ impl Renderer {
     /// The plate as it is drawn: the document's own, except that the shape is the global one, and that the default look of an
     /// icon without a plate gets a light one (so that it is not the only look left bare).
     pub fn plate_for(&self, doc: &IconDoc, app: Appearance) -> Background {
+        set_clear_style(self.clear());
         let mut b = doc.background.resolve(app, &auto_background(self.tint()));
         if self.tune.plate == Shape::None {
             return Background { shape: Shape::None, fill: FillKind::None, glass: Glass { enabled: false, ..b.glass }, ..b };
@@ -827,20 +936,37 @@ pub fn set_node_props(node: &mut Node, app: Appearance, p: Props) {
 }
 
 /// How a colour of the artwork is made in the clear and tinted looks: light and shade are kept, the colour is not.
-fn treat(c: [f32; 3], app: Appearance, tint: [f32; 3]) -> [f32; 3] {
+fn treat(c: [f32; 3], app: Appearance, tint: [f32; 3], style: ClearStyle) -> [f32; 3] {
     let l = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
-    match app {
-        Appearance::ClearLight => [0.50 + 0.50 * l; 3],
-        Appearance::ClearDark => [0.32 + 0.62 * l; 3],
+    match (app, style) {
+        // white symbols, the artwork's shade kept as a light grey modelling
+        (Appearance::ClearLight | Appearance::ClearDark, ClearStyle::Contrast) => [0.80 + 0.20 * l; 3],
+        // ink: dark symbols (light parts of the artwork a little lighter)
+        (Appearance::ClearLight, ClearStyle::Ink) => [0.10 + 0.32 * l; 3],
+        (Appearance::ClearDark, ClearStyle::Ink) => [0.14 + 0.30 * l; 3],
+        (Appearance::ClearLight, _) => [0.50 + 0.50 * l; 3],
+        (Appearance::ClearDark, _) => [0.32 + 0.62 * l; 3],
+        _ => match app {
         Appearance::TintedLight => [mix(tint[0], 1.0, 0.35 + 0.65 * l), mix(tint[1], 1.0, 0.35 + 0.65 * l), mix(tint[2], 1.0, 0.35 + 0.65 * l)],
         Appearance::TintedDark => [tint[0] * (0.42 + 0.55 * l), tint[1] * (0.42 + 0.55 * l), tint[2] * (0.42 + 0.55 * l)],
         _ => c,
+        },
     }
 }
 
 /// The glass a layer gets in the clear and tinted looks when it was not set there.
 fn auto_glass(app: Appearance) -> Glass {
-    Glass { enabled: true, specular: 0.75, blur: if app.is_clear() { 0.4 } else { 0.0 }, refraction: 0.5, translucency: if app.is_clear() { 0.3 } else { 0.2 }, shadow: ShadowKind::Neutral, shadow_amount: 0.3, ..Glass::default() }
+    let base = Glass { enabled: true, specular: 0.75, blur: if app.is_clear() { 0.4 } else { 0.0 }, refraction: 0.5, translucency: if app.is_clear() { 0.3 } else { 0.2 }, shadow: ShadowKind::Neutral, shadow_amount: 0.3, ..Glass::default() };
+    if !app.is_clear() {
+        return base;
+    }
+    match clear_style() {
+        // solid enough to read: little see-through, a firmer shadow lifting it off the plate
+        ClearStyle::Contrast => Glass { specular: 0.9, blur: 0.0, translucency: 0.05, shadow_amount: 0.6, ..base },
+        ClearStyle::Ink => Glass { specular: 0.35, blur: 0.0, translucency: 0.0, shadow_amount: 0.12, ..base },
+        ClearStyle::Colour => Glass { translucency: 0.1, blur: 0.1, ..base },
+        ClearStyle::Frost => base,
+    }
 }
 
 static TINT: std::sync::Mutex<Option<[f32; 3]>> = std::sync::Mutex::new(None);
@@ -881,8 +1007,18 @@ fn auto_background(tint: [f32; 3]) -> impl Fn(Appearance, &Background) -> Backgr
             Appearance::Default => *base,
             // the base of every dark icon is the same, whatever the light one is
             Appearance::Dark => Background { shape, fill: FillKind::Gradient, top: DARK_BASE_TOP, bottom: DARK_BASE_BOTTOM, glass: glass(0.5) },
-            Appearance::ClearLight => Background { shape, fill: FillKind::Gradient, top: [0.66; 3], bottom: [0.52; 3], glass: clear(0.75) },
-            Appearance::ClearDark => Background { shape, fill: FillKind::Gradient, top: [0.24; 3], bottom: [0.15; 3], glass: clear(0.6) },
+            Appearance::ClearLight | Appearance::ClearDark => {
+                let dark = app == Appearance::ClearDark;
+                let (top, bottom) = match (clear_style(), dark) {
+                    (ClearStyle::Contrast, false) => ([0.40; 3], [0.30; 3]),
+                    (ClearStyle::Contrast, true) => ([0.16; 3], [0.08; 3]),
+                    (ClearStyle::Ink, false) => ([0.97; 3], [0.88; 3]),
+                    (ClearStyle::Ink, true) => ([0.86; 3], [0.76; 3]),
+                    (_, false) => ([0.66; 3], [0.52; 3]),
+                    (_, true) => ([0.24; 3], [0.15; 3]),
+                };
+                Background { shape, fill: FillKind::Gradient, top, bottom, glass: clear(if dark { 0.6 } else { 0.75 }) }
+            }
             Appearance::TintedLight => Background { shape, fill: FillKind::Gradient, top: scaled(1.05), bottom: scaled(0.82), glass: glass(0.7) },
             Appearance::TintedDark => Background { shape, fill: FillKind::Gradient, top: scaled(0.2), bottom: scaled(0.12), glass: glass(0.9) },
         }
@@ -1565,6 +1701,48 @@ pub fn follow_accent(accent: [f32; 3]) {
         std::sync::Mutex::new(tx)
     });
     let _ = worker.lock().unwrap().send(accent);
+}
+
+/// Draw the clear looks in `style` from now on: the tuning keeps it, and the clear themes (and their live versions) are
+/// drawn again in the background (the processor's work, a few seconds); the shell is told when they are there. A newer
+/// choice while drawing starts the work over.
+pub fn set_clear(style: ClearStyle) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static GEN: AtomicU64 = AtomicU64::new(0);
+    let mut t = GlassTune::load();
+    t.clear = style;
+    t.colour_clear = style == ClearStyle::Colour;
+    t.save();
+    set_clear_style(style);
+    let out = theme_dir();
+    if !THEME_LOOKS.iter().filter(|(look, _)| is_live_look(*look)).all(|(_, suffix)| look_dir(&out, suffix).join("index.theme").is_file()) {
+        return;
+    }
+    let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let cancel = || GEN.load(Ordering::SeqCst) != gen;
+        if cancel() {
+            return;
+        }
+        let docs = saved_docs();
+        let done = for_each_doc(&docs, GlassTune::load(), true, &cancel, &|_, _| {}, |renderer, doc| {
+            let mut written = 0;
+            for (look, suffix) in THEME_LOOKS {
+                if is_live_look(look) {
+                    let dir = look_dir(&out, suffix);
+                    written += write_look(renderer, doc, look, &dir)?;
+                    written += write_live(renderer, doc, look, &dir)?;
+                }
+            }
+            Ok(written)
+        });
+        match done {
+            Ok(_) if !cancel() => touch_marker(),
+            Ok(_) => {}
+            Err(e) => eprintln!("[icons] redrawing the clear looks: {e}"),
+        }
+    });
 }
 
 /// Draw the tinted looks of every saved document again in `accent`, into the themes the editor wrote.

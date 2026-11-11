@@ -98,11 +98,23 @@ pub enum PathStyle {
     Address,
 }
 
+/// The look of the window: the floating glass sidebar over a paper sheet (macOS-like), or KDE Dolphin's: a toolbar with a
+/// location bar, a flat Places panel with its sections, a status bar with a zoom slider and the free space, an optional
+/// Information panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FilesStyle {
+    Glass,
+    #[default]
+    Dolphin,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FilesPrefs {
     /// name of the preset this started from (display only)
     pub preset: String,
+    pub style: FilesStyle,
     pub view: ViewMode,
     pub sidebar: bool,
     pub sidebar_w: f32,
@@ -122,6 +134,8 @@ pub struct FilesPrefs {
     pub col_size: bool,
     pub col_date: bool,
     pub col_kind: bool,
+    /// the Information panel at the right (preview and details of the selection, F11)
+    pub info_panel: bool,
 }
 
 pub const PRESETS: [&str; 4] = ["Dolphin", "Icons", "Details", "Minimal"];
@@ -136,6 +150,7 @@ impl FilesPrefs {
     pub fn preset(name: &str) -> FilesPrefs {
         let base = FilesPrefs {
             preset: name.to_string(),
+            style: FilesStyle::Glass,
             view: ViewMode::Details,
             sidebar: true,
             sidebar_w: 190.0,
@@ -153,13 +168,14 @@ impl FilesPrefs {
             col_size: true,
             col_date: true,
             col_kind: true,
+            info_panel: false,
         };
         match name {
             // (the names in the middle are what these presets were called before they were renamed)
             "Icons" | "Finder" => FilesPrefs { view: ViewMode::Icons, sidebar_w: 200.0, icon_size: 72.0, status_bar: false, col_kind: false, ..base },
             "Details" | "Explorer" => FilesPrefs { toolbar_labels: true, path_style: PathStyle::Address, selection_row: true, row_h: 32.0, sidebar_headers: false, ..base },
             "Minimal" => FilesPrefs { view: ViewMode::Compact, sidebar: false, status_bar: false, row_h: 28.0, ..base },
-            _ => base,
+            _ => FilesPrefs { style: FilesStyle::Dolphin, view: ViewMode::Icons, sidebar_w: 200.0, row_h: 28.0, ..base },
         }
     }
 

@@ -544,6 +544,13 @@ fn launch_moving(state: &State) -> bool {
     state.busy_icon.is_some() && state.cursor_shape == memrium_de::cursor::Shape::Progress && prefs.launch_icon && prefs.launch_anim != memrium_de::cursor::LaunchAnim::Still
 }
 
+/// The picture of `shape` is the shell's own drawing and nothing more (no program's picture, no launch icon beside it):
+/// only such pictures are blended geometrically when the shape changes (see `cursor::Morph`).
+fn cursor_plain(state: &State, shape: memrium_de::cursor::Shape) -> bool {
+    use memrium_de::cursor::Shape;
+    shape != Shape::Client && !(shape == Shape::Progress && state.busy_icon.is_some() && state.config.input.cursor.launch_icon)
+}
+
 /// Like `cursor_theme::animation` (loops per second, pictures per loop), with enough pictures for a moving launch icon
 /// (about 60 a second; the loop draws one when it turns, at least every 16 ms while it moves, see `launch_moving`).
 fn cursor_animation(state: &State) -> Option<(f32, u32)> {
@@ -712,6 +719,8 @@ pub fn run(args: Args) {
     // "shake to find": how much bigger the cursor is drawn now, and the growth it was last drawn at
     let mut shake = memrium_de::cursor::Shake::default();
     let mut drawn_zoom = 1.0f32;
+    // a change of the cursor's shape, animated (the picture shown last, and the change in progress)
+    let mut morph = memrium_de::cursor::Morph::default();
     {
         let img = cursor_picture(&state, scale, 0.0);
         for o in &mut screens.outs {
@@ -814,7 +823,7 @@ pub fn run(args: Args) {
             // not waiting for a flip (or inactive) means there is a frame to draw right now
             // idle (the last frame was identical): wake now and then for the clock, the widgets and what other threads
             // bring (less often the longer nothing changes); input and client commits wake the poll at once
-            let timeout: i32 = if flip_pending || copying.is_some() || !active { 100 } else if idle { idle_wait(idle_streak, state.screen_off).min(if state.recording.is_some() { 8 } else if launch_moving(&state) { 16 } else { i32::MAX }) } else { 0 };
+            let timeout: i32 = if flip_pending || copying.is_some() || !active { 100 } else if idle { idle_wait(idle_streak, state.screen_off).min(if state.recording.is_some() || morph.running() { 8 } else if launch_moving(&state) { 16 } else { i32::MAX }) } else { 0 };
             // a frame start put off by the pacer: wake for it (to the microsecond; poll's milliseconds would lose most of
             // what putting it off gains)
             let mut wait_us = timeout as i64 * 1000;
@@ -972,18 +981,23 @@ pub fn run(args: Args) {
             // (in steps of 1/16, so a growing cursor is drawn again only a few times)
             let now = Instant::now();
             let zoom = (shake.zoom(now) * 16.0).round() / 16.0;
-            if shake.moving(now) || launch_moving(&state) {
+            // a new shape: the picture changes into it over a moment (only while it does is the cursor drawn every turn)
+            morph.retarget(state.cursor_shape, cursor_plain(&state, state.cursor_shape), &state.config.input.cursor, now);
+            let morphing = morph.running();
+            if shake.moving(now) || launch_moving(&state) || morphing {
                 // keep the loop turning at the quick rate until it has shrunk back, even with the mouse still
                 idle_streak = 0;
             }
-            if state.cursor_gen != drawn_gen || step != drawn_step || zoom != drawn_zoom || state.config.input.cursor != drawn_prefs {
+            if state.cursor_gen != drawn_gen || step != drawn_step || zoom != drawn_zoom || state.config.input.cursor != drawn_prefs || morphing {
                 drawn_gen = state.cursor_gen;
                 drawn_step = step;
                 drawn_zoom = zoom;
                 drawn_prefs = state.config.input.cursor.clone();
-                let img = cursor_picture(&state, scale * zoom, phase);
+                let prefs = &state.config.input.cursor;
+                let box_px = (prefs.size * scale * zoom).round().max(1.0) as u32;
+                let img = morph.frame(now, prefs, box_px, state.theme.accent, phase, || cursor_picture(&state, scale * zoom, phase));
                 for o in &mut screens.outs {
-                    draw_cursor(o, &img);
+                    draw_cursor(o, img);
                 }
             }
             // the hardware cursor lives on the monitor under the pointer and is hidden on the others

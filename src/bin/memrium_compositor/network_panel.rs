@@ -96,7 +96,7 @@ pub fn parse_aps(out: &str, saved: &[String]) -> Vec<Ap> {
     v
 }
 
-fn fetch() -> NetData {
+pub(crate) fn fetch() -> NetData {
     let run = |args: &[&str]| std::process::Command::new("nmcli").args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).to_string());
     let active = run(&["-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"]).map(|o| parse_active(&o)).unwrap_or_default();
     let saved: Vec<String> = run(&["-t", "-f", "NAME,TYPE", "connection", "show"]).map(|o| o.lines().filter_map(|l| { let f = split_terse(l); (f.get(1).map(String::as_str) == Some("802-11-wireless")).then(|| f[0].clone()) }).collect()).unwrap_or_default();

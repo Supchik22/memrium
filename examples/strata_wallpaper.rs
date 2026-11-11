@@ -346,24 +346,42 @@ fn main() {
     let px = 1.0 / fh; // one pixel in shares of the height
     // the shadow's reach, as a share of the height (about 26 px at 1080)
     let shadow_r = 42.0 / 1080.0;
-    let mut img = vec![0u8; w * h * 3];
+    // STRATA_LAYERS=n: the sheets go into n pictures with transparency (the furthest with the sky), for a wallpaper whose
+    // layers the shell moves apart (parallax); the output is then a folder `<name>.parallax/` of `0.png`, `1.png`...
+    let nl: usize = std::env::var("STRATA_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let layered = nl > 1;
+    let layer_of = |i: usize| -> usize { if layered { ((i + 1) * nl / (edges.len() + 1)).min(nl - 1) } else { 0 } };
+    if layered {
+        let _ = std::fs::create_dir_all(&out);
+    }
+    for layer in 0..nl.max(1) {
+    let mut img = vec![0u8; w * h * 4];
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
     let rows = h.div_ceil(threads);
     let jitter = seed;
     std::thread::scope(|sc| {
-        for (t, chunk) in img.chunks_mut(rows * w * 3).enumerate() {
-            let (edges, lines, pal, lnd) = (&edges, &lines, &pal, &lnd);
+        for (t, chunk) in img.chunks_mut(rows * w * 4).enumerate() {
+            let (edges, lines, pal, lnd, layer_of) = (&edges, &lines, &pal, &lnd, &layer_of);
             sc.spawn(move || {
-                for (r, row) in chunk.chunks_mut(w * 3).enumerate() {
+                for (r, row) in chunk.chunks_mut(w * 4).enumerate() {
                     let y = t * rows + r;
                     let v = (y as f32 + 0.5) / fh;
                     for x in 0..w {
                         let u = (x as f32 + 0.5) / fw;
                         // the furthest sheet, then each nearer one over it
                         let mut c = if landscape { sky(lnd, u, v, aspect) } else { sheet_colour(pal, 0, u, v, 1.0) };
+                        // how much of this pixel the layer covers (the furthest layer is all of it)
+                        let mut alpha: f32 = 1.0;
+                        if layer > 0 {
+                            c = [0.0; 3];
+                            alpha = 0.0;
+                        }
                         // how much of this pixel is a sheet rather than the sky
                         let mut solid: f32 = if landscape { 0.0 } else { 1.0 };
                         for (i, e) in edges.iter().enumerate() {
+                            if layer_of(i) != layer {
+                                continue;
+                            }
                             let ey = e.y(u);
                             let d = 0.0015;
                             let dy = (e.y(u + d) - e.y(u - d)) / (2.0 * d) * (fh / fw);
@@ -390,7 +408,18 @@ fn main() {
                                 // own colour (light through coloured card), not grey
                                 let s = 0.40 * (across / shadow_r).exp();
                                 let tint = [0.45 + me[0] * 0.40, 0.35 + me[1] * 0.35, 0.50 + me[2] * 0.40];
-                                c = mix(c, [c[0] * tint[0], c[1] * tint[1], c[2] * tint[2]], s);
+                                if alpha >= 0.999 {
+                                    c = mix(c, [c[0] * tint[0], c[1] * tint[1], c[2] * tint[2]], s);
+                                } else {
+                                    // on a layer of its own the shadow falls on the layer behind: a see-through deep shade
+                                    let sc = [me[0] * tint[0] * 0.45, me[1] * tint[1] * 0.45, me[2] * tint[2] * 0.45];
+                                    let sa = s * 0.75 * (1.0 - alpha);
+                                    let na = alpha + sa;
+                                    if na > 0.0 {
+                                        c = [(c[0] * alpha + sc[0] * sa) / na, (c[1] * alpha + sc[1] * sa) / na, (c[2] * alpha + sc[2] * sa) / na];
+                                    }
+                                    alpha = na;
+                                }
                             }
                             let cover = ((across / px) + 0.5).clamp(0.0, 1.0);
                             if cover <= 0.0 {
@@ -401,7 +430,12 @@ fn main() {
                             let rim = 0.14 * (-depth / 1.6).exp() + 0.07 * (-depth / 26.0).exp();
                             let lit = rim * (1.0 - 0.5 * (dy.abs() / (1.0 + dy.abs())));
                             let s = mix(me, [1.0, 0.93, 0.93], lit);
-                            c = mix(c, s, cover);
+                            let na = cover + alpha * (1.0 - cover);
+                            if na > 0.0 {
+                                let k = cover / na;
+                                c = mix(c, s, k);
+                            }
+                            alpha = na;
                             solid = solid.max(cover);
                         }
                         // low-poly facets on the right: each triangle a little lighter or darker
@@ -424,13 +458,21 @@ fn main() {
                         // a breath of grain, so the long gradients do not band
                         let n = (hash((y * w + x) as u32 ^ seed) & 0xff) as f32 / 255.0 - 0.5;
                         for k in 0..3 {
-                            row[x * 3 + k] = ((c[k].clamp(0.0, 1.0) * 255.0) + n * 1.6).round().clamp(0.0, 255.0) as u8;
+                            row[x * 4 + k] = ((c[k].clamp(0.0, 1.0) * 255.0) + n * 1.6).round().clamp(0.0, 255.0) as u8;
                         }
+                        row[x * 4 + 3] = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
                     }
                 }
             });
         }
     });
-    image::save_buffer(&out, &img, w as u32, h as u32, image::ColorType::Rgb8).expect("save");
-    eprintln!("saved {out}");
+    let path = if layered { format!("{out}/{layer}.png") } else { out.clone() };
+    if layered {
+        image::save_buffer(&path, &img, w as u32, h as u32, image::ColorType::Rgba8).expect("save");
+    } else {
+        let rgb: Vec<u8> = img.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        image::save_buffer(&path, &rgb, w as u32, h as u32, image::ColorType::Rgb8).expect("save");
+    }
+    eprintln!("saved {path}");
+    }
 }

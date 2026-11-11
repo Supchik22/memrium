@@ -17,7 +17,9 @@ fn collect(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let p = e.path();
-        if p.is_dir() {
+        if is_layered(&p) {
+            out.push(p);
+        } else if p.is_dir() {
             collect(&p, depth + 1, out);
         } else if is_image(&p) {
             out.push(p);
@@ -86,6 +88,8 @@ pub fn scan() -> Vec<(String, PathBuf)> {
     for d in [format!("{home}/Pictures/Wallpapers"), format!("{home}/.local/share/wallpapers"), format!("{home}/.local/share/backgrounds"), format!("{home}/Pictures")] {
         collect(Path::new(&d), 0, &mut paths);
     }
+    // the parallax wallpapers first: few, and made for this desktop
+    paths.sort_by_key(|p| !is_layered(p));
     let mut seen = std::collections::HashSet::new();
     paths
         .into_iter()
@@ -188,14 +192,59 @@ pub fn thumbnail(path: &Path) -> Option<image::RgbaImage> {
     if crate::video::is_video(path) {
         return crate::video::thumbnail(path);
     }
-    let img = image::open(path).ok()?.thumbnail(512, 512).to_rgba8();
+    let img = if is_layered(path) { load(path, 512)? } else { image::open(path).ok()?.thumbnail(512, 512).to_rgba8() };
     Some(image::imageops::resize(&img, 128, 128, image::imageops::FilterType::Triangle))
+}
+
+/// Is this a parallax wallpaper: a folder `<name>.parallax/` of pictures, the furthest layer first by name?
+pub fn is_layered(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "parallax") && path.is_dir()
+}
+
+fn layer_files(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| is_image(p)).collect();
+    v.sort();
+    v
+}
+
+/// The layers of a parallax wallpaper, all of one size (at most `max_w` wide, and small enough that the stack fits in
+/// one texture of `max_tex` px), stacked top to bottom; and how many there are.
+pub fn load_layers(path: &Path, max_w: u32, max_tex: u32) -> Option<(image::RgbaImage, u32)> {
+    let files = layer_files(path);
+    let first = image::open(files.first()?).ok()?;
+    let n = files.len() as u32;
+    let (fw, fh) = (first.width(), first.height());
+    let k = (max_w as f32 / fw as f32).min(max_tex as f32 / (fh as f32 * n as f32)).min(1.0);
+    let (w, h) = (((fw as f32 * k) as u32).max(1), ((fh as f32 * k) as u32).max(1));
+    let mut out = image::RgbaImage::new(w, h * n);
+    for (i, f) in files.iter().enumerate() {
+        let img = if i == 0 { first.clone() } else { image::open(f).ok()? };
+        let img = image::imageops::resize(&img.to_rgba8(), w, h, image::imageops::FilterType::Triangle);
+        image::imageops::replace(&mut out, &img, 0, (i as u32 * h) as i64);
+    }
+    Some((out, n))
 }
 
 /// The full wallpaper, downscaled to at most `max_w` wide to keep memory sane.
 pub fn load(path: &Path, max_w: u32) -> Option<image::RgbaImage> {
     if let Some(name) = path.to_str().and_then(|s| s.strip_prefix("builtin:")) {
         return builtin(name, max_w.min(2560));
+    }
+    // a parallax wallpaper: its layers one over the other (a picture of it, for the pickers)
+    if is_layered(path) {
+        let files = layer_files(path);
+        let mut base = image::open(files.first()?).ok()?;
+        if base.width() > max_w {
+            base = base.resize(max_w, u32::MAX, image::imageops::FilterType::Triangle);
+        }
+        let mut base = base.to_rgba8();
+        for f in files.iter().skip(1) {
+            if let Ok(l) = image::open(f) {
+                let l = image::imageops::resize(&l.to_rgba8(), base.width(), base.height(), image::imageops::FilterType::Triangle);
+                image::imageops::overlay(&mut base, &l, 0, 0);
+            }
+        }
+        return Some(base);
     }
     let img = image::open(path).ok()?;
     let img = if img.width() > max_w { img.resize(max_w, u32::MAX, image::imageops::FilterType::Triangle) } else { img };

@@ -245,7 +245,7 @@ impl State {
         }
     }
 
-    fn card_act(&mut self, a: Act) {
+    pub(crate) fn card_act(&mut self, a: Act) {
         use memrium_de::sysctl::Cmd;
         match a {
             Act::SetProfile(name) => {

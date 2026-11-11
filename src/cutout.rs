@@ -206,6 +206,10 @@ fn ort_ready() -> bool {
             if debug() {
                 eprintln!("cutout: loading onnxruntime from {}", p.display());
             }
+            if let Err(e) = loadable(&p) {
+                eprintln!("cutout: onnxruntime at {} cannot be used ({e}); using tract", p.display());
+                continue;
+            }
             match ort::init_from(&p) {
                 Ok(env) => {
                     env.with_name("memrium-cutout").commit();
@@ -219,6 +223,32 @@ fn ort_ready() -> bool {
         }
         false
     })
+}
+
+/// Can `ort` load this library without trouble? Opened here first, because `ort` (2.0.0-rc.12) hangs for good when its
+/// own loading fails: the error it builds asks for the API that is still being loaded (a `OnceLock` waiting on itself).
+/// Seen with an onnxruntime from a newer nixpkgs than the program's: it needs a newer glibc (`GLIBC_2.43`), `dlopen`
+/// refuses it, and the session never got past its first line. The library stays loaded on success (`ort` then gets the
+/// same handle).
+fn loadable(p: &Path) -> Result<(), String> {
+    // SAFETY: loading onnxruntime runs its initialisers, as `ort::init_from` would do right after
+    let lib = unsafe { libloading::Library::new(p) }.map_err(|e| e.to_string())?;
+    // SAFETY: `OrtGetApiBase` takes nothing and returns a pointer to a static table; `GetVersionString` a static C string
+    let version = unsafe {
+        let get: libloading::Symbol<unsafe extern "C" fn() -> *const ort::sys::OrtApiBase> = lib.get(b"OrtGetApiBase").map_err(|_| "no OrtGetApiBase in it".to_string())?;
+        let base = get();
+        if base.is_null() {
+            return Err("OrtGetApiBase gave nothing".into());
+        }
+        std::ffi::CStr::from_ptr(((*base).GetVersionString)()).to_string_lossy().into_owned()
+    };
+    let minor = version.split('.').nth(1).and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+    if minor < 22 {
+        return Err(format!("version {version}, 1.22 or newer is needed"));
+    }
+    // (kept loaded: unloading and loading onnxruntime again is what was seen to hang before)
+    std::mem::forget(lib);
+    Ok(())
 }
 
 /// The onnxruntime version a library's (resolved) path names, as Nix store paths do: `...-onnxruntime-1.22.2/lib/...`.

@@ -584,13 +584,23 @@ pub struct State {
     pub wall_paths: Vec<std::path::PathBuf>,
     pub walls_loaded: bool,
     pub thumb_rx: Option<Receiver<(usize, image::RgbaImage)>>,
-    pub wall_rx: Option<Receiver<image::RgbaImage>>,
+    /// a wallpaper being read: the picture (a parallax one: its layers stacked) and how many layers it has
+    pub wall_rx: Option<Receiver<(image::RgbaImage, u32)>>,
+    /// the start of the session's opening (the desktop slides in), and whether it has played
+    pub intro_t0: Option<Instant>,
+    pub intro_done: bool,
+    /// the pointer as the wallpaper follows it (eased)
+    pub wall_ptr: [f32; 2],
     /// an accent colour taken from the current wallpaper (offered in Settings)
     pub wall_accent: Option<[f32; 3]>,
     pub pending_theme: Option<Theme>,
     pub pending_actions: Vec<SettingsAction>,
     /// when the theme last changed (config is saved shortly after the last change)
     pub cfg_dirty: Option<Instant>,
+    /// Focus (do not disturb) set for a while from Fettle: when it ends, and what the control says ("Until 18:00")
+    pub dnd_until: Option<(std::time::SystemTime, String)>,
+    /// search by meaning: the indexer and its status (see `semindex`)
+    pub semindex: crate::semindex::SemIndex,
     pub default_wallpaper: Option<std::path::PathBuf>,
     pub menu_light: bool,
 
@@ -742,6 +752,8 @@ pub struct State {
     pub gestures: crate::gestures::Gestures,
     /// the power card of the battery icon, and whether sleep and screen locking were blocked by hand
     pub card: Option<crate::popup::Popup>,
+    /// the networks, devices and sound lists Fettle shows, read while it is open
+    pub fettle_feed: crate::fettle_feed::FettleFeed,
     /// MEMRIUM_DEBUG_POINTER: how many raw motions were sent to clients
     pub dbg_rel: u64,
     /// MEMRIUM_DEBUG_POINTER: the lock as last seen, and the raw motions since it changed
@@ -2390,7 +2402,19 @@ impl State {
                     LauncherClick::App(i) => {
                         let app = self.apps[i].clone();
                         self.launch_app(&app);
+                        if !self.launcher.is_pinned() {
+                            self.launcher.close();
+                        }
+                    }
+                    LauncherClick::System(what) => {
                         self.launcher.close();
+                        self.power(what);
+                    }
+                    LauncherClick::Place(i) => {
+                        self.open_files(Some(&memrium_de::launcher::place_path(i)));
+                        if !self.launcher.is_pinned() {
+                            self.launcher.close();
+                        }
                     }
                     LauncherClick::Item(i) => {
                         if let Some(it) = self.launcher.item(i) {
@@ -2402,7 +2426,11 @@ impl State {
                         self.open_power_menu([r[0], (r[1] - 140.0).max(8.0)]);
                     }
                     LauncherClick::Inside | LauncherClick::Shortcut(_) => {}
-                    LauncherClick::Outside => self.launcher.close(),
+                    LauncherClick::Outside => {
+                        if !self.launcher.is_pinned() {
+                            self.launcher.close();
+                        }
+                    }
                 }
                 return;
             }
@@ -2547,6 +2575,10 @@ impl State {
             return;
         }
         if self.card_scroll(dy) {
+            return;
+        }
+        // Fettle's liquid sliders pour with the wheel
+        if self.scene.cc_scroll(dy as f32) {
             return;
         }
         if dy != 0.0 && self.panel_edit.is_none() && self.bar_alt_action(if dy < 0.0 { "scroll_up" } else { "scroll_down" }) {
@@ -2946,6 +2978,30 @@ impl State {
                 return true;
             }
         }
+        // the open Fettle walks with the arrows and Tab, switches with Enter / Space, opens a list with Shift+Enter
+        if self.scene.cc_open() && !ctrl && !alt && !logo {
+            use memrium_de::controlcenter::CcKey;
+            let k = match sym {
+                Keysym::Left => Some(CcKey::Left),
+                Keysym::Right => Some(CcKey::Right),
+                Keysym::Up => Some(CcKey::Up),
+                Keysym::Down => Some(CcKey::Down),
+                Keysym::ISO_Left_Tab => Some(CcKey::Prev),
+                Keysym::Tab if mods.shift => Some(CcKey::Prev),
+                Keysym::Tab => Some(CcKey::Next),
+                Keysym::Return | Keysym::KP_Enter if mods.shift => Some(CcKey::Open),
+                Keysym::Return | Keysym::KP_Enter | Keysym::space => Some(CcKey::Enter),
+                Keysym::Escape => Some(CcKey::Esc),
+                _ => None,
+            };
+            if let Some(k) = k {
+                if self.scene.cc_key(k) {
+                    self.process_shell_events();
+                    self.invalidate();
+                    return true;
+                }
+            }
+        }
         match sym {
             Keysym::Escape if self.focused_shell() == Some(Sw::Settings) => self.settings.close(),
             Keysym::Escape if self.panel_edit.is_some() => self.panel_edit = None,
@@ -3202,10 +3258,41 @@ impl State {
         self.scene.set_dock_focus(items, focused.as_deref());
     }
 
+    /// Focus (do not disturb) from Fettle: off, or on until a time worked out in local time.
+    fn set_focus(&mut self, f: memrium_de::controlcenter::FocusFor) {
+        use memrium_de::controlcenter::FocusFor;
+        let now = std::time::SystemTime::now();
+        let secs_of_day = local_secs_of_day();
+        let ahead: Option<u64> = match f {
+            FocusFor::Off | FocusFor::On => None,
+            FocusFor::Hour => Some(3600),
+            // the evening at 18:00; later on, 22:00; later still, midnight
+            FocusFor::Evening => Some([18 * 3600, 22 * 3600, 24 * 3600].into_iter().find(|t| *t > secs_of_day + 600).unwrap_or(24 * 3600) - secs_of_day),
+            FocusFor::Morning => Some(24 * 3600 + 8 * 3600 - secs_of_day),
+        };
+        self.config.notifications.dnd = f != FocusFor::Off;
+        self.dnd_until = ahead.map(|a| {
+            let at = (secs_of_day + a) % (24 * 3600);
+            (now + std::time::Duration::from_secs(a), format!("Until {:02}:{:02}", at / 3600, at / 60 % 60))
+        });
+        self.cfg_dirty = Some(Instant::now());
+    }
+
     /// React to Dock clicks: raise the app's window, or launch it.
     fn process_shell_events(&mut self) {
         use memrium_de::controlcenter::CcEvent;
         use memrium_de::sysctl::Cmd;
+        // Focus set for a while ends on its own; and Fettle shows it as it is (the bell and Settings switch it too)
+        if self.dnd_until.as_ref().is_some_and(|(t, _)| std::time::SystemTime::now() >= *t) {
+            self.dnd_until = None;
+            self.config.notifications.dnd = false;
+            self.cfg_dirty = Some(Instant::now());
+        }
+        if !self.config.notifications.dnd {
+            self.dnd_until = None;
+        }
+        let until = self.dnd_until.as_ref().map(|(_, l)| l.clone());
+        self.scene.cc_set_focus(self.config.notifications.dnd, until);
         for ev in self.scene.take_cc_events() {
             match ev {
                 CcEvent::Media(cmd) => {
@@ -3231,6 +3318,24 @@ impl State {
                 CcEvent::Layout(layout) => {
                     self.config.cc_tiles = layout;
                     self.cfg_dirty = Some(Instant::now());
+                }
+                CcEvent::WifiConnect(ssid) => self.card_act(crate::popup::Act::ConnectWifi(ssid)),
+                CcEvent::Bluetooth(args) => self.card_act(crate::popup::Act::Bluetooth(args)),
+                CcEvent::DefaultSink(id) => self.sys_watcher.send(Cmd::SetDefaultSink(id)),
+                CcEvent::NodeVolume(id, v) => self.sys_watcher.send(Cmd::SetNodeVolume(id, v)),
+                CcEvent::Focus(f) => self.set_focus(f),
+                CcEvent::Card(kind) if kind == "notifications" => {
+                    self.scene.set_cc_open(false);
+                    self.open_shell(Sw::Settings);
+                    self.settings.set_page(Settings::page_by_name("notifications").unwrap_or(0));
+                }
+                CcEvent::Card(kind) => {
+                    let pk = match kind.as_str() {
+                        "bluetooth" => crate::popup::PopKind::Bluetooth,
+                        "audio" => crate::popup::PopKind::Audio,
+                        _ => crate::popup::PopKind::Network,
+                    };
+                    self.toggle_card(pk, None, self.mouse[0]);
                 }
             }
         }
@@ -4058,6 +4163,10 @@ impl State {
                     "brightness" => self.toggle_flyout(crate::flyout::FlyKind::Brightness, hit.bar, self.mouse[0]),
                     "power" => self.toggle_card(crate::popup::PopKind::Power, Some(hit.bar), self.mouse[0]),
                     "calendar" => self.toggle_card(crate::popup::PopKind::Calendar, Some(hit.bar), self.mouse[0]),
+                    // in Fettle's look the bar's icons open it with their control grown in place
+                    "audio" if self.scene.cc_open_grown("sound") => {}
+                    "network" if self.scene.cc_open_grown("wifi") => {}
+                    "bluetooth" if self.scene.cc_open_grown("bluetooth") => {}
                     "audio" => self.toggle_card(crate::popup::PopKind::Audio, Some(hit.bar), self.mouse[0]),
                     "network" => self.toggle_card(crate::popup::PopKind::Network, Some(hit.bar), self.mouse[0]),
                     "keyboard" => self.open_layout_menu(),
@@ -4317,7 +4426,7 @@ impl State {
                 MenuItem::new(B_CLOSE, "Close Window").key("Alt+F4").enabled(self.has_window()),
             ],
             "View" => vec![
-                MenuItem::new(B_CC, "Quick Settings").icon("sliders-horizontal").checked(self.scene.cc_open()),
+                MenuItem::new(B_CC, "Fettle").icon("sliders-horizontal").checked(self.scene.cc_open()),
                 MenuItem::new(B_EDIT, "Edit Controls").icon("pencil"),
             ],
             "Window" => {
@@ -4741,9 +4850,15 @@ impl State {
                 match path {
                     Some(p) => {
                         let (tx, rx) = channel();
+                        let max_tex = self.renderer.device().limits().max_texture_dimension_2d;
                         std::thread::spawn(move || {
-                            if let Some(img) = wallpapers::load(&p, 3840) {
-                                let _ = tx.send(img);
+                            // a parallax wallpaper: its layers, moved apart by the shell
+                            if wallpapers::is_layered(&p) {
+                                if let Some(l) = wallpapers::load_layers(&p, 3840, max_tex) {
+                                    let _ = tx.send(l);
+                                }
+                            } else if let Some(img) = wallpapers::load(&p, 3840) {
+                                let _ = tx.send((img, 1));
                             }
                         });
                         self.wall_rx = Some(rx);
@@ -4833,13 +4948,28 @@ impl State {
             }
         }
         if let Some(rx) = &self.wall_rx {
-            if let Ok(img) = rx.try_recv() {
-                self.menu_light = wallpapers::is_dark_top(&img);
-                self.wall_accent = Some(wallpapers::accent_of(&img));
-                self.scene.set_menu_light(self.menu_light);
-                let fitted = self.fit_to_monitors(img);
-                self.renderer.set_wallpaper(Some(&fitted));
+            if let Ok((img, layers)) = rx.try_recv() {
+                if layers > 1 {
+                    // the colours are read from the layers one over the other, as the picture looks at rest
+                    let h = img.height() / layers;
+                    let mut flat = image::imageops::crop_imm(&img, 0, 0, img.width(), h).to_image();
+                    for i in 1..layers {
+                        let l = image::imageops::crop_imm(&img, 0, i * h, img.width(), h).to_image();
+                        image::imageops::overlay(&mut flat, &l, 0, 0);
+                    }
+                    self.menu_light = wallpapers::is_dark_top(&flat);
+                    self.wall_accent = Some(wallpapers::accent_of(&flat));
+                    self.scene.set_menu_light(self.menu_light);
+                    self.renderer.set_wallpaper_layers(Some(&img), layers);
+                } else {
+                    self.menu_light = wallpapers::is_dark_top(&img);
+                    self.wall_accent = Some(wallpapers::accent_of(&img));
+                    self.scene.set_menu_light(self.menu_light);
+                    let fitted = self.fit_to_monitors(img);
+                    self.renderer.set_wallpaper(Some(&fitted));
+                }
                 self.wall_rx = None;
+                self.invalidate();
             }
         }
         if let Some(theme) = self.pending_theme.take() {
@@ -4853,6 +4983,7 @@ impl State {
                 SettingsAction::TestNotification => self.test_notification(),
                 SettingsAction::TestOsd => self.test_osd(),
                 SettingsAction::TestGesture(word) => self.test_gesture(word),
+                SettingsAction::ForgetSearchIndex => self.semindex_forget(),
                 SettingsAction::Preset(id) => {
                     // a clean template switch, but keep the user's wallpaper
                     let wallpaper = self.theme.wallpaper.clone();
@@ -5000,10 +5131,11 @@ impl State {
                 let index = self.icons.get();
                 let icon_names: &[String] = index.as_deref().map_or(&[], |i| i.names());
                 let camera_status = self.gesture_status_line();
+                let search_status = self.semindex.status.clone();
                 let (cp, cl, actions) = {
                     let renderer = &self.renderer;
                     let app_icon = |id: &str| renderer.app_icon_get(id);
-                    let mut ctx = SettingsCtx { screen: self.size, theme: &mut theme, presets: &self.presets, preset_id: &self.config.theme, walls: &self.walls, language: &self.config.language, wall_accent: self.wall_accent, cfg: &mut cfg, monitors: &self.monitor_infos, size: self.client_size(Sw::Settings), icons: &icon_cells, sys: &self.sys, app_icon: &app_icon, want_icons: &mut want_icons, icon_names, camera_status: &camera_status };
+                    let mut ctx = SettingsCtx { screen: self.size, theme: &mut theme, presets: &self.presets, preset_id: &self.config.theme, walls: &self.walls, language: &self.config.language, wall_accent: self.wall_accent, cfg: &mut cfg, monitors: &self.monitor_infos, size: self.client_size(Sw::Settings), icons: &icon_cells, sys: &self.sys, app_icon: &app_icon, want_icons: &mut want_icons, icon_names, camera_status: &camera_status, search_status: &search_status };
                     self.settings.draw(&mut ctx, origin)
                 };
                 // the icons the Programs page lacked start loading (a few a frame)
@@ -5061,7 +5193,7 @@ impl State {
                 tidy(&mut cfg.keys);
                 let mut had = self.config.keys.clone();
                 tidy(&mut had);
-                if cfg.screenshots != self.config.screenshots || cfg.power != self.config.power || cfg.keys != had || cfg.weather_city != self.config.weather_city || cfg.display != self.config.display || cfg.input != self.config.input || cfg.notifications != self.config.notifications || cfg.desktop != self.config.desktop || cfg.osd != self.config.osd {
+                if cfg.screenshots != self.config.screenshots || cfg.power != self.config.power || cfg.keys != had || cfg.weather_city != self.config.weather_city || cfg.display != self.config.display || cfg.input != self.config.input || cfg.notifications != self.config.notifications || cfg.desktop != self.config.desktop || cfg.osd != self.config.osd || cfg.privacy != self.config.privacy {
                     self.desktop.prefs = cfg.desktop.clone();
                     self.config.desktop = cfg.desktop;
                     self.config.screenshots = cfg.screenshots;
@@ -5072,6 +5204,8 @@ impl State {
                     self.config.notifications = cfg.notifications;
                     // (the Indicator page: without this its changes were thrown away the next frame)
                     self.config.osd = cfg.osd;
+                    // (Privacy: camera, reactions, search by meaning; likewise thrown away before)
+                    self.config.privacy = cfg.privacy;
                     self.config.display = cfg.display;
                     // pointer speed and the like reach the devices on the next turn of the session's loop
                     self.input_dirty = cfg.input != self.config.input;
@@ -5285,6 +5419,11 @@ impl State {
         }
         self.scene.cc_set_layout(&self.config.cc_tiles);
         self.scene.cc_set_record_angle(self.album.angle);
+        let wants = self.scene.cc_wants_lists();
+        if let Some(lists) = self.fettle_feed.tick(wants) {
+            let lists = lists.clone();
+            self.scene.cc_set_lists(&lists);
+        }
         self.update_toasts(dt);
         self.clipboard_tick();
         self.update_reveal();
@@ -5301,6 +5440,7 @@ impl State {
         self.update_visualizer();
         self.update_flyout(dt);
         self.gestures_tick(dt);
+        self.semindex_tick();
         self.live_text_tick();
         self.voice_tick(dt);
         self.update_card(dt);
@@ -6178,5 +6318,16 @@ mod solid_parts_tests {
         let mut b = vec![0u8; w * h * 4];
         fill(&mut b, w, [0, 0, 100, 100]);
         assert!(solid_parts(&b, w, h, w * 4).is_empty());
+    }
+}
+
+/// Seconds since local midnight, now.
+fn local_secs_of_day() -> u64 {
+    // SAFETY: time/localtime_r are given valid pointers to initialised values
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        (tm.tm_hour as u64) * 3600 + (tm.tm_min as u64) * 60 + tm.tm_sec as u64
     }
 }

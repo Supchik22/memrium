@@ -67,7 +67,7 @@ pub fn parse_status(out: &str) -> AudioData {
     data
 }
 
-fn fetch() -> AudioData {
+pub(crate) fn fetch() -> AudioData {
     let run = |args: &[&str]| std::process::Command::new("wpctl").args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).to_string());
     let mut data = run(&["status"]).map(|o| parse_status(&o)).unwrap_or_default();
     for s in &mut data.streams {
