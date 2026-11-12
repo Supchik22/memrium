@@ -251,9 +251,13 @@ pub fn run(mut args: Args) {
                 // `desk 2`: go to a desktop; `swipe begin|-300|end`: a three-finger swipe
                 Some("desk") => state.switch_workspace(it.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).saturating_sub(1)),
                 Some("swipe") => match it.next() {
-                    Some("begin") => state.ws_swipe_begin(),
-                    Some("end") => state.ws_swipe_end(false),
-                    Some(v) => state.ws_swipe_move(v.parse().unwrap_or(0.0), 0.016),
+                    Some("begin") => state.swipe_begin(),
+                    Some("end") => state.swipe_end(false),
+                    // `swipe up 400`: vertical travel (negative = fingers up)
+                    Some("up") => state.swipe_move(0.0, -it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0), 0.016),
+                    Some("down") => state.swipe_move(0.0, it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0), 0.016),
+                    Some(v) => state.swipe_move(v.parse().unwrap_or(0.0), 0.0, 0.016),
+                    // (`overview on|off` is a step of its own, below)
                     None => {}
                 },
                 // `evdev 99 down|up`: a real key event by its evdev code (99 is Print), for keys that act on release or on holding
@@ -293,6 +297,20 @@ pub fn run(mut args: Args) {
             if now_ms > at {
                 state.open_shell(crate::state::Sw::Settings);
                 settings_opened = true;
+                // test hooks: a page by its position in the sidebar list, and made-up fingers for the touchpad test
+                if let Some(i) = std::env::var("MEMRIUM_TEST_PAGE").ok().and_then(|v| v.parse().ok()) {
+                    state.settings.set_page(i);
+                }
+                if std::env::var_os("MEMRIUM_FAKE_TOUCH").is_some() {
+                    use memrium_de::touchpad::{Finger, SNAP};
+                    if let Ok(mut sn) = SNAP.lock() {
+                        sn.present = true;
+                        sn.aspect = 1.55;
+                        sn.fingers = vec![Finger { id: 1, x: 0.3, y: 0.4, press: 0.4 }, Finger { id: 2, x: 0.5, y: 0.35, press: 0.6 }, Finger { id: 3, x: 0.7, y: 0.45, press: 0.5 }];
+                        sn.peak = 3;
+                        sn.touches = 7;
+                    }
+                }
             }
         }
         if let (Some(at), false) = (launcher_at, launcher_opened) {

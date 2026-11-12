@@ -736,6 +736,7 @@ pub fn run(args: Args) {
     state.pointer_motion(cursor[0], cursor[1]);
 
     let mut devices: Vec<input::Device> = Vec::new();
+    let mut touch_probe: Option<memrium_de::touchpad::Probe> = None;
     let kde_text = memrium_de::input::kcminputrc();
     // --- main loop
     let mut active = true;
@@ -898,12 +899,25 @@ pub fn run(args: Args) {
                 state.pointer_motion(cursor[0], cursor[1]);
             }
         }
+        if let Some(tp) = touch_probe.as_mut() {
+            tp.poll(memrium_de::touchpad::WANTED.load(std::sync::atomic::Ordering::Relaxed) && state.settings.open);
+        }
         for ev in &mut libinput {
             had_input = true;
             match ev {
                 InputEvent::Device(DeviceEvent::Added(a)) => {
                     let mut d = a.device();
                     apply_input(&mut d, &state.config.input, &kde_text);
+                    // a touchpad: a second reader of its raw fingers for Settings' touchpad test
+                    if touch_probe.is_none() && d.config_tap_finger_count() > 0 {
+                        let path = std::path::PathBuf::from(format!("/dev/input/{}", d.sysname()));
+                        if let Ok(dev) = seat.borrow_mut().open_device(&path) {
+                            if let Ok(fd) = dev.as_fd().try_clone_to_owned() {
+                                touch_probe = memrium_de::touchpad::Probe::new(fd, Some(Box::new(dev)));
+                                eprintln!("touchpad: reading fingers from {} ({})", path.display(), if touch_probe.is_some() { "ok" } else { "no multi-touch" });
+                            }
+                        }
+                    }
                     devices.push(d);
                 }
                 InputEvent::Device(DeviceEvent::Removed(r)) => {
@@ -943,14 +957,14 @@ pub fn run(args: Args) {
                     use input::event::gesture::{GestureEndEvent, GestureEventCoordinates, GestureEventTrait};
                     // three or four fingers going sideways move the desktops
                     match sw {
-                        GestureSwipeEvent::Begin(b) if b.finger_count() >= 3 => state.ws_swipe_begin(),
+                        GestureSwipeEvent::Begin(b) if b.finger_count() >= 3 => state.swipe_begin(),
                         GestureSwipeEvent::Update(u) if u.finger_count() >= 3 => {
                             let now = Instant::now();
                             let dt = (now - swipe_last).as_secs_f32();
                             swipe_last = now;
-                            state.ws_swipe_move(u.dx() as f32, dt);
+                            state.swipe_move(u.dx() as f32, u.dy() as f32, dt);
                         }
-                        GestureSwipeEvent::End(e) => state.ws_swipe_end(e.cancelled()),
+                        GestureSwipeEvent::End(e) => state.swipe_end(e.cancelled()),
                         _ => {}
                     }
                 }

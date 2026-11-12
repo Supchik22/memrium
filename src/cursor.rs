@@ -105,9 +105,22 @@ pub enum ArrowStyle {
     Slim,
     /// a plain triangle
     Triangle,
+    /// fatter, with a wide tail
+    Bold,
+    /// an arrowhead with a notch, like a map's "you are here"
+    Navigator,
+    /// a long, sharp kite
+    Sharp,
 }
 
-pub const ARROWS: [(ArrowStyle, &str); 3] = [(ArrowStyle::Classic, "Classic"), (ArrowStyle::Slim, "Slim"), (ArrowStyle::Triangle, "Triangle")];
+pub const ARROWS: [(ArrowStyle, &str); 6] = [
+    (ArrowStyle::Classic, "Classic"),
+    (ArrowStyle::Slim, "Slim"),
+    (ArrowStyle::Triangle, "Triangle"),
+    (ArrowStyle::Bold, "Bold"),
+    (ArrowStyle::Navigator, "Navigator"),
+    (ArrowStyle::Sharp, "Sharp"),
+];
 
 /// What the "starting / busy" cursor looks like.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -553,6 +566,9 @@ fn arrow_points(style: ArrowStyle, k: f32, dx: f32, dy: f32) -> Vec<(f32, f32)> 
         ArrowStyle::Classic => &[(2.0, 2.0), (2.0, 21.0), (6.6, 16.8), (10.2, 25.0), (13.4, 23.6), (9.8, 15.6), (16.2, 15.6)],
         ArrowStyle::Slim => &[(2.0, 2.0), (2.0, 23.0), (6.0, 18.6), (9.2, 26.5), (11.6, 25.5), (8.4, 17.6), (13.4, 17.4)],
         ArrowStyle::Triangle => &[(2.0, 2.0), (2.0, 24.0), (8.0, 18.5), (19.0, 17.0)],
+        ArrowStyle::Bold => &[(2.0, 2.0), (2.0, 22.0), (7.2, 17.6), (10.4, 26.0), (15.6, 23.8), (12.2, 15.8), (18.6, 15.8)],
+        ArrowStyle::Navigator => &[(2.0, 2.0), (19.0, 8.0), (10.8, 10.8), (8.0, 19.0)],
+        ArrowStyle::Sharp => &[(2.0, 2.0), (3.6, 27.0), (8.4, 20.2), (17.0, 17.4)],
     };
     pts.iter().map(|(x, y)| (dx + x * k, dy + y * k)).collect()
 }

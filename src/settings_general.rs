@@ -464,7 +464,7 @@ fn cursor_preview(ui: &mut Ui, r: [f32; 4], shape: crate::cursor::Shape, prefs: 
 #[allow(clippy::too_many_arguments)]
 fn shape_tiles<T: Copy + PartialEq>(ui: &mut Ui, x0: f32, y: f32, label: &str, v: &mut T, opts: &[(T, &str)], shape: crate::cursor::Shape, base: &crate::cursor::CursorPrefs, set: fn(&mut crate::cursor::CursorPrefs, T), cell: &dyn Fn(&str) -> Option<u32>, want: &mut Vec<String>) {
     ui.row(x0, y + 37.0, label);
-    let (tw, th, gap) = (104.0, 62.0, 10.0);
+    let (tw, th, gap) = (if opts.len() > 4 { 78.0 } else { 104.0 }, 62.0, 10.0);
     for (k, (val, name)) in opts.iter().enumerate() {
         let r = [x0 + 150.0 + k as f32 * (tw + gap), y + 6.0, tw, th];
         let hov = ui.hit(r);
@@ -490,9 +490,93 @@ fn shape_tiles<T: Copy + PartialEq>(ui: &mut Ui, x0: f32, y: f32, label: &str, v
 }
 
 pub(super) fn page_mouse(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
-    use crate::cursor::{CursorLook, LaunchAnim, Shape, ARROWS, BEAMS, BUSY_STYLES, EDGES, HANDS, LAUNCH_ANIMS, LOOKS, RESIZES};
     use crate::input::Accel;
     ui.text(x, y + 52.0, "Mouse", 22.0, true, ui.ink, 0.97, Align::Left);
+    let input = &mut ctx.cfg.input;
+    let n = y + 94.0;
+    let (px, rx) = (x + 16.0, x + cw - 16.0);
+    ui.section(x, n, "POINTER");
+    let py = n + 12.0;
+    group(ui, [x, py, cw, 196.0]);
+    ui.row(px, py + 30.0, "Speed");
+    ui.slider([rx - 300.0, py + 20.0, 240.0, 20.0], &mut input.pointer_speed, -1.0, 1.0, "");
+    separator(ui, x, py + 58.0, cw);
+    ui.row(px, py + 88.0, "Acceleration");
+    let mut acc = if input.accel == Accel::Flat { 1 } else { 0 };
+    if ui.segmented([rx - 190.0, py + 74.0, 190.0, 28.0], &["Adaptive", "Flat"], &mut acc) {
+        input.accel = if acc == 1 { Accel::Flat } else { Accel::Adaptive };
+    }
+    separator(ui, x, py + 116.0, cw);
+    ui.row(px, py + 142.0, "Natural scrolling");
+    ui.toggle(rx - 44.0, py + 130.0, &mut input.natural_scroll);
+    ui.row(px, py + 178.0, "Left-handed");
+    ui.toggle(rx - 44.0, py + 166.0, &mut input.left_handed);
+}
+
+pub(super) fn page_touchpad(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
+    ui.text(x, y + 52.0, "Touchpad", 22.0, true, ui.ink, 0.97, Align::Left);
+    let input = &mut ctx.cfg.input;
+    let (px, rx) = (x + 16.0, x + cw - 16.0);
+    ui.section(x, y + 94.0, "CLICKING AND SCROLLING");
+    let py = y + 106.0;
+    group(ui, [x, py, cw, 92.0]);
+    ui.row(px, py + 30.0, "Tap to click");
+    ui.toggle(rx - 44.0, py + 18.0, &mut input.tap_to_click);
+    separator(ui, x, py + 46.0, cw);
+    ui.row(px, py + 76.0, "Natural scrolling");
+    ui.toggle(rx - 44.0, py + 64.0, &mut input.natural_scroll);
+    ui.text(x + 4.0, py + 118.0, "Three fingers: up shows all windows, sideways switches desktops.", 12.0, false, ui.ink, 0.55, Align::Left);
+    let n = y + 106.0 + 92.0 + 56.0;
+    // ---- the touchpad test: every finger on the pad, where it is
+    let _n = {
+        let snap = crate::touchpad::SNAP.lock().map(|s| s.clone()).unwrap_or_else(|_| crate::touchpad::Snap::new());
+        ui.section(x, n, "TOUCHPAD TEST");
+        let top = n + 12.0;
+        let ph = 250.0;
+        group(ui, [x, top, cw, ph]);
+        if !snap.present {
+            ui.text(x + cw / 2.0, top + ph / 2.0, "No touchpad with multi-touch found", 13.0, false, ui.ink, 0.55, Align::Center);
+        } else {
+            // the pad, as wide as the real one is wide for its height
+            let ph_pad = ph - 32.0;
+            let pw = (ph_pad * snap.aspect).min(cw - 220.0);
+            let ph_pad = (pw / snap.aspect).min(ph_pad);
+            let pad = [x + 16.0, top + 16.0, pw, ph_pad];
+            ui.fill(pad, 14.0, ui.ink, 0.07);
+            ui.fill([pad[0] + 1.0, pad[1] + 1.0, pad[2] - 2.0, pad[3] - 2.0], 13.0, if ui.dark { [0.10, 0.11, 0.14] } else { [0.97, 0.98, 1.0] }, 1.0);
+            if snap.fingers.is_empty() {
+                ui.text(pad[0] + pad[2] / 2.0, pad[1] + pad[3] / 2.0 + 4.0, "Put your fingers on the touchpad", 12.5, false, ui.ink, 0.45, Align::Center);
+            }
+            const HUES: [[f32; 3]; 6] = [[1.0, 0.35, 0.45], [0.30, 0.65, 1.0], [0.35, 0.85, 0.50], [1.0, 0.75, 0.25], [0.70, 0.45, 1.0], [0.25, 0.85, 0.85]];
+            for (i, f) in snap.fingers.iter().enumerate() {
+                let c = HUES[i % HUES.len()];
+                let r = 15.0 + 9.0 * f.press;
+                let (cx, cy) = (pad[0] + 14.0 + f.x * (pad[2] - 28.0), pad[1] + 14.0 + f.y * (pad[3] - 28.0));
+                ui.fill([cx - r - 5.0, cy - r - 5.0, 2.0 * r + 10.0, 2.0 * r + 10.0], r + 5.0, c, 0.22);
+                ui.fill([cx - r, cy - r, 2.0 * r, 2.0 * r], r, c, 0.92);
+                ui.text(cx, cy + 4.5, &format!("{}", i + 1), 13.0, true, [1.0; 3], 1.0, Align::Center);
+            }
+            // the numbers beside it
+            let tx = pad[0] + pad[2] + 24.0;
+            ui.text(tx, top + 40.0, "Fingers now", 12.0, false, ui.ink, 0.55, Align::Left);
+            ui.text(tx, top + 74.0, &format!("{}", snap.fingers.len()), 30.0, true, ui.ink, 0.95, Align::Left);
+            ui.text(tx, top + 110.0, &format!("Most at once: {}", snap.peak), 12.5, false, ui.ink, 0.7, Align::Left);
+            ui.text(tx, top + 132.0, &format!("Touches: {}", snap.touches), 12.5, false, ui.ink, 0.7, Align::Left);
+            for (i, f) in snap.fingers.iter().enumerate().take(5) {
+                let c = HUES[i % HUES.len()];
+                let yy = top + 162.0 + i as f32 * 17.0;
+                ui.fill([tx, yy - 8.0, 9.0, 9.0], 4.5, c, 0.95);
+                ui.text(tx + 16.0, yy, &format!("{}  x {:.0}%  y {:.0}%", i + 1, f.x * 100.0, f.y * 100.0), 11.0, false, ui.ink, 0.65, Align::Left);
+            }
+        }
+        top + ph + 34.0
+    };
+}
+
+pub(super) fn page_cursor(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
+    use crate::cursor::{CursorLook, LaunchAnim, Shape, ARROWS, BEAMS, BUSY_STYLES, EDGES, HANDS, LAUNCH_ANIMS, LOOKS, RESIZES};
+    use crate::input::Accel;
+    ui.text(x, y + 52.0, "Cursor", 22.0, true, ui.ink, 0.97, Align::Left);
     let input = &mut ctx.cfg.input;
     const PITCH: f32 = 46.0;
     // a card of `rows` rows under a small heading, with lines between the rows; the Form that fills it, and where the
@@ -676,27 +760,7 @@ pub(super) fn page_mouse(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw:
             c.launch_speed = (c.launch_speed * 20.0).round() / 20.0;
         }
     }
-
-    // ---- the pointer
-    let (px, rx) = (x + 16.0, x + cw - 16.0);
-    ui.section(x, n, "POINTER");
-    let py = n + 12.0;
-    group(ui, [x, py, cw, 232.0]);
-    ui.row(px, py + 30.0, "Speed");
-    ui.slider([rx - 300.0, py + 20.0, 240.0, 20.0], &mut input.pointer_speed, -1.0, 1.0, "");
-    separator(ui, x, py + 58.0, cw);
-    ui.row(px, py + 88.0, "Acceleration");
-    let mut acc = if input.accel == Accel::Flat { 1 } else { 0 };
-    if ui.segmented([rx - 190.0, py + 74.0, 190.0, 28.0], &["Adaptive", "Flat"], &mut acc) {
-        input.accel = if acc == 1 { Accel::Flat } else { Accel::Adaptive };
-    }
-    separator(ui, x, py + 116.0, cw);
-    ui.row(px, py + 142.0, "Natural scrolling");
-    ui.toggle(rx - 44.0, py + 130.0, &mut input.natural_scroll);
-    ui.row(px, py + 178.0, "Tap to click");
-    ui.toggle(rx - 44.0, py + 166.0, &mut input.tap_to_click);
-    ui.row(px, py + 214.0, "Left-handed");
-    ui.toggle(rx - 44.0, py + 202.0, &mut input.left_handed);
+    let _ = n;
 }
 
 pub(super) fn page_themes(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32, actions: &mut Vec<SettingsAction>, share: &mut (String, String)) {

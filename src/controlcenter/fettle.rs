@@ -881,8 +881,7 @@ impl ControlCenter {
         let (left, top) = (cx - w / 2.0, cy - h / 2.0);
         match size {
             Size::S => {
-                self.glyph(t, cx, cy - 8.0, 22.0, icon, PURE, 0.95);
-                self.text(t, &short(name, 11), cx, cy + 23.0, 10.5, false, PURE, 0.8, Align::Center);
+                self.glyph(t, cx, cy, 24.0, icon, PURE, 0.95);
             }
             Size::M => {
                 self.f_disc(t, left + 32.0, cy, icon, on);
@@ -974,8 +973,7 @@ impl ControlCenter {
         self.acts.push((t, TileAct::Focus));
         match size {
             Size::S => {
-                self.glyph(t, cx, cy - 8.0, 22.0, "moon", PURE, 0.95);
-                self.text(t, "Focus", cx, cy + 23.0, 10.5, false, PURE, 0.8, Align::Center);
+                self.glyph(t, cx, cy, 24.0, "moon", PURE, 0.95);
             }
             Size::M | Size::L => {
                 let hy = if grow > 0.0 || size == Size::L { top + 35.0 } else { cy };
@@ -1031,10 +1029,9 @@ impl ControlCenter {
         match size {
             Size::S => {
                 match signal {
-                    Some(sig) => self.f_bars(t, cx - 9.0, cy - 2.0, sig, 1.2, 1.0),
-                    None => self.glyph(t, cx, cy - 8.0, 22.0, icon, PURE, 0.95),
+                    Some(sig) => self.f_bars(t, cx - 9.0, cy + 8.0, sig, 1.2, 1.0),
+                    None => self.glyph(t, cx, cy, 24.0, icon, PURE, 0.95),
                 }
-                self.text(t, &short(if on { ssid.as_deref().unwrap_or("Wi-Fi") } else { "Wi-Fi" }, 10), cx, cy + 23.0, 10.5, false, PURE, 0.8, Align::Center);
             }
             Size::M | Size::L => {
                 let hy = if grow > 0.0 || size == Size::L { top + 35.0 } else { cy };
@@ -1132,14 +1129,7 @@ impl ControlCenter {
         self.acts.push((t, TileAct::Bluetooth));
         match size {
             Size::S => {
-                self.glyph(t, cx, cy - 9.0, 22.0, icon, PURE, 0.95);
-                match first.and_then(|d| d.battery) {
-                    Some(p) => {
-                        self.f_battery(t, cx - 12.0, cy + 21.0, p, 1.0);
-                        self.text(t, &format!("{p}%"), cx + 4.0, cy + 25.0, 10.5, true, PURE, 0.9, Align::Left);
-                    }
-                    None => self.text(t, "Bluetooth", cx, cy + 23.0, 10.5, false, PURE, 0.8, Align::Center),
-                }
+                self.glyph(t, cx, cy, 24.0, icon, PURE, 0.95);
             }
             Size::M | Size::L => {
                 let hy = if grow > 0.0 || size == Size::L { top + 35.0 } else { cy };
@@ -1237,8 +1227,7 @@ impl ControlCenter {
         let (left, top) = (cx - w / 2.0, cy - h / 2.0);
         match size {
             Size::S => {
-                self.f_sun_moon(t, cx, cy - 8.0, 22.0, n, PURE);
-                self.text(t, name, cx, cy + 23.0, 10.5, false, PURE, 0.8, Align::Center);
+                self.f_sun_moon(t, cx, cy, 24.0, n, PURE);
             }
             Size::M => {
                 let (x, y) = (left + 32.0, cy);
@@ -1280,7 +1269,7 @@ impl ControlCenter {
         let (left, top) = (cx - w / 2.0, cy - h / 2.0);
         let r = if size == Size::L { 17.0 } else { 11.0 };
         let (sx, sy) = match size {
-            Size::S => (cx, cy - 8.0),
+            Size::S => (cx, cy),
             Size::M => (left + 32.0, cy),
             Size::L => (left + 36.0, top + 38.0),
         };
@@ -1311,7 +1300,7 @@ impl ControlCenter {
         self.panels.push(Att { tile: t, vis: Vis::Always, item: Panel::solid(ox, oy, 2.0 * cover, 2.0 * cover, cover, sky, sky).flat() });
         let word = if self.dark { "Dark" } else { "Light" };
         match size {
-            Size::S => self.text(t, word, cx, cy + 23.0, 10.5, false, PURE, 0.9, Align::Center),
+            Size::S => {}
             Size::M => self.f_title(t, left + 62.0, cy, "Appearance", word, w - 74.0),
             Size::L => {
                 self.text(t, "Appearance", left + 16.0, top + h - 34.0, 15.0, true, PURE, 1.0, Align::Left);
@@ -1321,51 +1310,47 @@ impl ControlCenter {
         t
     }
 
-    /// A liquid slider: the whole control is the tube; the liquid's surface leans and swings back as the level moves.
-    /// Grown (the sound), it shows the outputs and every app that plays.
+    /// A slider in one tile: its name on top, and under it a small icon, a thick white bar that fills to the level and a
+    /// big icon (like the Sound control of macOS). The sound has the outputs button at the end, which grows the mixer;
+    /// the speaker on the left mutes.
     fn f_slider(&mut self, spec: &CcTile, cx: f32, cy: f32, w: f32, h: f32, grow: f32) -> usize {
         let sound = spec.opt("target") == Some("sound");
         let (left, top) = (cx - w / 2.0, cy - h / 2.0);
         let t = self.tile(Kind::Chip, cx, cy, w, h, 24.0);
-        // the tube is the control's top 70 px (all of it, until it grows)
-        let tube_y = top + 35.0;
-        let tube = self.tile(Kind::Clear, cx, tube_y, w, 70.0, 24.0);
-        self.owner[tube] = self.building;
         let which = if sound { Slider::Sound } else { Slider::Display };
         let liq = self.liquid[if sound { 1 } else { 0 }];
         let muted = sound && self.sys.muted;
         let value = if sound { self.sys.volume.map(|v| v.min(1.0)) } else { self.sys.brightness };
-        let level = if liq.placed { liq.level } else { value.unwrap_or(0.5) };
-        // the liquid fills the control from edge to edge, in its own shape
-        self.f_liquid(t, left, tube_y, w, 70.0, 24.0, level, liq.tilt, if muted { 0.35 } else { 1.0 });
-        // a white badge with the icon in the accent says what it is (no name: the icon is enough)
-        let icon = if sound {
-            if muted {
-                "volume-x"
-            } else if level < 0.34 {
-                "volume-1"
-            } else {
-                "volume-2"
-            }
-        } else {
-            "sun"
-        };
-        let (bx, bs) = (left + 35.0, 46.0);
-        self.panels.push(Att { tile: t, vis: Vis::Always, item: Panel::solid(bx, tube_y, bs, bs, 14.0, [1.0, 1.0, 0.999], [0.93, 0.93, 0.95]).flat().alpha(0.96) });
-        self.glyph(t, bx, tube_y, 22.0, icon, self.accent, 1.0);
-        let pct = match value {
-            Some(v) => format!("{}%", (v * 100.0).round() as i32),
-            None => "—".into(),
-        };
-        self.text(t, &pct, left + w - if sound { 48.0 } else { 20.0 }, tube_y + 4.5, 12.5, true, PURE, 0.9, Align::Right);
+        let level = if liq.placed { liq.level } else { value.unwrap_or(0.5 ) }.clamp(0.0, 1.0);
+        // the name, then the row under it
+        self.text(t, if sound { "Sound" } else { "Display" }, left + 20.0, top + 26.0, 14.0, true, PURE, 1.0, Align::Left);
+        let ry = top + 52.0;
+        let (small, big) = if sound { (if muted { "volume-x" } else { "volume-1" }, "volume-2") } else { ("sun", "sun") };
+        let (bar_l, bar_r) = (left + 38.0, left + w - if sound { 96.0 } else { 48.0 });
+        // the bar: a groove and the white fill to the level (never thinner than its own height)
+        let bh = 9.0;
+        self.panels.push(Att { tile: t, vis: Vis::Always, item: Panel::solid((bar_l + bar_r) / 2.0, ry, bar_r - bar_l, bh, bh / 2.0, PURE, PURE).flat().alpha(0.22) });
+        let fw = ((bar_r - bar_l) * level).max(bh);
+        self.panels.push(Att { tile: t, vis: Vis::Always, item: Panel::solid(bar_l + fw / 2.0, ry, fw, bh, bh / 2.0, PURE, PURE).flat().alpha(if muted { 0.45 } else { 0.97 }) });
+        self.glyph(t, left + 22.0, ry, if sound { 15.0 } else { 13.0 }, small, PURE, 0.75);
+        self.glyph(t, bar_r + 18.0, ry, 19.0, big, PURE, 0.75);
+        let tube = self.tile(Kind::Clear, (bar_l + bar_r) / 2.0, ry, bar_r - bar_l + 12.0, 34.0, 12.0);
+        self.owner[tube] = self.building;
         self.acts.push((tube, TileAct::Slider(which)));
-        self.tracks.push((tube, (left + 10.0, left + w - 10.0)));
+        self.tracks.push((tube, (bar_l, bar_r)));
         if sound {
-            // the speaker on the left mutes; the chevron grows the mixer
-            let mute = self.tile(Kind::Clear, bx, tube_y, 52.0, 56.0, 0.0);
+            // the speaker on the left mutes
+            let mute = self.tile(Kind::Clear, left + 22.0, ry, 30.0, 34.0, 0.0);
             self.owner[mute] = self.building;
             self.acts.push((mute, TileAct::Mute));
-            self.f_chevron(left + w - 20.0, tube_y, grow > 0.5);
+            // the outputs button grows the mixer
+            let (ox, open) = (left + w - 32.0, grow > 0.5 || self.list_beside == Some(self.building));
+            let btn = self.tile(Kind::Clear, ox, ry, 44.0, 44.0, 22.0);
+            self.owner[btn] = self.building;
+            let fill = if open { 0.9 } else { 0.24 };
+            self.panels.push(Att { tile: btn, vis: Vis::Always, item: Panel::solid(ox, ry, 40.0, 40.0, 20.0, PURE, PURE).flat().alpha(fill) });
+            self.glyph(btn, ox, ry, 19.0, "airplay", if open { self.accent } else { PURE }, 1.0);
+            self.acts.push((btn, TileAct::Expand(self.building)));
         }
         if grow > 0.0 && sound {
             self.f_mixer(t, left, top, w, grow);

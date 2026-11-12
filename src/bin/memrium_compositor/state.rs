@@ -353,6 +353,13 @@ pub enum Sw {
     Settings,
 }
 
+/// A card of the overview: a client window (index in `wins`) or a shell window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OvId {
+    Win(usize),
+    Shell(Sw),
+}
+
 /// A closed window fading out: its last pixels and chrome, kept for a moment.
 pub struct Ghost {
     panels: Vec<Panel>,
@@ -774,6 +781,14 @@ pub struct State {
     pub alt_tab: Option<(Vec<u64>, usize)>,
     /// a swipe is moving the desktops: (position it started at, how far the fingers went in desktops, speed in desktops / s)
     pub ws_drag: Option<(f32, f32, f32)>,
+    /// the overview (every window of the desktop laid out small, Exposé style): 0 = off, 1 = on, between while it moves
+    pub ov: Spring,
+    /// three fingers pulling the overview: (position it started at, how far the fingers went, speed in screens / s)
+    pub ov_drag: Option<(f32, f32, f32)>,
+    /// a three-finger swipe in progress: what the fingers did so far before it is known which way it goes, then the way (1 desktops, 2 overview, 3 none)
+    pub swipe: Option<([f32; 2], u8)>,
+    /// the card under the pointer in the overview
+    pub ov_hover: Option<OvId>,
     /// the desktop's widgets can be moved
     /// the user manager's DISPLAY / WAYLAND_DISPLAY ... as they were before this session changed them
     pub saved_env: Vec<(String, Option<String>)>,
@@ -1737,6 +1752,235 @@ impl State {
         self.switch_workspace(n as usize);
     }
 
+    pub fn ov_active(&self) -> bool {
+        self.ov.target > 0.5 || self.ov_drag.is_some()
+    }
+
+    /// Show or hide the overview.
+    pub fn ov_set(&mut self, on: bool) {
+        self.ov_drag = None;
+        self.ov.target = if on { 1.0 } else { 0.0 };
+        self.ov_hover = None;
+        if on {
+            self.alt_tab = None;
+            self.preview = None;
+            self.menu.close();
+            self.ov_hover = self.ov_hit(self.mouse);
+        }
+    }
+
+    /// Where every card of the overview goes (in the pointer's monitor): the windows of this desktop in a grid, each as big as
+    /// the cell allows (never bigger than it is), the last row centred. Ordered by window number so cards stay put when focus changes.
+    pub fn ov_layout(&self) -> Vec<(OvId, [f32; 4])> {
+        let mut cards: Vec<(u64, OvId, [f32; 4])> = Vec::new();
+        for (i, w) in self.wins.iter().enumerate() {
+            if w.mapped && !w.or && !w.minimized && w.ws == self.workspace {
+                cards.push((w.id, OvId::Win(i), Self::frame_rect(w)));
+            }
+        }
+        for k in [Sw::Settings] {
+            if self.sw_visible(k) {
+                cards.push((SHELL_SETTINGS, OvId::Shell(k), self.sw_frame(k)));
+            }
+        }
+        if cards.is_empty() {
+            return Vec::new();
+        }
+        cards.sort_by_key(|c| c.0);
+        let mon = self.mons.get(self.mon_at(self.mouse)).copied().unwrap_or([0.0, 0.0, self.size[0], self.size[1]]);
+        let (top, bottom, side, gap, label) = (200.0f32, 120.0f32, 70.0f32, 36.0f32, 30.0f32);
+        let area = [mon[0] + side, mon[1] + top, (mon[2] - 2.0 * side).max(100.0), (mon[3] - top - bottom).max(100.0)];
+        let n = cards.len();
+        let cols = ((n as f32 * area[2] / area[3]).sqrt().ceil() as usize).clamp(1, n);
+        let rows = n.div_ceil(cols);
+        let cw = (area[2] - gap * (cols as f32 - 1.0)) / cols as f32;
+        let ch = (area[3] - gap * (rows as f32 - 1.0)) / rows as f32;
+        let mut out = Vec::new();
+        for (j, (_, id, f)) in cards.into_iter().enumerate() {
+            let (c, r) = (j % cols, j / cols);
+            let in_row = if r == rows - 1 { n - r * cols } else { cols };
+            let x0 = area[0] + (cols - in_row) as f32 * (cw + gap) / 2.0 + c as f32 * (cw + gap);
+            let y0 = area[1] + r as f32 * (ch + gap);
+            let s = (cw / f[2].max(1.0)).min((ch - label) / f[3].max(1.0)).min(1.0);
+            let (w, h) = (f[2] * s, f[3] * s);
+            out.push((id, [x0 + (cw - w) / 2.0, y0 + (ch - label - h) / 2.0, w, h]));
+        }
+        out
+    }
+
+    /// The title under each card, fading in with the overview.
+    pub fn ov_labels(&mut self, cards: &[(OvId, [f32; 4])], shell: &mut Vec<Panel>) {
+        if cards.is_empty() {
+            return;
+        }
+        let ink = if self.theme.dark { [0.96, 0.97, 1.0] } else { [0.08, 0.10, 0.16] };
+        let k = ((self.ov.x - 0.3) / 0.7).clamp(0.0, 1.0);
+        let mut labels = Vec::new();
+        for (id, r) in cards {
+            let title = match id {
+                OvId::Win(i) => self.wins.get(*i).map(|w| if w.title.is_empty() { w.app_id.clone() } else { w.title.clone() }).unwrap_or_default(),
+                OvId::Shell(_) => "Settings".to_string(),
+            };
+            let title = ellipsize(&self.renderer, &title, 13.0, (r[2] + 40.0).max(160.0));
+            labels.push(Label::new(title, r[0] + r[2] / 2.0, r[1] + r[3] + 18.0, 13.0, self.ov_hover == Some(*id), ink, k, chebrium::draw::Align::Center));
+        }
+        let lp = self.renderer.label_panels(&labels);
+        shell.extend(lp);
+    }
+
+    /// The strip of desktops at the top of the overview: one tile per desktop, in the pointer's monitor.
+    pub fn ov_strip(&self) -> Vec<(usize, [f32; 4])> {
+        let mon = self.mons.get(self.mon_at(self.mouse)).copied().unwrap_or([0.0, 0.0, self.size[0], self.size[1]]);
+        let th = 92.0f32;
+        let tw = (th * mon[2] / mon[3].max(1.0)).clamp(100.0, 200.0);
+        let gap = 18.0;
+        let total = WORKSPACES as f32 * tw + (WORKSPACES as f32 - 1.0) * gap;
+        let x0 = mon[0] + (mon[2] - total) / 2.0;
+        (0..WORKSPACES).map(|n| (n, [x0 + n as f32 * (tw + gap), mon[1] + 44.0, tw, th])).collect()
+    }
+
+    /// Panels and labels of the desktop strip: a tile per desktop with its windows drawn small, the current one ringed.
+    pub fn ov_strip_panels(&mut self, shell: &mut Vec<Panel>) {
+        let k = ((self.ov.x - 0.1) / 0.6).clamp(0.0, 1.0);
+        if k <= 0.001 {
+            return;
+        }
+        let mon = self.mons.get(self.mon_at(self.mouse)).copied().unwrap_or([0.0, 0.0, self.size[0], self.size[1]]);
+        let dark = self.theme.dark;
+        let (bg, ink) = if dark { ([0.04, 0.05, 0.08], [0.96, 0.97, 1.0]) } else { ([1.0, 1.0, 1.0], [0.08, 0.10, 0.16]) };
+        let slide = -(1.0 - k) * 30.0;
+        let mut labels = Vec::new();
+        for (n, r) in self.ov_strip() {
+            let r = [r[0], r[1] + slide, r[2], r[3]];
+            let cur = n == self.workspace;
+            if cur {
+                let a = self.theme.accent;
+                shell.push(Panel::solid(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, r[2] + 6.0, r[3] + 6.0, 11.0, a, a).flat().alpha(0.95 * k));
+            }
+            shell.push(Panel::solid(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, r[2], r[3], 8.0, bg, bg).flat().alpha(if dark { 0.62 } else { 0.55 } * k));
+            let sc = r[2] / mon[2].max(1.0);
+            let mut minis: Vec<(u64, [f32; 4])> = Vec::new();
+            for w in self.wins.iter().filter(|w| w.mapped && !w.or && w.ws == n && (!w.minimized || w.ws_hidden)) {
+                minis.push((w.stamp, Self::frame_rect(w)));
+            }
+            for kk in [Sw::Settings] {
+                if self.is_open(kk) && self.shell_win(kk).ws == n {
+                    minis.push((self.shell_win(kk).stamp, self.sw_frame(kk)));
+                }
+            }
+            minis.sort_by_key(|m| m.0);
+            for (_, f) in minis {
+                let m = [r[0] + (f[0] - mon[0]) * sc, r[1] + (f[1] - mon[1]) * sc, f[2] * sc, f[3] * sc];
+                shell.push(Panel::solid(m[0] + m[2] / 2.0, m[1] + m[3] / 2.0, m[2], m[3], 2.0, ink, ink).flat().alpha(0.5 * k).cut_to(r));
+            }
+            labels.push(Label::new(format!("Desktop {}", n + 1), r[0] + r[2] / 2.0, r[1] + r[3] + 16.0, 12.5, cur, ink, k, chebrium::draw::Align::Center));
+        }
+        let lp = self.renderer.label_panels(&labels);
+        shell.extend(lp);
+    }
+
+    /// The desktop tile at a point.
+    pub fn ov_strip_hit(&self, p: [f32; 2]) -> Option<usize> {
+        self.ov_strip().into_iter().find(|(_, r)| Self::in_rect(p, [r[0] - 6.0, r[1] - 6.0, r[2] + 12.0, r[3] + 28.0])).map(|(n, _)| n)
+    }
+
+    /// The card at a point (the top-most one, a hovered one counting a little bigger).
+    pub fn ov_hit(&self, p: [f32; 2]) -> Option<OvId> {
+        self.ov_layout().into_iter().rev().find(|(_, r)| Self::in_rect(p, *r)).map(|(id, _)| id)
+    }
+
+    /// A card was chosen: the overview closes and that window comes to the front.
+    pub fn ov_pick(&mut self, id: OvId) {
+        self.ov_set(false);
+        match id {
+            OvId::Win(i) if i < self.wins.len() => {
+                self.focus_window(i);
+            }
+            OvId::Shell(k) => self.open_shell(k),
+            _ => {}
+        }
+    }
+
+    /// The overview's mouse: a click on a card picks it, one anywhere else closes the overview. True = the overview took it.
+    pub fn ov_button(&mut self, button: u32, pressed: bool) -> bool {
+        if !self.ov_active() || self.bar_hit(self.mouse).is_some() {
+            return false;
+        }
+        if pressed && button == BTN_LEFT {
+            if let Some(n) = self.ov_strip_hit(self.mouse) {
+                self.switch_workspace(n);
+                return true;
+            }
+            match self.ov_hit(self.mouse) {
+                Some(id) => self.ov_pick(id),
+                None => self.ov_set(false),
+            }
+        }
+        true
+    }
+
+    /// Three fingers went down: which way they go is decided after a few units of travel.
+    pub fn swipe_begin(&mut self) {
+        self.swipe = Some(([0.0, 0.0], 0));
+    }
+
+    pub fn swipe_move(&mut self, dx: f32, dy: f32, dt: f32) {
+        let Some((acc, mode)) = self.swipe else { return };
+        let acc = [acc[0] + dx, acc[1] + dy];
+        let mut mode = mode;
+        let mut feed = [dx, dy];
+        if mode == 0 {
+            if acc[0].abs().max(acc[1].abs()) < 8.0 {
+                self.swipe = Some((acc, 0));
+                return;
+            }
+            mode = if self.ov_active() && acc[1].abs() <= acc[0].abs() { 3 } else if acc[1].abs() > acc[0].abs() { 2 } else { 1 };
+            if mode == 1 {
+                self.ws_swipe_begin();
+            } else if mode == 2 {
+                let start = self.ov.x;
+                self.ov_drag = Some((start, 0.0, 0.0));
+                self.ov.v = 0.0;
+                self.ov.target = start;
+            }
+            // what the fingers did before the way was known counts too
+            feed = acc;
+        }
+        self.swipe = Some((acc, mode));
+        match mode {
+            1 => self.ws_swipe_move(feed[0], dt),
+            2 => {
+                let Some((start, moved, vel)) = self.ov_drag else { return };
+                // fingers up (dy < 0) open it; a screen's 40 % of travel is all the way
+                let step = -feed[1] / (self.size[1].max(1.0) * 0.4);
+                let moved = moved + step;
+                let vel = vel * 0.6 + (step / dt.max(0.001)) * 0.4;
+                let want = start + moved;
+                let shown = if want < 0.0 { want * 0.25 } else if want > 1.0 { 1.0 + (want - 1.0) * 0.25 } else { want };
+                self.ov_drag = Some((start, moved, vel));
+                self.ov.x = shown;
+                self.ov.target = shown;
+                self.ov.v = 0.0;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn swipe_end(&mut self, cancelled: bool) {
+        let Some((_, mode)) = self.swipe.take() else { return };
+        match mode {
+            1 => self.ws_swipe_end(cancelled),
+            2 => {
+                let Some((start, _, vel)) = self.ov_drag.take() else { return };
+                let here = self.ov.x;
+                let on = if cancelled { start > 0.5 } else { here + vel * 0.15 > 0.5 };
+                self.ov_set(on);
+                self.ov.v = vel.clamp(-4.0, 4.0) * 0.3;
+            }
+            _ => {}
+        }
+    }
+
     /// Three fingers went down on the touchpad: the desktops follow them from now on.
     pub fn ws_swipe_begin(&mut self) {
         self.ws_drag = Some((self.ws_pos.x, 0.0, 0.0));
@@ -2041,6 +2285,10 @@ impl State {
         if self.shot_sel.is_some() {
             return;
         }
+        if self.ov_active() && self.bar_hit(self.mouse).is_none() {
+            self.ov_hover = self.ov_hit(self.mouse);
+            return;
+        }
         if self.live_shot.is_some() {
             self.live_text_motion();
             return;
@@ -2240,6 +2488,9 @@ impl State {
             eprintln!("click {button} {pressed} at {:?}: bar_hit {:?} menu {} launcher {} card {} shell_hit {}", self.mouse, self.bar_hit(self.mouse).map(|h| (h.bar, h.widget)), self.menu.open, self.launcher_modal(), self.card_hit(self.mouse), self.shell_hit());
         }
         if self.lock.is_some() {
+            return;
+        }
+        if self.ov_button(button, pressed) {
             return;
         }
         // a click on a notification toast is the toast's alone
@@ -2557,6 +2808,9 @@ impl State {
         if self.lock.is_some() {
             return;
         }
+        if self.ov_active() && self.bar_hit(self.mouse).is_none() {
+            return;
+        }
         if self.launcher_modal() && !self.menu.open {
             self.launcher.scroll(dy);
             return;
@@ -2748,6 +3002,7 @@ impl State {
     fn key_action(&mut self, action: &str) {
         let top = self.wins.iter().rposition(|w| !w.minimized);
         match action {
+            "overview" => self.ov_set(!self.ov_active()),
             "search" => self.launcher.toggle_as(Some(memrium_de::theme::LauncherKind::Figlet)),
             "menu-search" => self.menu_search(),
             "launcher" | "launcher-alt" => self.launcher.toggle(),
@@ -2845,6 +3100,21 @@ impl State {
         }
         if matches!(bound, Some("lock")) {
             self.lock_screen();
+            return true;
+        }
+        // the overview: its own key or Esc closes it, Enter picks the card under the pointer, the other keys go nowhere
+        if self.ov_active() {
+            match sym {
+                Keysym::Return | Keysym::KP_Enter => match self.ov_hit(self.mouse) {
+                    Some(id) => self.ov_pick(id),
+                    None => self.ov_set(false),
+                },
+                _ if sym == Keysym::Escape || bound == Some("overview") => self.ov_set(false),
+                _ if bound.is_some() => {
+                    self.key_action(bound.unwrap_or_default());
+                }
+                _ => {}
+            }
             return true;
         }
         if self.shot_edit.is_some() {
@@ -5078,11 +5348,17 @@ impl State {
             xf = Xf { c, s: 0.9 + 0.1 * o, t: [dx, 0.0], fade: (kk * 1.7).clamp(0.0, 1.0) };
             fade = xf.fade;
         }
+        let mut xf = xf;
+        if self.ov.x > 0.001 {
+            if let Some((_, tr)) = self.ov_layout().into_iter().find(|(id, _)| *id == OvId::Shell(k)) {
+                xf.ov(frame, tr, self.ov.x, self.ov_hover == Some(OvId::Shell(k)));
+            }
+        }
         let jel = [self.shell_win(k).jel[0].x, self.shell_win(k).jel[1].x];
         if out.is_empty() && jel[0].abs() + jel[1].abs() > 0.4 {
             out.push(Item::Warp(Some(jelly_warp(frame, jel, self.shell_win(k).jgrab))));
         }
-        let panels: Vec<Panel> = if kk > 0.999 && xf.s > 0.999 && dx == 0.0 { panels } else { panels.into_iter().map(|p| xf.panel(p)).collect() };
+        let panels: Vec<Panel> = if kk > 0.999 && xf.s > 0.999 && dx == 0.0 && self.ov.x < 0.001 { panels } else { panels.into_iter().map(|p| xf.panel(p)).collect() };
         let bb = xf.rect([frame[0] - 90.0, frame[1] - 90.0, frame[2] + 180.0, frame[3] + 200.0]);
         out.push(Item::Frame { panels, bbox: [bb[0], bb[1], bb[0] + bb[2], bb[1] + bb[3]], fade });
         if matches!(out.first(), Some(Item::Warp(_))) {
@@ -5395,6 +5671,9 @@ impl State {
         self.process_settings();
         if self.ws_drag.is_none() {
             an.step("workspace_slide", &mut self.ws_pos, dt);
+        }
+        if self.ov_drag.is_none() {
+            an.step("workspace_slide", &mut self.ov, dt);
         }
         for w in &mut self.wins {
             an.step("window_move", &mut w.x, dt);
@@ -5984,6 +6263,16 @@ impl Xf {
         Xf { c, s: w.scale.x * (0.9 + 0.1 * o.min(1.08)), t: [0.0, 0.0], fade: (o * 1.7).clamp(0.0, 1.0) }
     }
 
+    /// Move and shrink towards an overview card `k` of the way (the card a little bigger while the pointer is on it).
+    fn ov(&mut self, f: [f32; 4], card: [f32; 4], k: f32, hover: bool) {
+        let c = [f[0] + f[2] / 2.0, f[1] + f[3] / 2.0];
+        let tc = [card[0] + card[2] / 2.0, card[1] + card[3] / 2.0];
+        let target = card[2] / f[2].max(1.0) * if hover { 1.04 } else { 1.0 };
+        self.s *= 1.0 + (target - 1.0) * k;
+        self.t[0] += (tc[0] - c[0]) * k;
+        self.t[1] += (tc[1] - c[1]) * k;
+    }
+
     fn rect(&self, r: [f32; 4]) -> [f32; 4] {
         let rc = [r[0] + r[2] / 2.0, r[1] + r[3] / 2.0];
         let nc = [self.c[0] + (rc[0] - self.c[0]) * self.s + self.t[0], self.c[1] + (rc[1] - self.c[1]) * self.s + self.t[1]];
@@ -6021,12 +6310,19 @@ fn build_items<'a>(
     dev: f32,
     rules: &memrium_de::apprules::Rules,
     desks: (f32, f32),
+    ov: (f32, &[(OvId, [f32; 4])], Option<OvId>),
 ) -> Vec<Item<'a>> {
     // A program's picture is put on whole device pixels: at a place between two the filter smears every letter (a window that
     // was moved by the pointer, or maximized into a fractional area, lands there).
     let snap = |v: f32| (v * dev).round() / dev;
     let mut out = Vec::new();
     out.extend(desktop);
+    // the overview dims the desktop behind the windows
+    if ov.0 > 0.001 {
+        let c = if theme.dark { [0.0; 3] } else { [0.12, 0.13, 0.18] };
+        let dim = Panel::solid(0.0, 0.0, 40000.0, 40000.0, 0.0, c, c).flat().alpha(0.38 * ov.0.min(1.0));
+        out.push(Item::Frame { panels: vec![dim], bbox: [-20000.0, -20000.0, 20000.0, 20000.0], fade: 1.0 });
+    }
     // shell windows (Settings, Files) and client windows stack by when each was last raised: a shell window goes in
     // before the first client window that was raised after it
     let mut shells = shells.into_iter().peekable();
@@ -6048,6 +6344,11 @@ fn build_items<'a>(
         }
         let mut xf = Xf::new(w, docks.get(i).copied().unwrap_or([0.0, 0.0]));
         xf.t[0] = dx;
+        if ov.0 > 0.001 {
+            if let Some((_, tr)) = ov.1.iter().find(|(id, _)| *id == OvId::Win(i)) {
+                xf.ov(State::frame_rect(w), *tr, ov.0, ov.2 == Some(OvId::Win(i)));
+            }
+        }
         let f = State::frame_rect(w);
         let genie = w.min_k.x.clamp(0.0, 1.0);
         let wobble = w.jel[0].x.abs() + w.jel[1].x.abs() > 0.4;

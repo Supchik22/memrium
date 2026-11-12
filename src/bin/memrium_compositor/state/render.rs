@@ -247,7 +247,10 @@ impl State {
         let intro = if self.capturing { None } else { self.intro_rems() };
         let wall_view = if self.capturing { None } else { Some(self.wall_view_now()) };
         let ime = self.ime_popup_origins();
-        let mut items = build_items(&self.wins, &self.popups, &self.surfaces, ime, focus, &docks, &title_panels, &self.theme, self.hover_btn, shells, desktop, &self.ghosts, self.renderer.scale().max(1.0), &self.rules, (self.ws_pos.x, self.size[0]));
+        let ov_cards = if self.ov.x > 0.001 { self.ov_layout() } else { Vec::new() };
+        self.ov_labels(&ov_cards, &mut shell);
+        self.ov_strip_panels(&mut shell);
+        let mut items = build_items(&self.wins, &self.popups, &self.surfaces, ime, focus, &docks, &title_panels, &self.theme, self.hover_btn, shells, desktop, &self.ghosts, self.renderer.scale().max(1.0), &self.rules, (self.ws_pos.x, self.size[0]), (self.ov.x.max(0.0), &ov_cards, self.ov_hover));
         if let Some(l) = &preview {
             items.extend(crate::dock::preview_items(l, &self.wins, &self.surfaces, self.theme.dark, self.theme.accent));
         }

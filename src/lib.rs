@@ -20,6 +20,7 @@ pub mod gtk;
 pub mod gtkcss;
 pub use chebrium::i18n;
 pub mod input;
+pub mod touchpad;
 pub mod kdecolors;
 pub mod launcher;
 pub mod launchpad;

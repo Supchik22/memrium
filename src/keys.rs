@@ -29,6 +29,7 @@ pub const ACTIONS: &[(&str, &str, &str)] = &[
     ("snap-down", "Restore window (a half goes to the corner below), then minimize", "Super+Down"),
     ("switch-window", "Previous window", "Alt+Tab"),
     ("show-desktop", "Show desktop", "Super+D"),
+    ("overview", "Show all windows (overview; three fingers up on the touchpad)", "Super+Tab"),
     ("widgets", "Widgets panel", "Super+W"),
     ("notifications", "Notification centre", "Super+N"),
     ("clipboard", "Clipboard history", "Super+V"),

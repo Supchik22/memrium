@@ -38,6 +38,8 @@ enum Page {
     Animations,
     Keys,
     Mouse,
+    Touchpad,
+    Cursor,
     Icons,
     About,
     Notifications,
@@ -50,7 +52,7 @@ enum Page {
     Privacy,
 }
 
-const PAGES: [(Page, &str, &str); 22] = [
+const PAGES: [(Page, &str, &str); 24] = [
     (Page::General, "General", "settings"),
     (Page::Themes, "Themes", "layers"),
     (Page::Displays, "Displays", "monitor"),
@@ -62,7 +64,9 @@ const PAGES: [(Page, &str, &str); 22] = [
     (Page::Windows, "Windows", "app-window"),
     (Page::Animations, "Animations", "audio-waveform"),
     (Page::Keys, "Keyboard", "terminal"),
-    (Page::Mouse, "Mouse", "move"),
+    (Page::Mouse, "Mouse", "mouse-pointer"),
+    (Page::Touchpad, "Touchpad", "tablet"),
+    (Page::Cursor, "Cursor", "move"),
     (Page::Icons, "Icons", "sticky-note"),
     (Page::About, "About", "monitor"),
     (Page::Notifications, "Notifications", "bell"),
@@ -99,6 +103,8 @@ fn page_tone(page: Page) -> chebrium::style::Tone {
         Page::General => Grey,
         Page::Displays => Info,
         Page::Mouse => Grey,
+        Page::Touchpad => Grey,
+        Page::Cursor => Grey,
         Page::Keys => Grey,
         Page::About => Grey,
     }
@@ -323,6 +329,8 @@ impl Settings {
 
     /// Draw the content for a client area whose top-left is `origin` (world coordinates).
     pub fn draw(&mut self, ctx: &mut SettingsCtx, origin: [f32; 2]) -> (Vec<Panel>, Vec<Label>, Vec<SettingsAction>) {
+        // the touchpad test reads the pad only while it is on screen
+        crate::touchpad::WANTED.store(self.page == Page::Touchpad, std::sync::atomic::Ordering::Relaxed);
         let mut p = Vec::new();
         let mut l = Vec::new();
         let mut actions = Vec::new();
@@ -405,7 +413,7 @@ impl Settings {
             ("LOOK", &[Page::Themes, Page::Appearance, Page::Glass, Page::Wallpaper, Page::Icons, Page::Programs]),
             ("DESKTOP", &[Page::Layout, Page::Panels, Page::Notifications, Page::Osd, Page::DateTime]),
             ("WINDOWS", &[Page::Windows, Page::Animations]),
-            ("DEVICES", &[Page::Displays, Page::Sound, Page::Network, Page::Power, Page::Mouse, Page::Keys]),
+            ("DEVICES", &[Page::Displays, Page::Sound, Page::Network, Page::Power, Page::Mouse, Page::Touchpad, Page::Cursor, Page::Keys]),
             ("SYSTEM", &[Page::Privacy, Page::General, Page::About]),
         ];
         let mut rows: Vec<(Option<&str>, Option<&(Page, &str, &str)>)> = Vec::new();
@@ -413,6 +421,10 @@ impl Settings {
             for (cat, pages) in CATEGORIES.iter() {
                 rows.push((Some(cat), None));
                 for pg in pages.iter() {
+                    // the mouse, the touchpad and the cursor are one entry; its page has a tab strip for the three
+                    if matches!(pg, Page::Touchpad | Page::Cursor) {
+                        continue;
+                    }
                     if let Some(e) = shown.iter().find(|e| e.0 == *pg) {
                         rows.push((None, Some(*e)));
                     }
@@ -437,7 +449,9 @@ impl Settings {
             let Some((page, name, icon)) = entry.copied() else { continue };
             let r = [x + 14.0, cy, SIDEBAR - 28.0, pitch - 6.0];
             cy += pitch;
-            let selected = page == self.page;
+            let grouped = needle.is_empty() && page == Page::Mouse;
+            let name = if grouped { "Mouse & Touchpad" } else { name };
+            let selected = page == self.page || (grouped && matches!(self.page, Page::Touchpad | Page::Cursor));
             let visible = r[1] >= list_top - 2.0 && r[1] + r[3] <= list_bot + 2.0;
             let idx = PAGES.iter().position(|e| e.0 == page).unwrap_or(0);
             let want = [selected as u8 as f32, (!selected && visible && ui.hit(r)) as u8 as f32];
@@ -476,7 +490,7 @@ impl Settings {
             }
             ui.glyph(r[0] + 22.0, r[1] + r[3] / 2.0, glyph, icon, tone, if multi { 1.0 } else { 0.8 + 0.2 * sel_t });
             ui.text(r[0] + 44.0, r[1] + r[3] / 2.0 + 5.0, name, 13.5, selected, ink, 0.95, Align::Left);
-            if ui.click && visible && ui.hit(r) && self.page != page {
+            if ui.click && visible && ui.hit(r) && !selected {
                 self.page = page;
                 self.scroll.x = 0.0;
                 self.scroll.v = 0.0;
@@ -531,6 +545,20 @@ impl Settings {
         // (room above the page: a maximized window starts right under the menu bar)
         const PAGE_TOP: f32 = 18.0;
         let py = y - sy + PAGE_TOP + if unified { 8.0 } else { 0.0 };
+        if matches!(self.page, Page::Mouse | Page::Touchpad | Page::Cursor) {
+            // the tabs of "Mouse & Touchpad"
+            let mut tab = match self.page {
+                Page::Touchpad => 1,
+                Page::Cursor => 2,
+                _ => 0,
+            };
+            if ui.segmented([cx0 + cw - 290.0, py + 8.0, 290.0, 28.0], &["Mouse", "Touchpad", "Cursor"], &mut tab) {
+                self.page = [Page::Mouse, Page::Touchpad, Page::Cursor][tab];
+                self.scroll.x = 0.0;
+                self.scroll.v = 0.0;
+                self.scroll.target = 0.0;
+            }
+        }
         match self.page {
             Page::General => general::page_general(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions),
             Page::Themes => general::page_themes(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions, &mut self.share),
@@ -546,6 +574,8 @@ impl Settings {
             Page::Privacy => more::page_privacy(&mut ui, ctx, cx0, py - 26.0, cw, &mut actions),
             Page::Programs => more::page_programs(&mut ui, ctx, cx0, py - 26.0, cw, &mut self.rules, &mut self.rule_name),
             Page::Mouse => general::page_mouse(&mut ui, ctx, cx0, py - 26.0, cw),
+            Page::Touchpad => general::page_touchpad(&mut ui, ctx, cx0, py - 26.0, cw),
+            Page::Cursor => general::page_cursor(&mut ui, ctx, cx0, py - 26.0, cw),
             Page::Glass => glass_prev = Some(page_glass(&mut ui, ctx, cx0, py - 26.0, cw, &mut self.glass_target)),
             Page::Panels => page_panels(&mut ui, ctx, cx0, py - 26.0, cw, &mut self.panels),
             Page::Wallpaper => {
@@ -1629,7 +1659,9 @@ fn page_keywords(page: Page) -> &'static str {
         Page::Windows => "title bar buttons frame border corner radius squircle smoothing continuous shadow opacity traffic lights decoration custom",
         Page::Animations => "motion speed jelly genie minimize open close effects sounds volume transition parallax wallpaper pointer mouse start intro",
         Page::Keys => "keyboard shortcut keys layout run program",
-        Page::Mouse => "cursor pointer speed acceleration scroll natural tap touchpad left-handed size launch icon bounce starting program hide typing smooth morph animate shape change",
+        Page::Mouse => "mouse pointer speed acceleration adaptive flat scroll natural left-handed",
+        Page::Touchpad => "touchpad trackpad tap click scroll natural fingers test gestures three finger swipe",
+        Page::Cursor => "cursor theme size look colour outline shadow shape arrow hand text edges loading busy starting program launch icon bounce hide typing smooth morph animate shake find",
         Page::Icons => "icon shape plate tile padding theme",
         Page::About => "version info credits",
         Page::Notifications => "notification toast do not disturb dnd corner position time",
