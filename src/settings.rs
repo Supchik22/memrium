@@ -79,6 +79,37 @@ const PAGES: [(Page, &str, &str); 24] = [
     (Page::Privacy, "Privacy", "shield-check"),
 ];
 
+/// A page's icon in our icon pack: the icon System Settings has for the same thing, or the nearest for the shell's own
+/// pages. Without the pack the sidebar draws the glyph of `PAGES`.
+fn page_icon(page: Page) -> &'static str {
+    match page {
+        Page::Themes => "preferences-desktop-theme-global",
+        Page::Appearance => "preferences-desktop-color",
+        Page::Glass => "lighttable",
+        Page::Wallpaper => "preferences-desktop-wallpaper",
+        Page::Icons => "preferences-desktop-icons",
+        Page::Programs => "preferences-desktop-theme-applications",
+        Page::Layout => "preferences-desktop-virtual",
+        Page::Panels => "preferences-desktop-plasma-theme",
+        Page::Notifications => "preferences-desktop-notification-bell",
+        Page::Osd => "preferences-desktop",
+        Page::DateTime => "preferences-system-time",
+        Page::Windows => "preferences-system-windows",
+        Page::Animations => "preferences-desktop-animations",
+        Page::Displays => "preferences-desktop-display",
+        Page::Sound => "preferences-desktop-sound",
+        Page::Network => "preferences-system-network",
+        Page::Power => "preferences-system-power",
+        Page::Mouse => "preferences-desktop-mouse",
+        Page::Touchpad => "preferences-desktop-touchpad",
+        Page::Cursor => "preferences-desktop-cursors",
+        Page::Keys => "preferences-desktop-keyboard",
+        Page::Privacy => "preferences-security",
+        Page::General => "applications-system",
+        Page::About => "ktip",
+    }
+}
+
 /// The colour a settings page has when the accent is several: blue for the look of things, and its own for the rest.
 fn page_tone(page: Page) -> chebrium::style::Tone {
     use chebrium::style::Tone::*;
@@ -433,6 +464,9 @@ impl Settings {
         } else {
             rows.extend(shown.iter().map(|e| (None, Some(*e))));
         }
+        // the pages' icons come from our pack whatever pack the programs have: in the look chosen for it, with their plates
+        // painted in (a row is too small for live glass)
+        let pack = if ctx.theme.icons.is_own() { ctx.theme.icons.theme_name(dark) } else { theme::OWN_ICON_THEME.to_string() };
         let mut cy = list_top - self.side_scroll.x;
         if self.side_t.len() != PAGES.len() {
             self.side_t = PAGES.iter().map(|(pg, ..)| [(*pg == self.page) as u8 as f32, 0.0]).collect();
@@ -481,14 +515,25 @@ impl Settings {
             let own = ui.tone(page_tone(page));
             let multi = ui.controls.multi;
             let tone = if multi { own.map(|c| c * 0.92) } else { [0, 1, 2].map(|c| ink[c] + (accent[c] - ink[c]) * sel_t) };
-            if multi {
+            let id = format!("page:{pack}:{}", page_icon(page));
+            let picture = (ctx.app_icon)(&id);
+            if let Some(cell) = picture {
+                // (it brings its own plate)
+                let size = glyph + 10.0;
+                ui.d.image([r[0] + 22.0 - size / 2.0, r[1] + r[3] / 2.0 - size / 2.0, size, size], 0.0, cell);
+            } else {
+                ctx.want_icons.push(id);
+            }
+            if multi && picture.is_none() {
                 // a pale plate under the coloured sign, so it reads on a dark sidebar too
                 let size = glyph + 11.0;
                 let plate = [r[0] + 22.0 - size / 2.0, r[1] + r[3] / 2.0 - size / 2.0, size, size];
                 ui.fill([plate[0], plate[1] + 1.5, size, size], 7.0, [0.0; 3], if dark { 0.35 } else { 0.14 });
                 ui.grad(plate, 7.0, [1.0, 1.0, 1.0], [0.88, 0.91, 0.96], 1.0);
             }
-            ui.glyph(r[0] + 22.0, r[1] + r[3] / 2.0, glyph, icon, tone, if multi { 1.0 } else { 0.8 + 0.2 * sel_t });
+            if picture.is_none() {
+                ui.glyph(r[0] + 22.0, r[1] + r[3] / 2.0, glyph, icon, tone, if multi { 1.0 } else { 0.8 + 0.2 * sel_t });
+            }
             ui.text(r[0] + 44.0, r[1] + r[3] / 2.0 + 5.0, name, 13.5, selected, ink, 0.95, Align::Left);
             if ui.click && visible && ui.hit(r) && !selected {
                 self.page = page;

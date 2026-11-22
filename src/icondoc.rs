@@ -179,6 +179,8 @@ pub trait Patchable: Copy + PartialEq {
     fn apply(&self, patch: &Self::Patch) -> Self;
     /// The patch that makes `base` into `new`.
     fn diff(base: &Self, new: &Self) -> Self::Patch;
+    /// The patch that holds every field of `v`: whatever it is applied to, the result is `v`.
+    fn full(v: &Self) -> Self::Patch;
 }
 
 /// A setting that differs between the looks. The default look holds the value; every other look holds only what it
@@ -209,6 +211,15 @@ impl<T: Patchable> Variants<T> {
     /// The value in look `a` without any automatic starting point.
     pub fn get(&self, a: Appearance) -> T {
         self.resolve(a, &|_, d| *d)
+    }
+
+    /// Make look `a` have the value `new` and keep every field of it, so that no change in the looks it inherits from
+    /// reaches it any more (`set` keeps only what differs, and the rest follows the other looks).
+    pub fn pin(&mut self, a: Appearance, new: T) {
+        match a.slot() {
+            None => self.default = new,
+            Some(i) => self.slots[i] = T::full(&new),
+        }
     }
 
     /// Make look `a` have the value `new`: only what differs from what it inherits is kept in the look.
@@ -277,6 +288,21 @@ impl Patchable for Glass {
             glow: p.glow.unwrap_or(self.glow),
         }
     }
+    fn full(v: &Glass) -> GlassPatch {
+        GlassPatch {
+            enabled: Some(v.enabled),
+            specular: Some(v.specular),
+            blur: Some(v.blur),
+            refraction: Some(v.refraction),
+            translucency: Some(v.translucency),
+            shadow: Some(v.shadow),
+            shadow_amount: Some(v.shadow_amount),
+            bevel: Some(v.bevel),
+            bevel_width: Some(v.bevel_width),
+            inner_shadow: Some(v.inner_shadow),
+            glow: Some(v.glow),
+        }
+    }
     fn diff(b: &Glass, n: &Glass) -> GlassPatch {
         GlassPatch {
             enabled: pick(b.enabled, n.enabled),
@@ -323,6 +349,9 @@ impl Patchable for Props {
             glass_mode: p.glass_mode.unwrap_or(self.glass_mode),
         }
     }
+    fn full(v: &Props) -> PropsPatch {
+        PropsPatch { visible: Some(v.visible), opacity: Some(v.opacity), blend: Some(v.blend), fill: Some(v.fill), gradient: Some(v.gradient), offset: Some(v.offset), scale: Some(v.scale), glass: Glass::full(&v.glass), glass_mode: Some(v.glass_mode) }
+    }
     fn diff(b: &Props, n: &Props) -> PropsPatch {
         PropsPatch {
             visible: pick(b.visible, n.visible),
@@ -352,6 +381,9 @@ impl Patchable for Background {
     type Patch = BackgroundPatch;
     fn apply(&self, p: &BackgroundPatch) -> Background {
         Background { shape: p.shape.unwrap_or(self.shape), fill: p.fill.unwrap_or(self.fill), top: p.top.unwrap_or(self.top), bottom: p.bottom.unwrap_or(self.bottom), glass: self.glass.apply(&p.glass) }
+    }
+    fn full(v: &Background) -> BackgroundPatch {
+        BackgroundPatch { shape: Some(v.shape), fill: Some(v.fill), top: Some(v.top), bottom: Some(v.bottom), glass: Glass::full(&v.glass) }
     }
     fn diff(b: &Background, n: &Background) -> BackgroundPatch {
         BackgroundPatch { shape: pick(b.shape, n.shape), fill: pick(b.fill, n.fill), top: pick(b.top, n.top), bottom: pick(b.bottom, n.bottom), glass: Glass::diff(&b.glass, &n.glass) }
@@ -1239,6 +1271,42 @@ pub fn docs_dir() -> PathBuf {
 pub fn doc_path(name: &str) -> PathBuf {
     let safe: String = name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
     docs_dir().join(format!("{safe}.memicon"))
+}
+
+/// Saves the document of a picture that a tool drew (the `examples/*_icon.rs` programs), but never over a file that is not
+/// what the tool wrote last time: one edited in the editor since, or made by hand, is left alone and the new drawing goes
+/// to `icons-proposed/<name>.memicon` (beside the documents' folder, where the editor does not look). Every file the tool writes is remembered by its hash in
+/// `icons-generated.txt` (beside the documents' folder). Setting `MEMRIUM_FORCE_SAVE=1` overwrites anyway, after the old file
+/// is copied to `icons-backup/`. Returns whether the document was written in place.
+pub fn save_generated(doc: &IconDoc) -> Result<bool, String> {
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
+    }
+    let path = doc_path(&doc.name);
+    let dir = docs_dir();
+    let base = dir.parent().map(Path::to_path_buf).unwrap_or_else(|| dir.clone());
+    let manifest = base.join("icons-generated.txt");
+    let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let mut lines: Vec<String> = std::fs::read_to_string(&manifest).unwrap_or_default().lines().map(str::to_string).collect();
+    let known = lines.iter().find_map(|l| l.strip_prefix(&format!("{file} "))).and_then(|h| u64::from_str_radix(h.trim(), 16).ok());
+    let on_disk = std::fs::read(&path).ok();
+    let force = std::env::var("MEMRIUM_FORCE_SAVE").is_ok_and(|v| v == "1");
+    let mine = on_disk.as_ref().is_none_or(|b| known == Some(fnv(b)));
+    if !mine && !force {
+        save(&base.join("icons-proposed").join(&file), doc)?;
+        return Ok(false);
+    }
+    if let (Some(old), true) = (&on_disk, force && !mine) {
+        let bk = base.join("icons-backup");
+        std::fs::create_dir_all(&bk).map_err(|e| e.to_string())?;
+        std::fs::write(bk.join(format!("{file}.{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))), old).map_err(|e| e.to_string())?;
+    }
+    save(&path, doc)?;
+    let written = std::fs::read(&path).map_err(|e| e.to_string())?;
+    lines.retain(|l| !l.starts_with(&format!("{file} ")));
+    lines.push(format!("{file} {:x}", fnv(&written)));
+    std::fs::write(&manifest, lines.join("\n") + "\n").map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 /// The names of the icons that have a document.

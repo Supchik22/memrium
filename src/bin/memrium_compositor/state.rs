@@ -5426,6 +5426,18 @@ impl State {
                             let tile = self.renderer.icon_tile();
                             self.icon_loader.request_pack(&id, pack, icon, tile);
                         }
+                    } else if let Some((pack, icon)) = id.strip_prefix("page:").and_then(|r| r.split_once(':')) {
+                        // a page's icon in the sidebar of Settings: a small PNG of our pack, read here so that the whole
+                        // list changes at once, and never put on the shell's tile (it has a plate of its own)
+                        if self.renderer.app_icon_get(&id).is_none() && !self.icon_failed.contains(&id) {
+                            let file = memrium_de::iconrender::theme_dir().with_file_name(pack).join(format!("128x128/apps/{icon}.png"));
+                            match image::open(file) {
+                                Ok(img) if self.renderer.image_cell(&id, &img.to_rgba8()).is_some() => self.invalidate(),
+                                _ => {
+                                    self.icon_failed.insert(id);
+                                }
+                            }
+                        }
                     } else if id.starts_with("cursor:") {
                         // a cursor preview of the Mouse page; the previews of an older look go back to the atlas
                         if self.renderer.app_icon_get(&id).is_none() {
