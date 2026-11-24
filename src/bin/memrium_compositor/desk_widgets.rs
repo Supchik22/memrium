@@ -2,7 +2,7 @@
 //! dragged anywhere and removed again.
 
 use crate::state::State;
-use crate::widgets_panel::{days_in_month, first_weekday, now, DAYS, MONTHS, SHORT};
+use crate::widgets_panel::{days_in_month, first_weekday, now, Now, DAYS, MONTHS, SHORT};
 use memrium_de::deskwidgets::{self, DeskWidget, KINDS};
 use memrium_de::i18n::tr;
 use memrium_de::renderer::{Align, Label, Panel, Renderer};
@@ -154,10 +154,15 @@ pub const STYLE_BASE: u32 = 330;
 pub const H24: u32 = 340;
 pub const DATE: u32 = 341;
 pub const EDIT: u32 = 342;
+/// 360 + the index in `deskwidgets::ext_list()` adds that external widget (the desktop's "Add Widget" list)
+pub const EXT_BASE: u32 = 360;
 
 impl State {
     fn desk_rect(&self, d: &DeskWidget) -> [f32; 4] {
-        let s = deskwidgets::size(&d.kind);
+        // an external widget is as big as its program made its window
+        let s = if deskwidgets::is_ext(&d.kind) { self.desk_win_size(d.uid) } else { None }.unwrap_or_else(|| deskwidgets::size(&d.kind));
+        // (the calendar's "Date" look is wide)
+        let s = if d.kind == "calendar" && d.style == 1 { [400.0, 196.0] } else { s };
         let k = if deskwidgets::scalable(&d.kind) { d.scale.clamp(0.5, 2.5) } else { 1.0 };
         [d.x, d.y, s[0] * k, s[1] * k]
     }
@@ -241,6 +246,10 @@ impl State {
             items.push(MenuItem::new(BIGGER, "Bigger").icon("plus"));
             items.push(MenuItem::new(SMALLER, "Smaller").icon("minus"));
         }
+        if d.kind == "calendar" {
+            let styles = deskwidgets::CAL_STYLES.iter().enumerate().map(|(k, name)| MenuItem::new(STYLE_BASE + k as u32, *name).checked(d.style as usize == k)).collect();
+            items.push(MenuItem::new(0, "Style").icon("sliders-horizontal").sub(styles));
+        }
         if d.kind == "clock" || d.kind == "glassclock" {
             items.push(MenuItem::new(H24, "24-hour clock").checked(d.h24));
             items.push(MenuItem::new(DATE, "Show the date").checked(d.date));
@@ -251,6 +260,97 @@ impl State {
         items.push(MenuItem::new(EDIT, if self.scene.edit_mode() { "Exit Edit Mode" } else { "Enter Edit Mode" }).icon("pencil"));
         items.push(MenuItem::new(REMOVE, "Remove widget").icon("x"));
         items
+    }
+
+    /// The calendar on the desktop, in one of `deskwidgets::CAL_STYLES`.
+    #[allow(clippy::too_many_arguments)]
+    fn desk_calendar(&self, style: u8, rect: [f32; 4], t: &Now, ink: [f32; 3], accent: [f32; 3], panels: &mut Vec<Panel>, labels: &mut Vec<Label>) {
+        let [x, y, w, _] = rect;
+        let monday = self.theme.ui.clock.week_monday;
+        let shift = if monday { 1 } else { 0 };
+        let weekend = |col: usize| (col + shift) % 7 == 0 || (col + shift) % 7 == 6;
+        let lead = (first_weekday(t.year, t.month) + if monday { 6 } else { 0 }) % 7;
+        let (dim, prev_year, prev_month) = (days_in_month(t.year, t.month) as i32, if t.month == 1 { t.year - 1 } else { t.year }, if t.month == 1 { 12 } else { t.month - 1 });
+        let pdim = days_in_month(prev_year, prev_month) as i32;
+        // the day shown in cell `i` of the six weeks: (number, belongs to this month)
+        let cell = |i: i32| -> (i32, bool) {
+            let d = i - lead as i32 + 1;
+            if d < 1 {
+                (pdim + d, false)
+            } else if d > dim {
+                (d - dim, false)
+            } else {
+                (d, true)
+            }
+        };
+        match style {
+            // the month large, the weekend quiet, the days around it faint, today a rounded square
+            0 => {
+                let pad = 18.0;
+                let month = tr(MONTHS[(t.month as usize - 1) % 12]).to_string();
+                let mw = self.renderer.text_width(&month, 19.0, true);
+                labels.push(Label::new(month, x + pad, y + 36.0, 19.0, true, ink, 1.0, Align::Left));
+                labels.push(Label::new(t.year.to_string(), x + pad + mw + 7.0, y + 36.0, 19.0, false, ink, 0.40, Align::Left));
+                let cw = (w - 2.0 * pad) / 7.0;
+                for col in 0..7usize {
+                    labels.push(Label::new(SHORT[(col + shift) % 7].to_string(), x + pad + cw * (col as f32 + 0.5), y + 66.0, 10.5, true, ink, if weekend(col) { 0.26 } else { 0.42 }, Align::Center));
+                }
+                for i in 0..42i32 {
+                    let (n, mine) = cell(i);
+                    let col = (i % 7) as usize;
+                    let (cx, cy) = (x + pad + cw * (col as f32 + 0.5), y + 96.0 + (i / 7) as f32 * 30.0);
+                    let today = mine && n as u32 == t.day;
+                    if today {
+                        panels.push(Panel::solid(cx, cy - 4.0, 27.0, 27.0, 9.5, accent, accent).flat());
+                    }
+                    let alpha = if today { 1.0 } else if !mine { 0.20 } else if weekend(col) { 0.52 } else { 0.88 };
+                    labels.push(Label::new(n.to_string(), cx, cy + 0.5, 13.0, today, if today { [1.0; 3] } else { ink }, alpha, Align::Center));
+                }
+            }
+            // today's date large on the left, a small month on the right
+            1 => {
+                let pad = 24.0;
+                labels.push(Label::new(tr(DAYS[t.wday as usize % 7]).to_string(), x + pad, y + 40.0, 15.0, true, accent, 1.0, Align::Left));
+                labels.push(Label::new(t.day.to_string(), x + pad - 3.0, y + 128.0, 92.0, true, ink, 1.0, Align::Left));
+                labels.push(Label::new(format!("{} {}", tr(MONTHS[(t.month as usize - 1) % 12]), t.year), x + pad, y + 160.0, 14.0, false, ink, 0.55, Align::Left));
+                let cw = 25.0;
+                let gx = x + w - 22.0 - cw * 7.0;
+                panels.push(Panel::solid(gx - 20.0, y + 98.0, 1.0, 140.0, 0.5, ink, ink).flat().alpha(0.10));
+                for col in 0..7usize {
+                    labels.push(Label::new(SHORT[(col + shift) % 7].to_string(), gx + cw * (col as f32 + 0.5), y + 40.0, 10.0, true, ink, if weekend(col) { 0.26 } else { 0.42 }, Align::Center));
+                }
+                for i in 0..42i32 {
+                    let (n, mine) = cell(i);
+                    let col = (i % 7) as usize;
+                    let (cx, cy) = (gx + cw * (col as f32 + 0.5), y + 66.0 + (i / 7) as f32 * 22.0);
+                    let today = mine && n as u32 == t.day;
+                    if today {
+                        panels.push(Panel::solid(cx, cy - 4.0, 21.0, 21.0, 7.5, accent, accent).flat());
+                    }
+                    let alpha = if today { 1.0 } else if !mine { 0.18 } else if weekend(col) { 0.50 } else { 0.85 };
+                    labels.push(Label::new(n.to_string(), cx, cy + 0.5, 11.5, today, if today { [1.0; 3] } else { ink }, alpha, Align::Center));
+                }
+            }
+            // the first one: this month only, Sunday first, today a circle
+            _ => {
+                let lx = x + 20.0;
+                labels.push(Label::new(format!("{} {}", tr(MONTHS[(t.month as usize - 1) % 12]), t.year), lx, y + 34.0, 15.0, true, ink, 1.0, Align::Left));
+                let cell_w = (w - 40.0) / 7.0;
+                for (i, n) in SHORT.iter().enumerate() {
+                    labels.push(Label::new(n.to_string(), lx + i as f32 * cell_w + cell_w / 2.0, y + 64.0, 11.5, true, ink, 0.5, Align::Center));
+                }
+                let first = first_weekday(t.year, t.month);
+                for day in 1..=days_in_month(t.year, t.month) {
+                    let idx = first + day - 1;
+                    let (dx, dy) = (lx + (idx % 7) as f32 * cell_w + cell_w / 2.0, y + 92.0 + (idx / 7) as f32 * 29.0);
+                    let today = day == t.day;
+                    if today {
+                        panels.push(Panel::solid(dx, dy - 4.0, 26.0, 26.0, 13.0, accent, accent).flat());
+                    }
+                    labels.push(Label::new(day.to_string(), dx, dy + 0.5, 13.0, today, if today { [1.0; 3] } else { ink }, if today { 1.0 } else { 0.85 }, Align::Center));
+                }
+            }
+        }
     }
 
     pub fn desk_widget_motion(&mut self, p: [f32; 2]) {
@@ -279,26 +379,19 @@ impl State {
 
     /// Put a new widget of `kind` on the desktop: in the middle of the screen, nudged so it does not sit exactly on another.
     pub fn desk_add_widget(&mut self, kind: &str) {
-        let size = deskwidgets::size(kind);
-        let w = self.world;
-        let mut at = [(w[0] + w[2]) / 2.0, (w[1] + w[3]) / 2.0 - 40.0];
-        for _ in 0..16 {
-            let [x, y] = deskwidgets::place_at(kind, at, self.world);
-            if self.config.desk_widgets.iter().any(|d| (d.x - x).abs() < 24.0 && (d.y - y).abs() < 24.0) {
-                at = [at[0] + 32.0, at[1] + 32.0];
-                continue;
-            }
-            self.config.desk_widgets.push(DeskWidget { kind: kind.to_string(), x, y, ..Default::default() });
-            self.cfg_dirty = Some(std::time::Instant::now());
-            return;
-        }
-        let [x, y] = deskwidgets::place_at(kind, at, self.world);
-        let _ = size;
-        self.config.desk_widgets.push(DeskWidget { kind: kind.to_string(), x, y, ..Default::default() });
+        let [x, y] = self.desk_free_place(kind);
+        let uid = self.new_desk_uid(kind);
+        self.config.desk_widgets.push(DeskWidget { kind: kind.to_string(), uid, x, y, ..Default::default() });
         self.cfg_dirty = Some(std::time::Instant::now());
     }
 
     pub fn desk_menu_command(&mut self, id: u32) -> bool {
+        if (EXT_BASE..EXT_BASE + 40).contains(&id) {
+            if let Some(e) = deskwidgets::ext_list().get((id - EXT_BASE) as usize) {
+                self.desk_add_widget(&e.kind());
+            }
+            return true;
+        }
         if (STYLE_BASE..STYLE_BASE + deskwidgets::CLOCK_STYLES.len() as u32).contains(&id) {
             if let Some(w) = self.desk_target.take().and_then(|i| self.config.desk_widgets.get_mut(i)) {
                 w.style = (id - STYLE_BASE) as u8;
@@ -476,8 +569,8 @@ impl State {
                 p.fx = [p.fx[0].max(30.0), 0.0, 0.0, 0.0];
                 p.color2 = if dark { [1.0, 1.0, 1.0, 0.10] } else { [0.0, 0.0, 0.0, 0.10] };
             }
-            // the record is the widget: no card behind it
-            if d.kind != "vinyl" {
+            // the record is the widget: no card behind it (nor behind a program that says it draws all of its own)
+            if deskwidgets::ext_of(&d.kind).map_or(d.kind != "vinyl", |e| e.card) {
                 panels.push(p);
             }
             let (lx, rx) = (x + 20.0, x + w - 20.0);
@@ -518,23 +611,7 @@ impl State {
                         labels.push(Label::new(format!("{}, {} {}", tr(DAYS[t.wday as usize % 7]), t.day, tr(MONTHS[(t.month as usize - 1) % 12])), lx, y + 98.0, 14.0, false, ink, 0.7, Align::Left));
                     }
                 }
-                "calendar" => {
-                    labels.push(Label::new(format!("{} {}", tr(MONTHS[(t.month as usize - 1) % 12]), t.year), lx, y + 34.0, 15.0, true, ink, 1.0, Align::Left));
-                    let cell = (w - 40.0) / 7.0;
-                    for (i, n) in SHORT.iter().enumerate() {
-                        labels.push(Label::new(n.to_string(), lx + i as f32 * cell + cell / 2.0, y + 64.0, 11.5, true, ink, 0.5, Align::Center));
-                    }
-                    let first = first_weekday(t.year, t.month);
-                    for day in 1..=days_in_month(t.year, t.month) {
-                        let idx = first + day - 1;
-                        let (dx, dy) = (lx + (idx % 7) as f32 * cell + cell / 2.0, y + 92.0 + (idx / 7) as f32 * 29.0);
-                        let today = day == t.day;
-                        if today {
-                            panels.push(Panel::solid(dx, dy - 4.0, 26.0, 26.0, 13.0, accent, accent).flat());
-                        }
-                        labels.push(Label::new(day.to_string(), dx, dy + 0.5, 13.0, today, if today { [1.0; 3] } else { ink }, if today { 1.0 } else { 0.85 }, Align::Center));
-                    }
-                }
+                "calendar" => self.desk_calendar(d.style, [x, y, w, h], &t, ink, accent, &mut panels, &mut labels),
                 "system" => {
                     let rows: [(String, String, Option<f32>); 3] = [
                         (memrium_de::widget::status_icon("battery", sys), sys.battery.map_or("No battery".into(), |(p, c)| format!("Battery {p}%{}", if c { " charging" } else { "" })), sys.battery.map(|(p, _)| p as f32 / 100.0)),
@@ -653,13 +730,49 @@ impl State {
                     labels.push(Label::new(self.config.weather_city.trim().to_string(), lx, y + 30.0, 12.5, true, ink, 0.7, Align::Left));
                     labels.push(Label::new(text, lx, y + 60.0, 16.0, true, ink, 1.0, Align::Left));
                 }
+                k if deskwidgets::is_ext(k) => {
+                    // the program draws what is on the card; until its window is up, the card says what it waits for
+                    if self.desk_win_of(d.uid).is_none() {
+                        let text = match deskwidgets::ext_of(k) {
+                            Some(e) => e.label,
+                            None => format!("{} is not installed", &k[deskwidgets::EXT.len()..]),
+                        };
+                        labels.push(Label::new(text, lx, y + h / 2.0 + 5.0, 13.0, false, ink, 0.6, Align::Left));
+                    }
+                }
                 _ => {}
             }
         }
         // in edit mode every widget shows a frame to grab and a "−" to remove it
         if self.scene.edit_mode() {
             let accent = self.theme.accent;
-            for d in &widgets {
+            // (the frames of a widget that is a program of its own are drawn over its window: `desk_overlay`)
+            for d in widgets.iter().filter(|d| !deskwidgets::is_ext(&d.kind)) {
+                let [x, y, w, h] = self.desk_rect(d);
+                for (ex, ey, ew, eh) in [(x, y, w, 2.0), (x, y + h - 2.0, w, 2.0), (x, y, 2.0, h), (x + w - 2.0, y, 2.0, h)] {
+                    panels.push(Panel::solid(ex + ew / 2.0, ey + eh / 2.0, ew, eh, 1.0, accent, accent).flat().alpha(0.85));
+                }
+                for (cx, cy) in [(x + w, y), (x, y + h), (x + w, y + h)] {
+                    panels.push(Panel::solid(cx, cy, 12.0, 12.0, 6.0, [1.0; 3], [1.0; 3]).flat());
+                    panels.push(Panel::solid(cx, cy, 8.0, 8.0, 4.0, accent, accent).flat());
+                }
+                panels.push(Panel::glass(x + 14.0, y + 14.0, 22.0, 22.0, 11.0).tinted([0.30, 0.33, 0.42, 0.78]).shadow(0.25, 6.0, 2.0));
+                panels.push(Panel::glyph(x + 14.0, y + 14.0, 13.0, "minus", [1.0; 3], 1.0));
+            }
+        }
+        (panels, labels)
+    }
+
+    /// What is drawn over the windows of the external widgets (above them, below the windows that are in front of them): in edit
+    /// mode their frames and the "−" to take them off, and, while any widget is dragged, the lines it is pulled onto.
+    pub fn desk_overlay(&self) -> (Vec<Panel>, Vec<Label>) {
+        let (mut panels, mut labels) = (Vec::new(), Vec::new());
+        if self.config.desk_widgets.is_empty() {
+            return (panels, labels);
+        }
+        if self.scene.edit_mode() {
+            let accent = self.theme.accent;
+            for d in self.config.desk_widgets.iter().filter(|d| deskwidgets::is_ext(&d.kind)) {
                 let [x, y, w, h] = self.desk_rect(d);
                 for (ex, ey, ew, eh) in [(x, y, w, 2.0), (x, y + h - 2.0, w, 2.0), (x, y, 2.0, h), (x + w - 2.0, y, 2.0, h)] {
                     panels.push(Panel::solid(ex + ew / 2.0, ey + eh / 2.0, ew, eh, 1.0, accent, accent).flat().alpha(0.85));

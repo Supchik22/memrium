@@ -9,7 +9,7 @@ use crate::theme::{Corner, OsdPlace, OsdStyle};
 /// of `pitch` tall, and the next group starts at the returned y plus that).
 fn card(ui: &mut Ui, x: f32, y: f32, w: f32, heading: &str, height: f32) -> f32 {
     ui.section(x + 4.0, y + 12.0, heading);
-    ui.fill([x, y + 22.0, w, height], 12.0, ui.ink, 0.05);
+    ui.card([x, y + 22.0, w, height], 12.0);
     y + 22.0
 }
 

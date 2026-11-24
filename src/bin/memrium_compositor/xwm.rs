@@ -145,6 +145,8 @@ impl State {
             id: self.next_id,
             role,
             or: false,
+            desk: false,
+            desk_uid: 0,
             x11_loc: None,
             deco: Deco::Legacy,
             app_id: String::new(),
@@ -266,7 +268,7 @@ impl XwmHandler for State {
         win.title = window.title();
         let loc = (crate::role::to_x((x + win.ins[0]) as i32), crate::role::to_x((y + win.ins[1]) as i32));
         win.x11_loc = Some(loc);
-        let at = self.wins.iter().rposition(|o| !o.or).map(|p| p + 1).unwrap_or(0);
+        let at = self.managed_insert_at();
         self.wins.insert(at, win);
         let _ = window.configure(Rectangle::new(Point::from(loc), window.geometry().size));
         self.apply_focus();

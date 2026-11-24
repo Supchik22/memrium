@@ -178,6 +178,12 @@ fn lens(t: f32) -> f32 {
     return sqrt(1.0 - (1.0 - u) * (1.0 - u));
 }
 
+// How far a clear icon of the Auto style has gone from Frost (0) to Contrast (1) over a backdrop of lightness `l`
+// (`iconrender::auto_amount` is the same).
+fn auto_amount(l: f32) -> f32 {
+    return smoothstep(0.55, 0.80, l);
+}
+
 fn shade_glass(px: vec2<f32>, pn: Panel, sd: f32, n: vec2<f32>, base: vec3<f32>) -> vec3<f32> {
     let bezel = abs(pn.params.z);
     let depth = -sd;                       // px inside the shape
@@ -188,7 +194,8 @@ fn shade_glass(px: vec2<f32>, pn: Panel, sd: f32, n: vec2<f32>, base: vec3<f32>)
     let k = 1.0 - clamp(t, 0.0, 1.0);
     let k2 = select(0.0, k * k, t < 1.0);
     let disp = -n * k2 * pn.params.w;      // sample from further inside => edge bends scene inward
-    let dsp = pn.fx.y;
+    // (a negative dispersion marks the plate of a clear icon of the Auto style: -1 light look, -2 dark look)
+    let dsp = max(pn.fx.y, 0.0);
 
     let br = pn.fx.x;
     // no refraction here (or no dispersion): one blurred sample instead of three (green is that one sample either way;
@@ -204,7 +211,16 @@ fn shade_glass(px: vec2<f32>, pn: Panel, sd: f32, n: vec2<f32>, base: vec3<f32>)
 
     col = saturate_col(col, select(pn.extra.w, 1.15, pn.extra.w <= 0.0));
     // tint + slight lift
-    col = mix(col, pn.tint.rgb, pn.tint.a);
+    var tint = pn.tint;
+    if (pn.fx.y < -0.5) {
+        // the Auto style: over a light picture the pale frost becomes the smoky glass of Contrast, so that the white symbol
+        // on it reads (keep the two tints with `ClearStyle::plate_tint`); one decision for the whole icon, from the
+        // picture behind its middle, as the symbol makes it
+        let k = auto_amount(luma(blur_bg(pn.rect.xy, pn.rect.z * 0.8)));
+        let smoky = select(vec4(0.26, 0.27, 0.32, 0.34), vec4(0.06, 0.06, 0.08, 0.55), pn.fx.y < -1.5);
+        tint = mix(tint, smoky, k);
+    }
+    col = mix(col, tint.rgb, tint.a);
     col = col * 1.0 + 0.015;
     // adaptive shade: over a bright backdrop the glass darkens, so white content stays readable
     // (only for panels marked adaptive: Dock, Quick Settings, menu bar; not tooltips). The shade is a deeper,
@@ -558,20 +574,39 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
         // the picture sits on whole physical pixels: its top-left corner is moved to the nearest one (half a pixel at most), so
         // a straight line of the icon covers pixels instead of straddling two of them
         let tl = (pn.rect.xy - pn.rect.zw) * g.scale;
-        let snap = (round(tl) - tl) / g.scale;
-        let u = (local - snap) / pn.rect.zw;
+        var snap = (round(tl) - tl) / g.scale;
+        var half = pn.rect.zw;
+        var at = local;
+        // a flying icon (`Panel::flying_icon`, fx.y < 0): undeformed first. color2 = the direction, the factors along and
+        // across it; extra.w = the icon's own half side. It moves by fractions of a pixel, so it is not snapped.
+        let flying = pn.fx.y < -0.5;
+        if (flying) {
+            let d = pn.color2.xy;
+            let n = vec2(-d.y, d.x);
+            at = d * (dot(local, d) / pn.color2.z) + n * (dot(local, n) / pn.color2.w);
+            half = vec2(pn.extra.w);
+            snap = vec2(0.0);
+        }
+        let u = (at - snap) / half;
         let uu = u / max(1.0 - pn.fx.x, 0.2);
         // a soft copy of the picture (the Dock's bloom) reaches past the icon's edge: fx.w is how far, as a share of the icon's size
         let lim = 1.0 + 2.0 * max(pn.fx.w, 0.0);
         if (abs(uu.x) <= lim && abs(uu.y) <= lim) {
             let id = u32(pn.params.z + 0.5);
-            let cell = vec2(f32(id % 24u), f32(id / 24u));
+            var cell = vec2(f32(id % 24u), f32(id / 24u));
+            // a big icon (cell id from 1000) lies in a block of 2 x 2 cells at the end of the atlas: 256 px with its own mips
+            var span = 1.0;
+            if (id >= 1000u) {
+                let b = id - 1000u;
+                cell = vec2(f32((b % 12u) * 2u), f32(18u + (b / 12u) * 2u));
+                span = 2.0;
+            }
             // fx.z turns the picture (a record label); the mask below stays put
             let ca = cos(pn.fx.z);
             let sa = sin(pn.fx.z);
             let ur = vec2(ca * uu.x - sa * uu.y, sa * uu.x + ca * uu.y);
-            let uv = (cell + clamp(ur * 0.5 + vec2(0.5), vec2(0.004), vec2(0.996))) / 24.0;
-            var lod = clamp(log2(128.0 / max(2.0 * pn.rect.z * g.scale, 1.0)), 0.0, 2.0);
+            let uv = (cell + span * clamp(ur * 0.5 + vec2(0.5), vec2(0.004), vec2(0.996))) / 24.0;
+            var lod = clamp(log2(128.0 * span / max(2.0 * half.x * g.scale, 1.0)), 0.0, 2.0);
             // close to a level of the chain: take that level alone (each is drawn from the vector, not shrunk from the one
             // above), instead of a blend of two that is always a little soft
             let lod_whole = round(lod);
@@ -584,7 +619,7 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
                     let ang = f32(k) * 2.399963;
                     let rad = sqrt((f32(k) + 0.5) / 16.0) * pn.fx.w * 2.0;
                     let q = ur + vec2(cos(ang), sin(ang)) * rad;
-                    let uvk = (cell + clamp(q * 0.5 + vec2(0.5), vec2(0.004), vec2(0.996))) / 24.0;
+                    let uvk = (cell + span * clamp(q * 0.5 + vec2(0.5), vec2(0.004), vec2(0.996))) / 24.0;
                     sum += textureSampleLevel(app_atlas, bgs, uvk, max(lod, 1.0));
                 }
                 t = sum / 16.0;
@@ -598,15 +633,19 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
                 let hue = clamp(saturate_col(bd / max(m, 0.05), 1.25), vec3(0.0), vec3(1.0));
                 // (the picture holds the symbol in the grey of the clear look, 0.5..1 light, 0.32..0.94 dark: its own shades
                 // spread out again, so the dark details of the artwork stay apart from the light parts)
-                if (pn.color2.a > 0.5) {
-                    let l = clamp((lum - 0.32) / 0.62, 0.0, 1.0);
-                    t = vec4(mix(hue * 0.22, mix(hue, vec3(1.0), 0.45), l) * t.a, t.a);
-                } else {
-                    let l = clamp((lum - 0.5) / 0.5, 0.0, 1.0);
-                    t = vec4(mix(hue * 0.62, vec3(1.0), 0.15 + 0.85 * l) * t.a, t.a);
+                let dark_look = pn.color2.a > 0.5;
+                let l = select(clamp((lum - 0.5) / 0.5, 0.0, 1.0), clamp((lum - 0.32) / 0.62, 0.0, 1.0), dark_look);
+                var ink = select(mix(hue * 0.62, vec3(1.0), 0.15 + 0.85 * l), mix(hue * 0.22, mix(hue, vec3(1.0), 0.45), l), dark_look);
+                if (pn.fx.y > 2.5) {
+                    // the Auto style: the symbol turns white as the picture behind gets light (the Contrast end:
+                    // 0.80 to 1 by its own lightness); the shadow under it, which the picture holds darker than any
+                    // symbol, keeps its own dark colour (`iconrender::auto_ink`)
+                    let s = smoothstep(select(0.30, 0.12, dark_look), select(0.46, 0.26, dark_look), lum);
+                    let own = t.rgb / max(t.a, 0.0001);
+                    let white = mix(own, vec3(0.80 + 0.20 * l), s);
+                    ink = mix(ink, white, auto_amount(luma(bd)));
                 }
-                let ink = t.rgb;
-                t = vec4(ink, t.a);
+                t = vec4(ink * t.a, t.a);
             } else if (pn.fx.y > 0.5) {
                 let lum = luma(t.rgb / max(t.a, 0.0001));
                 t = vec4(pn.color2.rgb * lum * t.a, t.a);
@@ -615,16 +654,16 @@ fn apply_panel_raw(i: u32, px: vec2<f32>, acc_in: vec4<f32>) -> vec4<f32> {
             if (shape != 0u) {
                 var msd = 0.0;
                 if (shape == 1u) {
-                    msd = (pow(pow(abs(u.x), 5.0) + pow(abs(u.y), 5.0), 0.2) - 1.0) * pn.rect.z;
+                    msd = (pow(pow(abs(u.x), 5.0) + pow(abs(u.y), 5.0), 0.2) - 1.0) * half.x;
                 } else if (shape == 2u) {
-                    msd = (length(u) - 1.0) * pn.rect.z;
+                    msd = (length(u) - 1.0) * half.x;
                 } else {
-                    msd = sd_round_rect(local - snap, pn.rect.zw, pn.rect.z * 0.44);
+                    msd = sd_round_rect(at - snap, half, half.x * 0.44);
                 }
                 t = t * clamp(0.5 - msd * g.scale, 0.0, 1.0);
             }
             // a picture cut to a rounded rectangle (color2 = centre + half size, extra.w = radius), when asked to
-            if (pn.fx.y <= 0.5 && pn.color2.z > 0.0) {
+            if (!flying && pn.fx.y <= 0.5 && pn.color2.z > 0.0) {
                 t = t * clamp(0.5 - sd_shape(px - pn.color2.xy, pn.color2.zw, pn.extra.w) * g.scale, 0.0, 1.0);
             }
             let o = pn.tint.a;

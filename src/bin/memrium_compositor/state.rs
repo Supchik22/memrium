@@ -52,6 +52,12 @@ use std::sync::mpsc::{channel, Receiver};
 use std::time::Instant;
 
 mod render;
+#[path = "overview.rs"]
+mod overview;
+#[path = "overview_draw.rs"]
+mod overview_draw;
+pub use overview::{OvId, Overview};
+use overview_draw::OvFrame;
 
 /// resize grab margin around a window (logical px)
 const EDGE: f32 = 7.0;
@@ -194,6 +200,11 @@ pub struct Win {
     pub role: Role,
     /// an X11 override-redirect window (menu, tooltip): placed by the client, never framed or focused
     pub or: bool,
+    /// a desktop widget that is a program of its own (`desk_apps.rs`): kept with `or` set, so that it is never framed,
+    /// focused, listed, minimized or moved to another desktop, but under every window, put where its entry in
+    /// `config.desk_widgets` says, and `desk_uid` is that entry's
+    pub desk: bool,
+    pub desk_uid: u64,
     /// where the client area was last told to be (X11 windows live in screen coordinates)
     pub x11_loc: Option<(i32, i32)>,
     pub deco: Deco,
@@ -249,7 +260,7 @@ impl Win {
             t.dark = d;
         }
         if bare {
-            t.window.decoration = DecoKind::Minimal;
+            t.window.decoration = decor::bare_kind(theme);
         }
         std::borrow::Cow::Owned(t)
     }
@@ -347,17 +358,17 @@ enum SnapOp {
     Beside(i8),
 }
 
-/// Windows the shell draws itself (not Wayland clients): draggable, minimizable, listed in the Dock.
+/// The window whose magic corner is open.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Sw {
-    Settings,
+pub enum CornerOwner {
+    Win(u64),
+    Shell(Sw),
 }
 
-/// A card of the overview: a client window (index in `wins`) or a shell window.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum OvId {
-    Win(usize),
-    Shell(Sw),
+/// Windows the shell draws itself (not Wayland clients): draggable, minimizable, listed in the Dock.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Sw {
+    Settings,
 }
 
 /// A closed window fading out: its last pixels and chrome, kept for a moment.
@@ -410,6 +421,8 @@ pub enum MenuFor {
     Panel(usize, Option<usize>),
     /// a Dock / taskbar item's menu (see `dock.rs`)
     Dock,
+    /// a program in a launcher (see `dock_pin.rs`)
+    Launcher,
     /// the menu of a tray icon (see `tray_ui.rs`)
     Tray,
     /// the keyboard layout list
@@ -559,6 +572,9 @@ pub struct State {
     /// the user's theme as they chose it: what is saved, edited in Settings and cloned for a change
     pub base_theme: Theme,
     pub hover_btn: Option<(usize, Btn)>,
+    /// the magic corner of a maximized window without its title bar (`MaxControls::Corner`): whose it is, and how far its
+    /// buttons are out (0 .. 1)
+    pub corner: (Option<CornerOwner>, Spring),
     pub last_title_click: Option<Instant>,
 
     // ---- settings window
@@ -619,10 +635,8 @@ pub struct State {
     /// the icons menus show beside their entries (the "actions" folders), indexed off-thread
     pub action_icons: Arc<IconSlot>,
     pub icon_failed: HashSet<String>,
-    /// the cursor previews of the Mouse settings page in the icon atlas, and the look (accent and preferences) they show
+    /// what the cursor previews of Settings show: the newest key of each place (a place is one cell of the icon atlas)
     pub cursor_previews: Vec<String>,
-    /// the looks whose previews are kept, newest last (the page shows the current look and a few variants of it at once)
-    pub cursor_preview_looks: Vec<String>,
     /// set by the thread that rebuilt the icon indexes for a new icon theme: the loaded icons are dropped on the next frame
     pub icons_rebuilt: Arc<std::sync::atomic::AtomicBool>,
     /// when the icon theme the editor writes was last looked at, and the time its marker file had then
@@ -651,6 +665,8 @@ pub struct State {
     pub soft_check: Instant,
     /// the icon of the program being started: drawn beside the busy cursor (straight RGBA)
     pub busy_icon: Option<image::RgbaImage>,
+    /// the icon flying from where a program was started to the pointer (see launch.rs)
+    pub launch: crate::launch::Launch,
     /// typing hid the cursor; the next mouse motion, click or scroll shows it again
     pub typing_hid_cursor: bool,
     pub preview: Option<crate::dock::DockPreview>,
@@ -733,6 +749,9 @@ pub struct State {
     pub tray_retry: Instant,
     /// how far a side bar is kept from the screen's top and bottom by the bars along them (rebuilt each frame)
     pub axis_cache: std::cell::Cell<[f32; 2]>,
+    /// The app (index into `apps`) each window class was matched to, with the length of the list it was matched in: the
+    /// Dock asks for every window several times a frame, and a match compares the class with every app in lower case.
+    pub app_of: std::cell::RefCell<(usize, HashMap<String, Option<usize>>)>,
     pub tray_expanded: bool,
     /// the menu bar's service for programs, and the program whose menu is open
     pub appmenu: crate::appmenu_service::AppMenuService,
@@ -769,6 +788,10 @@ pub struct State {
     pub warp_to: Option<[f32; 2]>,
     /// the X11 surface under the pointer and its true origin (while a button is held the pointer may be outside it)
     pub x_focus_origin: Option<(WlSurface, [f64; 2])>,
+    /// what the program under the pointer was last told (see `pointer_hold.rs`)
+    pub hold: crate::pointer_hold::Hold,
+    /// programs on their way into the Dock (see `dock_pin.rs`)
+    pub pinning: crate::dock_pin::Pinning,
     pub manual_block: bool,
     /// start and centre (device px) of a theme-switch circle in progress
     pub reveal: Option<(Instant, [f32; 2])>,
@@ -787,8 +810,8 @@ pub struct State {
     pub ov_drag: Option<(f32, f32, f32)>,
     /// a three-finger swipe in progress: what the fingers did so far before it is known which way it goes, then the way (1 desktops, 2 overview, 3 none)
     pub swipe: Option<([f32; 2], u8)>,
-    /// the card under the pointer in the overview
-    pub ov_hover: Option<OvId>,
+    /// what the overview holds while it shows: cards, what is dragged, the selection (see `overview.rs`)
+    pub overview: Overview,
     /// the desktop's widgets can be moved
     /// the user manager's DISPLAY / WAYLAND_DISPLAY ... as they were before this session changed them
     pub saved_env: Vec<(String, Option<String>)>,
@@ -818,6 +841,10 @@ pub struct State {
     pub desk_guides: Vec<memrium_de::deskwidgets::Guide>,
     pub desk_snap: memrium_de::deskwidgets::Snap,
     pub desk_target: Option<usize>,
+    /// the programs started for external desktop widgets, by the entry's uid, and those that stopped (not started again)
+    pub desk_procs: HashMap<u64, std::process::Child>,
+    pub desk_gone: std::collections::HashSet<u64>,
+    pub desk_check: Option<Instant>,
     /// the desktop: (x0, y0, x1, y1) logical px; the main monitor's top-left is (0, 0)
     pub world: [f32; 4],
     /// every monitor as (x, y, w, h) logical px, and which one is the main one
@@ -1083,6 +1110,8 @@ impl State {
                     w.x.snap();
                     w.y.snap();
                 }
+                // a program that is a desktop widget goes under the windows and onto its place
+                self.adopt_desk_window(i);
                 // an X11 window is asked to be focused before Xwayland has given it a surface: now it has one
                 self.apply_focus();
             }
@@ -1346,7 +1375,7 @@ impl State {
             w.min_k.target = 0.0;
         }
         w.stamp = self.next_stamp();
-        let at = self.wins.iter().rposition(|o| !o.or).map(|p| p + 1).unwrap_or(0);
+        let at = self.managed_insert_at();
         self.wins.insert(at, w);
         self.apply_focus();
         at
@@ -1365,8 +1394,9 @@ impl State {
 
     /// The stamp of the client window (or popup: always in front) that has a point of its own at `p`, if any does.
     fn client_stamp_at(&self, p: [f32; 2]) -> Option<u64> {
-        let from_chrome = self.chrome_at(p).map(|(i, _)| if self.wins[i].or { u64::MAX } else { self.wins[i].stamp });
-        let from_surface = self.surface_under(p).map(|(s, _)| self.win_index(&root_of(&s)).map_or(u64::MAX, |i| if self.wins[i].or { u64::MAX } else { self.wins[i].stamp }));
+        let stamp_of = |w: &Win| if w.desk { 0 } else if w.or { u64::MAX } else { w.stamp };
+        let from_chrome = self.chrome_at(p).map(|(i, _)| stamp_of(&self.wins[i]));
+        let from_surface = self.surface_under(p).map(|(s, _)| self.win_index(&root_of(&s)).map_or(u64::MAX, |i| stamp_of(&self.wins[i])));
         from_chrome.max(from_surface)
     }
 
@@ -1431,7 +1461,7 @@ impl State {
         }
         let f = Self::frame_rect(&self.wins[idx]);
         let area = self.maximize_area([f[0] + f[2] / 2.0, f[1] + f[3] / 2.0]);
-        let (hide, normal) = (self.theme.window.hide_title_max, decor::insets(&self.theme));
+        let (hide, normal, bare_ins) = (self.theme.window.hide_title_max, decor::insets(&self.theme), decor::max_insets(&self.theme));
         // a window that is asked to maximize before it has any size (Kate does) must not "restore" to nothing: a frame too
         // small to be a window is replaced by a comfortable one in the middle of the area
         let comfy = [area[0] + area[2] * 0.14, area[1] + area[3] * 0.10, area[2] * 0.72, area[3] * 0.80];
@@ -1454,7 +1484,7 @@ impl State {
             w.restore = Some(if too_small(&before) { comfy } else { before });
             // the title bar is left out of a maximized window when the setting says so
             if hide && w.deco == Deco::Server {
-                w.ins = [0.0; 4];
+                w.ins = bare_ins;
             }
             let (ix, iy) = (w.ins[0] + w.ins[2], w.ins[1] + w.ins[3]);
             w.x.target = area[0];
@@ -1495,7 +1525,7 @@ impl State {
         let f = Self::frame_rect(&self.wins[idx]);
         let r = self.snap_rect(p, side);
         // a snapped window is dressed like a maximized one: where the theme moves the title into the bar, it does so here too
-        let ins = if self.theme.window.hide_title_max { [0.0; 4] } else { decor::insets(&self.theme) };
+        let ins = decor::max_insets(&self.theme);
         let w = &mut self.wins[idx];
         if w.restore.is_none() {
             w.restore = Some(f);
@@ -1513,7 +1543,7 @@ impl State {
     pub fn tile_shell_window(&mut self, k: Sw, side: i8) {
         let c = self.sw_frame(k);
         let r = self.snap_rect([c[0] + c[2] / 2.0, c[1] + c[3] / 2.0], side);
-        let ins = if self.theme.window.hide_title_max || self.sw_unified() { [0.0; 4] } else { decor::insets(&self.theme) };
+        let ins = if self.theme.window.hide_title_max { decor::max_insets(&self.theme) } else if self.sw_unified() { [0.0; 4] } else { decor::insets(&self.theme) };
         let w = self.shell_win_mut(k);
         if w.restore.is_none() {
             w.restore = Some([w.x.target, w.y.target]);
@@ -1668,6 +1698,7 @@ impl State {
         let work = self.maximize_area([f[0] + f[2] / 2.0, f[1] + f[3] / 2.0]);
         let hide = self.theme.window.hide_title_max;
         let theme_ins = decor::insets(&self.theme);
+        let bare_ins = decor::max_insets(&self.theme);
         let w = &mut self.wins[idx];
         if on {
             w.fs = Some((f, w.restore));
@@ -1679,7 +1710,7 @@ impl State {
         } else if let Some((prev, was_max)) = w.fs.take() {
             w.role.set_fullscreen(false);
             if w.deco == Deco::Server {
-                w.ins = if hide && was_max.is_some() { [0.0; 4] } else { theme_ins };
+                w.ins = if hide && was_max.is_some() { bare_ins } else { theme_ins };
             }
             let (ix, iy) = (w.ins[0] + w.ins[2], w.ins[1] + w.ins[3]);
             w.restore = was_max;
@@ -1721,7 +1752,8 @@ impl State {
         }
         self.ws_pos.target = n as f32;
         self.apply_focus();
-        if changed {
+        // (the overview shows which one it is by itself)
+        if changed && !self.ov_active() {
             self.shot_notice = Some((format!("Desktop {}", n + 1), 1.2));
         }
     }
@@ -1752,173 +1784,6 @@ impl State {
         self.switch_workspace(n as usize);
     }
 
-    pub fn ov_active(&self) -> bool {
-        self.ov.target > 0.5 || self.ov_drag.is_some()
-    }
-
-    /// Show or hide the overview.
-    pub fn ov_set(&mut self, on: bool) {
-        self.ov_drag = None;
-        self.ov.target = if on { 1.0 } else { 0.0 };
-        self.ov_hover = None;
-        if on {
-            self.alt_tab = None;
-            self.preview = None;
-            self.menu.close();
-            self.ov_hover = self.ov_hit(self.mouse);
-        }
-    }
-
-    /// Where every card of the overview goes (in the pointer's monitor): the windows of this desktop in a grid, each as big as
-    /// the cell allows (never bigger than it is), the last row centred. Ordered by window number so cards stay put when focus changes.
-    pub fn ov_layout(&self) -> Vec<(OvId, [f32; 4])> {
-        let mut cards: Vec<(u64, OvId, [f32; 4])> = Vec::new();
-        for (i, w) in self.wins.iter().enumerate() {
-            if w.mapped && !w.or && !w.minimized && w.ws == self.workspace {
-                cards.push((w.id, OvId::Win(i), Self::frame_rect(w)));
-            }
-        }
-        for k in [Sw::Settings] {
-            if self.sw_visible(k) {
-                cards.push((SHELL_SETTINGS, OvId::Shell(k), self.sw_frame(k)));
-            }
-        }
-        if cards.is_empty() {
-            return Vec::new();
-        }
-        cards.sort_by_key(|c| c.0);
-        let mon = self.mons.get(self.mon_at(self.mouse)).copied().unwrap_or([0.0, 0.0, self.size[0], self.size[1]]);
-        let (top, bottom, side, gap, label) = (200.0f32, 120.0f32, 70.0f32, 36.0f32, 30.0f32);
-        let area = [mon[0] + side, mon[1] + top, (mon[2] - 2.0 * side).max(100.0), (mon[3] - top - bottom).max(100.0)];
-        let n = cards.len();
-        let cols = ((n as f32 * area[2] / area[3]).sqrt().ceil() as usize).clamp(1, n);
-        let rows = n.div_ceil(cols);
-        let cw = (area[2] - gap * (cols as f32 - 1.0)) / cols as f32;
-        let ch = (area[3] - gap * (rows as f32 - 1.0)) / rows as f32;
-        let mut out = Vec::new();
-        for (j, (_, id, f)) in cards.into_iter().enumerate() {
-            let (c, r) = (j % cols, j / cols);
-            let in_row = if r == rows - 1 { n - r * cols } else { cols };
-            let x0 = area[0] + (cols - in_row) as f32 * (cw + gap) / 2.0 + c as f32 * (cw + gap);
-            let y0 = area[1] + r as f32 * (ch + gap);
-            let s = (cw / f[2].max(1.0)).min((ch - label) / f[3].max(1.0)).min(1.0);
-            let (w, h) = (f[2] * s, f[3] * s);
-            out.push((id, [x0 + (cw - w) / 2.0, y0 + (ch - label - h) / 2.0, w, h]));
-        }
-        out
-    }
-
-    /// The title under each card, fading in with the overview.
-    pub fn ov_labels(&mut self, cards: &[(OvId, [f32; 4])], shell: &mut Vec<Panel>) {
-        if cards.is_empty() {
-            return;
-        }
-        let ink = if self.theme.dark { [0.96, 0.97, 1.0] } else { [0.08, 0.10, 0.16] };
-        let k = ((self.ov.x - 0.3) / 0.7).clamp(0.0, 1.0);
-        let mut labels = Vec::new();
-        for (id, r) in cards {
-            let title = match id {
-                OvId::Win(i) => self.wins.get(*i).map(|w| if w.title.is_empty() { w.app_id.clone() } else { w.title.clone() }).unwrap_or_default(),
-                OvId::Shell(_) => "Settings".to_string(),
-            };
-            let title = ellipsize(&self.renderer, &title, 13.0, (r[2] + 40.0).max(160.0));
-            labels.push(Label::new(title, r[0] + r[2] / 2.0, r[1] + r[3] + 18.0, 13.0, self.ov_hover == Some(*id), ink, k, chebrium::draw::Align::Center));
-        }
-        let lp = self.renderer.label_panels(&labels);
-        shell.extend(lp);
-    }
-
-    /// The strip of desktops at the top of the overview: one tile per desktop, in the pointer's monitor.
-    pub fn ov_strip(&self) -> Vec<(usize, [f32; 4])> {
-        let mon = self.mons.get(self.mon_at(self.mouse)).copied().unwrap_or([0.0, 0.0, self.size[0], self.size[1]]);
-        let th = 92.0f32;
-        let tw = (th * mon[2] / mon[3].max(1.0)).clamp(100.0, 200.0);
-        let gap = 18.0;
-        let total = WORKSPACES as f32 * tw + (WORKSPACES as f32 - 1.0) * gap;
-        let x0 = mon[0] + (mon[2] - total) / 2.0;
-        (0..WORKSPACES).map(|n| (n, [x0 + n as f32 * (tw + gap), mon[1] + 44.0, tw, th])).collect()
-    }
-
-    /// Panels and labels of the desktop strip: a tile per desktop with its windows drawn small, the current one ringed.
-    pub fn ov_strip_panels(&mut self, shell: &mut Vec<Panel>) {
-        let k = ((self.ov.x - 0.1) / 0.6).clamp(0.0, 1.0);
-        if k <= 0.001 {
-            return;
-        }
-        let mon = self.mons.get(self.mon_at(self.mouse)).copied().unwrap_or([0.0, 0.0, self.size[0], self.size[1]]);
-        let dark = self.theme.dark;
-        let (bg, ink) = if dark { ([0.04, 0.05, 0.08], [0.96, 0.97, 1.0]) } else { ([1.0, 1.0, 1.0], [0.08, 0.10, 0.16]) };
-        let slide = -(1.0 - k) * 30.0;
-        let mut labels = Vec::new();
-        for (n, r) in self.ov_strip() {
-            let r = [r[0], r[1] + slide, r[2], r[3]];
-            let cur = n == self.workspace;
-            if cur {
-                let a = self.theme.accent;
-                shell.push(Panel::solid(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, r[2] + 6.0, r[3] + 6.0, 11.0, a, a).flat().alpha(0.95 * k));
-            }
-            shell.push(Panel::solid(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, r[2], r[3], 8.0, bg, bg).flat().alpha(if dark { 0.62 } else { 0.55 } * k));
-            let sc = r[2] / mon[2].max(1.0);
-            let mut minis: Vec<(u64, [f32; 4])> = Vec::new();
-            for w in self.wins.iter().filter(|w| w.mapped && !w.or && w.ws == n && (!w.minimized || w.ws_hidden)) {
-                minis.push((w.stamp, Self::frame_rect(w)));
-            }
-            for kk in [Sw::Settings] {
-                if self.is_open(kk) && self.shell_win(kk).ws == n {
-                    minis.push((self.shell_win(kk).stamp, self.sw_frame(kk)));
-                }
-            }
-            minis.sort_by_key(|m| m.0);
-            for (_, f) in minis {
-                let m = [r[0] + (f[0] - mon[0]) * sc, r[1] + (f[1] - mon[1]) * sc, f[2] * sc, f[3] * sc];
-                shell.push(Panel::solid(m[0] + m[2] / 2.0, m[1] + m[3] / 2.0, m[2], m[3], 2.0, ink, ink).flat().alpha(0.5 * k).cut_to(r));
-            }
-            labels.push(Label::new(format!("Desktop {}", n + 1), r[0] + r[2] / 2.0, r[1] + r[3] + 16.0, 12.5, cur, ink, k, chebrium::draw::Align::Center));
-        }
-        let lp = self.renderer.label_panels(&labels);
-        shell.extend(lp);
-    }
-
-    /// The desktop tile at a point.
-    pub fn ov_strip_hit(&self, p: [f32; 2]) -> Option<usize> {
-        self.ov_strip().into_iter().find(|(_, r)| Self::in_rect(p, [r[0] - 6.0, r[1] - 6.0, r[2] + 12.0, r[3] + 28.0])).map(|(n, _)| n)
-    }
-
-    /// The card at a point (the top-most one, a hovered one counting a little bigger).
-    pub fn ov_hit(&self, p: [f32; 2]) -> Option<OvId> {
-        self.ov_layout().into_iter().rev().find(|(_, r)| Self::in_rect(p, *r)).map(|(id, _)| id)
-    }
-
-    /// A card was chosen: the overview closes and that window comes to the front.
-    pub fn ov_pick(&mut self, id: OvId) {
-        self.ov_set(false);
-        match id {
-            OvId::Win(i) if i < self.wins.len() => {
-                self.focus_window(i);
-            }
-            OvId::Shell(k) => self.open_shell(k),
-            _ => {}
-        }
-    }
-
-    /// The overview's mouse: a click on a card picks it, one anywhere else closes the overview. True = the overview took it.
-    pub fn ov_button(&mut self, button: u32, pressed: bool) -> bool {
-        if !self.ov_active() || self.bar_hit(self.mouse).is_some() {
-            return false;
-        }
-        if pressed && button == BTN_LEFT {
-            if let Some(n) = self.ov_strip_hit(self.mouse) {
-                self.switch_workspace(n);
-                return true;
-            }
-            match self.ov_hit(self.mouse) {
-                Some(id) => self.ov_pick(id),
-                None => self.ov_set(false),
-            }
-        }
-        true
-    }
-
     /// Three fingers went down: which way they go is decided after a few units of travel.
     pub fn swipe_begin(&mut self) {
         self.swipe = Some(([0.0, 0.0], 0));
@@ -1934,7 +1799,7 @@ impl State {
                 self.swipe = Some((acc, 0));
                 return;
             }
-            mode = if self.ov_active() && acc[1].abs() <= acc[0].abs() { 3 } else if acc[1].abs() > acc[0].abs() { 2 } else { 1 };
+            mode = if acc[1].abs() > acc[0].abs() { 2 } else { 1 };
             if mode == 1 {
                 self.ws_swipe_begin();
             } else if mode == 2 {
@@ -1942,6 +1807,10 @@ impl State {
                 self.ov_drag = Some((start, 0.0, 0.0));
                 self.ov.v = 0.0;
                 self.ov.target = start;
+                // (fingers going down over the desktop open nothing)
+                if acc[1] < 0.0 || start > 0.02 {
+                    self.ov_begin();
+                }
             }
             // what the fingers did before the way was known counts too
             feed = acc;
@@ -2064,6 +1933,7 @@ impl State {
             self.grab = Some(Grab::Move { surf: root.clone(), off: [self.mouse[0] - x, self.mouse[1] - y], start: self.mouse });
             self.wins[i].scale.target = 1.018;
             self.focus_window(i);
+            self.take_pointer_from_client();
         }
     }
 
@@ -2085,6 +1955,9 @@ impl State {
             }
             let i = self.focus_window(i);
             self.start_resize(i, bits);
+        }
+        if matches!(self.grab, Some(Grab::Resize { .. })) {
+            self.take_pointer_from_client();
         }
     }
 
@@ -2240,6 +2113,76 @@ impl State {
         None
     }
 
+    /// The buttons of a shell window: its title bar's, or the ones of its corner or strip while it is maximized without one.
+    fn sw_buttons(&self, k: Sw) -> Vec<(Btn, [f32; 4])> {
+        let f = self.sw_frame(k);
+        let mut v = decor::buttons(&self.sw_theme(k), f);
+        let kk = self.corner_k(CornerOwner::Shell(k));
+        if kk >= 0.5 && self.theme.window.hide_title_max && self.shell_win(k).restore.is_some() && self.theme.window.max_controls == memrium_de::theme::MaxControls::Corner {
+            v.extend(decor::mark_buttons(&self.theme, f, kk.min(1.0)));
+        }
+        v
+    }
+
+    /// How far the magic corner of a window is open (0: shut, or not this window's).
+    pub(crate) fn corner_k(&self, owner: CornerOwner) -> f32 {
+        if self.corner.0 == Some(owner) {
+            self.corner.1.x.max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// The button of the corner or the strip of client window `w` (frame `f`) at `p`.
+    fn mark_at(&self, w: &Win, f: [f32; 4], p: [f32; 2]) -> Option<Btn> {
+        let ws = &self.theme.window;
+        if !ws.hide_title_max || w.restore.is_none() || w.deco != Deco::Server || w.fs.is_some() {
+            return None;
+        }
+        let k = match ws.max_controls {
+            memrium_de::theme::MaxControls::MenuBar => return None,
+            memrium_de::theme::MaxControls::Strip => 1.0,
+            // (only once it is far enough out to be seen)
+            memrium_de::theme::MaxControls::Corner => self.corner_k(CornerOwner::Win(w.id)).min(1.0),
+        };
+        if k < 0.5 {
+            return None;
+        }
+        decor::mark_buttons(&self.theme, f, k).into_iter().find(|(_, r)| Self::in_rect(p, *r)).map(|(b, _)| b)
+    }
+
+    /// The pointer moved: open the magic corner of the maximized window it is in, keep it open while the pointer is over its
+    /// buttons, shut it when the pointer leaves.
+    fn corner_motion(&mut self, p: [f32; 2]) {
+        use memrium_de::theme::MaxControls;
+        let on = self.theme.window.hide_title_max && self.theme.window.max_controls == MaxControls::Corner;
+        let under: Option<(CornerOwner, [f32; 4])> = if !on || self.popup_hit(p) {
+            None
+        } else if let Some(k) = self.shell_covers(p) {
+            self.shell_win(k).restore.is_some().then(|| (CornerOwner::Shell(k), self.sw_frame(k)))
+        } else {
+            match self.chrome_at(p) {
+                Some((i, _)) => {
+                    let w = &self.wins[i];
+                    (w.restore.is_some() && w.deco == Deco::Server && w.fs.is_none()).then(|| (CornerOwner::Win(w.id), Self::frame_rect(w)))
+                }
+                None => None,
+            }
+        };
+        let open = match under {
+            Some((o, f)) if Self::in_rect(p, decor::corner_zone(&self.theme, f)) => {
+                self.corner.0 = Some(o);
+                true
+            }
+            Some((o, f)) if self.corner.0 == Some(o) && self.corner.1.target > 0.5 => {
+                let r = decor::corner_plate(&self.theme, f, 1.0);
+                Self::in_rect(p, [r[0] - 8.0, r[1] - 8.0, r[2] + 16.0, r[3] + 16.0])
+            }
+            _ => false,
+        };
+        self.corner.1.target = if open { 1.0 } else { 0.0 };
+    }
+
     /// Chrome hit-test for the topmost window under `p`.
     pub(crate) fn chrome_at(&self, p: [f32; 2]) -> Option<(usize, Hit)> {
         for (i, w) in self.wins.iter().enumerate().rev() {
@@ -2258,8 +2201,12 @@ impl State {
             if !inside {
                 continue;
             }
+            // the corner's or the strip's buttons of a maximized window without its title bar (over the program's picture)
+            if let Some(b) = self.mark_at(w, f, p) {
+                return Some((i, Hit::Button(b)));
+            }
             if in_title {
-                for (b, r) in decor::buttons(&self.theme, f) {
+                for (b, r) in decor::buttons(&w.chrome_theme(&self.theme), f) {
                     if p[0] >= r[0] && p[0] <= r[0] + r[2] && p[1] >= r[1] && p[1] <= r[1] + r[3] {
                         return Some((i, Hit::Button(b)));
                     }
@@ -2285,8 +2232,8 @@ impl State {
         if self.shot_sel.is_some() {
             return;
         }
-        if self.ov_active() && self.bar_hit(self.mouse).is_none() {
-            self.ov_hover = self.ov_hit(self.mouse);
+        if self.ov_takes_input() {
+            self.ov_motion();
             return;
         }
         if self.live_shot.is_some() {
@@ -2331,9 +2278,10 @@ impl State {
         self.title_menu_hover([x, y]);
         let covering = self.shell_covers([x, y]);
         for k in [Sw::Settings] {
-            let hover = if covering == Some(k) { decor::buttons(&self.sw_theme(k), self.sw_frame(k)).into_iter().find(|(_, r)| Self::in_rect([x, y], *r)).map(|(b, _)| b) } else { None };
+            let hover = if covering == Some(k) { self.sw_buttons(k).into_iter().find(|(_, r)| Self::in_rect([x, y], *r)).map(|(b, _)| b) } else { None };
             self.shell_win_mut(k).hover = hover;
         }
+        self.corner_motion([x, y]);
         self.hover_btn = match self.chrome_at([x, y]) {
             Some((i, Hit::Button(b))) if !self.popup_hit([x, y]) => Some((i, b)),
             _ => None,
@@ -2437,8 +2385,8 @@ impl State {
             }
         }
         let offering = dragging_files && self.pointer.is_grabbed() && !self.file_dnd.is_empty();
-        let focus = if self.launcher_modal() || self.shell_hit() || self.grab.is_some() || self.menu.open || (dragging_files && !offering) || self.shell_covers([x, y]).is_some() { None } else { self.surface_under([x, y]) };
-        let focus = focus.filter(|_| !matches!(self.chrome_at([x, y]), Some((_, Hit::Edge(_)))) || self.popup_hit([x, y]));
+        let focus = if dragging_files && !offering { None } else { self.client_focus([x, y]) };
+        self.note_pointer_focus(focus.clone());
         let fid = focus.as_ref().map(|(s, _)| s.id());
         if fid != self.cursor_focus {
             self.cursor_focus = fid;
@@ -2477,11 +2425,27 @@ impl State {
         self.update_pointer_constraints();
     }
 
+    /// The surface of a program that gets the pointer at `p` (and its origin); None where the shell has it.
+    pub fn client_focus(&self, p: [f32; 2]) -> Option<(WlSurface, [f32; 2])> {
+        if self.launcher_modal() || self.shell_hit() || self.grab.is_some() || self.menu.open || self.shell_covers(p).is_some() {
+            return None;
+        }
+        self.surface_under(p).filter(|_| !matches!(self.chrome_at(p), Some((_, Hit::Edge(_)))) || self.popup_hit(p))
+    }
+
     fn popup_hit(&self, p: [f32; 2]) -> bool {
         self.surface_under(p).is_some_and(|(s, _)| self.popup_index(&root_of(&s)).is_some())
     }
 
     pub fn pointer_button(&mut self, button: u32, pressed: bool) {
+        self.route_button(button, pressed);
+        if !pressed {
+            self.settle_release(button);
+        }
+    }
+
+    /// Who takes the button: the shell, or (through `send_button`) the program under the pointer.
+    fn route_button(&mut self, button: u32, pressed: bool) {
         self.typing_hid_cursor = false;
         self.activity();
         if std::env::var_os("MEMRIUM_DEBUG_CLICK").is_some() {
@@ -2539,8 +2503,10 @@ impl State {
             }
             return;
         }
-        let time = self.time_ms();
         if !pressed && button == BTN_LEFT && self.launcher_modal() {
+            if self.launcher_drop_on_dock() {
+                return;
+            }
             match self.launcher.release(self.mouse, &self.apps, false) {
                 LauncherClick::App(i) => {
                     let app = self.apps[i].clone();
@@ -2592,7 +2558,12 @@ impl State {
             if self.launcher_modal() {
                 if button == BTN_LEFT {
                     self.launcher.press(self.mouse);
+                } else if button == BTN_RIGHT {
+                    self.open_launcher_menu();
                 }
+                return;
+            }
+            if button == BTN_RIGHT && self.launcher.visible() && self.launcher.open && self.open_launcher_menu() {
                 return;
             }
             if self.preview_active() && (button == BTN_LEFT || button == BTN_MIDDLE) {
@@ -2693,6 +2664,18 @@ impl State {
             if (button == BTN_LEFT || button == BTN_RIGHT) && self.shell_pointer_down(button == BTN_RIGHT) {
                 return;
             }
+            // a widget that is a program of its own: edit mode (to move it) and the right button (its menu) are the shell's, any
+            // other click is the program's, and does not bring it forward or give it the keyboard
+            if !self.popup_hit(self.mouse) && self.desk_win_under(self.mouse).is_some() {
+                let editing = self.scene.edit_mode();
+                if (button == BTN_RIGHT || (button == BTN_LEFT && editing)) && self.desk_widget_press(self.mouse, button == BTN_RIGHT) {
+                    return;
+                }
+                if !editing {
+                    self.send_button(button, true);
+                }
+                return;
+            }
             if (button == BTN_LEFT || button == BTN_RIGHT) && self.desktop_hit(self.mouse) && self.desk_widget_press(self.mouse, button == BTN_RIGHT) {
                 return;
             }
@@ -2777,10 +2760,7 @@ impl State {
                     if d.active {
                         // a program being offered the files takes the release: it is the drop
                         if self.pointer.is_grabbed() && !self.file_dnd.is_empty() {
-                            let ptr = self.pointer.clone();
-                            let time = self.time_ms();
-                            ptr.button(self, &ButtonEvent { button, state: ButtonState::Released, serial: SERIAL_COUNTER.next_serial(), time });
-                            ptr.frame(self);
+                            self.send_button(button, false);
                         }
                         self.finish_drag(d);
                         return;
@@ -2796,10 +2776,7 @@ impl State {
                 return;
             }
         }
-        let ptr = self.pointer.clone();
-        let state = if pressed { ButtonState::Pressed } else { ButtonState::Released };
-        ptr.button(self, &ButtonEvent { button, state, serial: SERIAL_COUNTER.next_serial(), time });
-        ptr.frame(self);
+        self.send_button(button, pressed);
     }
 
     pub fn pointer_axis(&mut self, dx: f64, dy: f64) {
@@ -2808,7 +2785,8 @@ impl State {
         if self.lock.is_some() {
             return;
         }
-        if self.ov_active() && self.bar_hit(self.mouse).is_none() {
+        if self.ov_takes_input() && self.bar_hit(self.mouse).is_none() {
+            self.ov_wheel(dx as f32, dy as f32);
             return;
         }
         if self.launcher_modal() && !self.menu.open {
@@ -2951,6 +2929,10 @@ impl State {
             } else {
                 self.begin_live_text();
             }
+            self.intercepted.insert(evdev);
+            return true;
+        }
+        if self.ov_digit(evdev, mods) {
             self.intercepted.insert(evdev);
             return true;
         }
@@ -3102,19 +3084,9 @@ impl State {
             self.lock_screen();
             return true;
         }
-        // the overview: its own key or Esc closes it, Enter picks the card under the pointer, the other keys go nowhere
-        if self.ov_active() {
-            match sym {
-                Keysym::Return | Keysym::KP_Enter => match self.ov_hit(self.mouse) {
-                    Some(id) => self.ov_pick(id),
-                    None => self.ov_set(false),
-                },
-                _ if sym == Keysym::Escape || bound == Some("overview") => self.ov_set(false),
-                _ if bound.is_some() => {
-                    self.key_action(bound.unwrap_or_default());
-                }
-                _ => {}
-            }
+        // the overview: every key is its own
+        if self.ov_takes_input() {
+            self.ov_key(mods, sym, bound);
             return true;
         }
         if self.shot_edit.is_some() {
@@ -3168,13 +3140,17 @@ impl State {
                 Keysym::Return | Keysym::KP_Enter if self.launcher.editing() => self.launcher.end_edit(),
                 Keysym::Return | Keysym::KP_Enter if self.launcher.figlet => {
                     if let Some(it) = self.launcher.accept_item() {
+                        self.launch.typed = true;
                         self.spotlight_run(it.target);
+                        self.launch.typed = false;
                     }
                 }
                 Keysym::Return | Keysym::KP_Enter => {
                     if let Some(i) = self.launcher.accept() {
                         let app = self.apps[i].clone();
+                        self.launch.typed = true;
                         self.launch_app(&app);
+                        self.launch.typed = false;
                     }
                     self.launcher.close();
                 }
@@ -3298,7 +3274,9 @@ impl State {
                 let t1 = std::time::Instant::now();
                 // big enough for the launch icon's size at this scale (it is only scaled down when drawn)
                 let icon_px = ((self.config.input.cursor.launch_size * self.renderer.scale()).ceil() as u32).clamp(48, 128);
-                self.busy_icon = self.icons.get().and_then(|index| index.load(&app.icon, icon_px));
+                // (on its tile, so that it is the same picture as the copy that flies in)
+                self.busy_icon = self.icons.get().and_then(|index| index.load(&app.icon, icon_px)).map(|img| self.renderer.on_tile(img));
+                self.launch_fly(&app.id, &app.icon);
                 if std::env::var_os("MEMRIUM_STATS").is_some() {
                     eprintln!("stats: launch {}: spawn {:.1} ms, busy icon {:.1} ms", app.name, spawned.as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3);
                 }
@@ -3384,11 +3362,36 @@ impl State {
                 self.icon_loader.request(&id, &name, tile);
             }
         }
+        // icons drawn larger than their cell of the atlas: load them at 256 px
+        for key in self.renderer.take_big_wanted() {
+            let name = match key.strip_prefix("icon:") {
+                Some(n) => Some(n.to_string()),
+                None if key.starts_with("pack:") => None,
+                None => self.apps.iter().find(|a| a.id == key).map(|a| a.icon.clone()),
+            };
+            if let Some(name) = name {
+                let tile = self.renderer.icon_tile();
+                self.icon_loader.request_big(&key, &name, tile);
+            }
+        }
         let done = self.icon_loader.take(6);
         if done.is_empty() {
             return;
         }
         for d in done {
+            if d.big {
+                // (no big picture is no harm: the icon stays as it is; a stale tile style asks again)
+                if let Some(baked) = d.icon {
+                    if !self.renderer.app_icon_big_insert(&d.id, baked) {
+                        let name = d.id.strip_prefix("icon:").map(str::to_string).or_else(|| self.apps.iter().find(|a| a.id == d.id).map(|a| a.icon.clone()));
+                        if let Some(name) = name {
+                            let tile = self.renderer.icon_tile();
+                            self.icon_loader.request_big(&d.id, &name, tile);
+                        }
+                    }
+                }
+                continue;
+            }
             match d.icon {
                 Some(baked) => {
                     // made for another tile style than the current one: ask again with the current
@@ -3426,8 +3429,16 @@ impl State {
     }
 
     fn app_index_for_window(&self, w: &Win) -> Option<usize> {
-        let e = apps::find_for_app_id(&self.apps, &w.app_id)?;
-        self.apps.iter().position(|a| std::ptr::eq(a, e))
+        let mut known = self.app_of.borrow_mut();
+        if known.0 != self.apps.len() {
+            *known = (self.apps.len(), HashMap::new());
+        }
+        if let Some(i) = known.1.get(&w.app_id) {
+            return *i;
+        }
+        let i = apps::find_for_app_id(&self.apps, &w.app_id).and_then(|e| self.apps.iter().position(|a| std::ptr::eq(a, e)));
+        known.1.insert(w.app_id.clone(), i);
+        i
     }
 
     /// Favourite apps as indices into the app list.
@@ -3509,7 +3520,8 @@ impl State {
             // the integrated / dedicated card mark on running programs: off for now (the user asked); true brings it back
             const GPU_MARKS: bool = false;
             let gpu = (GPU_MARKS && running && memrium_de::gpu::is_hybrid()).then(|| memrium_de::gpu::launched_on(&key).unwrap_or(false));
-            items.push(DockItem { key, name, icon, running, separator_before: sep, windows, pinned: is_pinned, badge, gpu });
+            let arriving = self.pinning.arriving(&key);
+            items.push(DockItem { key, name, icon, running, separator_before: sep, windows, pinned: is_pinned, badge, gpu, arriving });
         }
         let focused = if let Some(k) = self.focused_shell() {
             Some(match k { Sw::Settings => apps::SETTINGS_ID }.to_string())
@@ -3705,7 +3717,7 @@ impl State {
     pub(crate) fn toggle_shell_maximize(&mut self, k: Sw) {
         let area = self.maximize_area([self.size[0] / 2.0, self.size[1] / 2.0]);
         // the title bar is left out of a maximized window when the setting says so (and always in the unified look)
-        let ins = if self.theme.window.hide_title_max || self.sw_unified() { [0.0; 4] } else { decor::insets(&self.theme) };
+        let ins = if self.theme.window.hide_title_max { decor::max_insets(&self.theme) } else if self.sw_unified() { [0.0; 4] } else { decor::insets(&self.theme) };
         let w = self.shell_win_mut(k);
         if let Some(r) = w.restore.take() {
             w.tile = 0;
@@ -3921,9 +3933,8 @@ impl State {
         self.raise_shell(k);
         let f = self.sw_frame(k);
         let ins = self.sw_ins(k);
-        let theme = self.sw_theme(k).into_owned();
         if !right {
-            for (b, r) in decor::buttons(&theme, f) {
+            for (b, r) in self.sw_buttons(k) {
                 if Self::in_rect(p, r) {
                     match b {
                         Btn::Close => match k {
@@ -3977,7 +3988,14 @@ impl State {
                     let at = if at[0] < 0.0 { self.mouse } else { at };
                     self.menu.open_at(at, items);
                 }
-                FilesEvent::Open(path) => fsops::open_external(&path, &self.socket),
+                FilesEvent::Open(path) => {
+                    // a launcher on the desktop starts like any other: the busy cursor, its icon flying to the pointer
+                    let launcher = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("desktop")).then(|| apps::load_desktop(&path)).flatten();
+                    match launcher {
+                        Some(app) => self.launch_app(&app),
+                        None => fsops::open_external(&path, &self.socket),
+                    }
+                }
                 FilesEvent::Own(program, args) => fsops::spawn_own(program, &args, &self.socket),
                 FilesEvent::OpenFolder(path) => self.open_files(Some(&path)),
                 FilesEvent::DragStart(paths) => {
@@ -4034,6 +4052,14 @@ impl State {
             MenuItem::sep(),
             MenuItem::new(0, "Open").icon("folder-open").sub(vec![MenuItem::new(D_FILES, "Files").icon("folder"), MenuItem::new(D_TERMINAL, "Terminal").icon("terminal"), MenuItem::new(D_DESKTOP_DIR, "Desktop folder").icon("monitor")]),
             MenuItem::sep(),
+        ]);
+        // the widgets that are programs of their own, installed next to the built-in ones (those are added in edit mode)
+        let ext = memrium_de::deskwidgets::ext_list();
+        if !ext.is_empty() {
+            let list = ext.iter().enumerate().map(|(k, e)| MenuItem::new(crate::desk_widgets::EXT_BASE + k as u32, e.label.clone()).icon("plus")).collect();
+            items.push(MenuItem::new(0, "Add Widget").icon("layout-grid").sub(list));
+        }
+        items.extend([
             // one edit mode: widgets and controls are added, moved and removed in it
             MenuItem::new(D_EDIT, if self.scene.edit_mode() { "Exit Edit Mode" } else { "Enter Edit Mode" }).icon("pencil"),
             MenuItem::sep(),
@@ -4061,17 +4087,18 @@ impl State {
         if app.is_empty() {
             names.extend(["File", "View"].map(String::from));
         }
-        let is = |title: &str, key: &str| title == key || title.to_lowercase() == tr(key).to_lowercase();
+        let (window, help_name) = (tr("Window").to_lowercase(), tr("Help").to_lowercase());
+        let is = |title: &str, key: &str| title == key || title.to_lowercase() == if key == "Window" { window.as_str() } else { help_name.as_str() };
         // the front program's own menus: the same title replaces the shell's, a new one comes before Window
         let mut help = None;
-        for m in app {
+        for m in app.iter() {
             if is(&m.title, "Window") {
                 continue;
             }
             if is(&m.title, "Help") {
-                help = Some(m.title);
+                help = Some(m.title.clone());
             } else if !names.contains(&m.title) {
-                names.push(m.title);
+                names.push(m.title.clone());
             }
         }
         // Window and Help stay last; a program's own Help is shown in place of the shell's (see `open_bar_menu`)
@@ -4094,7 +4121,7 @@ impl State {
     /// quick second press zooms (restores) the window, and dragging pulls it loose and carries it, as the title bar would.
     /// True when the press was used.
     fn bar_title_drag(&mut self) -> bool {
-        if !self.window_buttons_visible() {
+        if !self.front_is_bare() {
             return false;
         }
         // the Quick Settings pill (and anything else of the shell) on the bar is not empty bar
@@ -4128,8 +4155,13 @@ impl State {
         true
     }
 
-    /// The window in front is maximized and its title bar is left out: the bar shows its buttons.
+    /// The window in front is maximized and its title bar is left out, and the theme puts its buttons into the bar.
     fn window_buttons_visible(&self) -> bool {
+        self.theme.window.max_controls == memrium_de::theme::MaxControls::MenuBar && self.front_is_bare()
+    }
+
+    /// The window in front is maximized and its title bar is left out.
+    fn front_is_bare(&self) -> bool {
         if !self.theme.window.hide_title_max {
             return false;
         }
@@ -4147,7 +4179,7 @@ impl State {
         if w.deco != Deco::Server || w.fs.is_some() {
             [0.0; 4]
         } else if self.theme.window.hide_title_max && w.restore.is_some() {
-            [0.0; 4]
+            decor::max_insets(&self.theme)
         } else {
             decor::insets(&self.theme)
         }
@@ -4155,7 +4187,9 @@ impl State {
 
     /// The same for a shell window (Settings, Files). In the unified look they have no title bar at all.
     fn sw_ins(&self, k: Sw) -> [f32; 4] {
-        if self.sw_unified() || (self.theme.window.hide_title_max && self.shell_win(k).restore.is_some()) {
+        if self.theme.window.hide_title_max && self.shell_win(k).restore.is_some() {
+            decor::max_insets(&self.theme)
+        } else if self.sw_unified() {
             [0.0; 4]
         } else {
             decor::insets(&self.theme)
@@ -4181,7 +4215,7 @@ impl State {
     fn sw_theme(&self, k: Sw) -> std::borrow::Cow<'_, Theme> {
         if self.theme.window.hide_title_max && self.shell_win(k).restore.is_some() {
             let mut t = self.theme.clone();
-            t.window.decoration = DecoKind::Minimal;
+            t.window.decoration = decor::bare_kind(&self.theme);
             std::borrow::Cow::Owned(t)
         } else if self.sw_unified() {
             let mut t = self.theme.clone();
@@ -4200,7 +4234,12 @@ impl State {
         }
         let f = self.sw_frame(k);
         let mut room = [0.0f32; 2];
-        for (_, r) in decor::buttons(&self.sw_theme(k), f) {
+        let th = self.sw_theme(k);
+        // (the strip's marks hang over the content: they take no room in its top row)
+        if th.window.decoration == DecoKind::Strip {
+            return Some(room);
+        }
+        for (_, r) in decor::buttons(&th, f) {
             if r[0] + r[2] / 2.0 < f[0] + f[2] / 2.0 {
                 room[0] = room[0].max(r[0] + r[2] - f[0] + 12.0);
             } else {
@@ -4367,7 +4406,7 @@ impl State {
     }
 
     /// Where a minimising window should fly: the centre of its Dock icon.
-    fn item_center(&self, key: &str) -> Option<[f32; 2]> {
+    pub(crate) fn item_center(&self, key: &str) -> Option<[f32; 2]> {
         self.bars.iter().find_map(|b| b.item_center(key)).or_else(|| self.scene.item_center(key))
     }
 
@@ -4725,6 +4764,8 @@ impl State {
     }
 
     fn open_bar_menu_at(&mut self, hit: BarHit, x: f32, m: Vec<MenuItem>) {
+        // one menu of this bar is open: this one slides over from it
+        let slides = self.menu.open && self.bar_menu_mon == self.bar_mon.get() && matches!(self.menu_for, MenuFor::Bar(was) if was.bar == hit.bar);
         self.menu_for = MenuFor::Bar(hit);
         let bars = &self.bars;
         let (bottom, side) = self.with_bar_ctx(|ctx| bars.get(hit.bar).map(|b| { let r = b.rect(ctx); (r[1] + r[3], b.cfg.edge.vertical().then_some((r, b.cfg.edge))) })).unwrap_or((self.theme.menubar.height, None));
@@ -4737,7 +4778,11 @@ impl State {
             Some((r, _)) => [r[0] - 190.0 + o[0], x + o[1]],
             None => [x + o[0], bottom - 2.0 + o[1]],
         };
-        self.menu.open_at(at, m);
+        if slides {
+            self.menu.slide_to(at, m);
+        } else {
+            self.menu.open_at(at, m);
+        }
     }
 
     fn has_window(&self) -> bool {
@@ -4896,6 +4941,7 @@ impl State {
             MenuFor::Bar(_) => self.bar_command(id),
             MenuFor::Panel(b, w) => self.panel_menu_command(id, b, w),
             MenuFor::Dock => self.dock_menu_command(id),
+            MenuFor::Launcher => self.launcher_menu_command(id),
             MenuFor::Tray => self.tray_menu_command(id),
             MenuFor::Layout if id == 1000 => {
                 self.settings.set_page(Settings::page_by_name("keyboard").unwrap_or(0));
@@ -5003,9 +5049,15 @@ impl State {
             }
             _ => {}
         }
-        let (hide, normal) = (self.theme.window.hide_title_max, decor::insets(&self.theme));
+        let (hide, normal, bare) = (self.theme.window.hide_title_max, decor::insets(&self.theme), decor::max_insets(&self.theme));
         for w in &mut self.wins {
-            w.ins = if w.deco == Deco::Server && w.fs.is_none() && !(hide && w.restore.is_some()) { normal } else { [0.0; 4] };
+            w.ins = if w.deco != Deco::Server || w.fs.is_some() {
+                [0.0; 4]
+            } else if hide && w.restore.is_some() {
+                bare
+            } else {
+                normal
+            };
         }
         self.relayout_maximized();
         self.renderer.set_icon_tile(self.theme.icons.tile_style());
@@ -5319,9 +5371,12 @@ impl State {
     fn shell_item(&mut self, k: Sw) -> Vec<Item<'static>> {
         let logical = self.sw_visible(k);
         let kk = self.shell_win(k).k.x;
+        let id = OvId::Shell(k);
+        let open = self.is_open(k);
+        let card = if self.ov.x > 0.001 && (open || kk > 0.01) { self.ov_card_on_desk(id) } else { None };
         // a window of another desktop is beside the one on show, as for client windows
         let dx = desk_dx(self.shell_win(k).ws, self.ws_pos.x, self.size[0]);
-        if (!logical && kk < 0.01) || dx.abs() >= self.size[0] {
+        if (!logical && kk < 0.01 && card.is_none()) || dx.abs() >= self.size[0] {
             return Vec::new();
         }
         let frame = self.sw_frame(k);
@@ -5336,9 +5391,20 @@ impl State {
         let c = [frame[0] + frame[2] / 2.0, frame[1] + frame[3] / 2.0];
         let minimizing = self.shell_win(k).minimized;
         let mut out = Vec::new();
+        // (the content is still drawn above: the overview shows it where it carries the window)
+        if self.overview.is_loose(id) {
+            return Vec::new();
+        }
         let fade;
         let xf;
-        if minimizing || (logical && kk < 0.999 && self.shell_win(k).genie) {
+        if card.is_some() && open && (minimizing || self.shell_win(k).genie) {
+            // on its card there is no genie: it comes out of the Dock icon as the overview does
+            let dock = self.item_center(apps::SETTINGS_ID).unwrap_or([self.size[0] / 2.0, self.size[1] - 40.0]);
+            let mut away = Xf { c, s: 1.0, t: [dx, 0.0], fade: 1.0 };
+            away.ov_away(dock, 1.0 - kk, self.ov.x);
+            fade = away.fade;
+            xf = away;
+        } else if minimizing || (logical && kk < 0.999 && self.shell_win(k).genie) {
             let dock = self.item_center(if k == Sw::Settings { apps::SETTINGS_ID } else { apps::FILES_ID }).unwrap_or([self.size[0] / 2.0, self.size[1] - 40.0]);
             out.push(Item::Warp(Some(Warp { rect: frame, t: (1.0 - kk).clamp(0.0, 1.0), dock, icon_w: 52.0, jelly: None })));
             xf = Xf { c, s: 1.0, t: [dx, 0.0], fade: 1.0 };
@@ -5349,10 +5415,8 @@ impl State {
             fade = xf.fade;
         }
         let mut xf = xf;
-        if self.ov.x > 0.001 {
-            if let Some((_, tr)) = self.ov_layout().into_iter().find(|(id, _)| *id == OvId::Shell(k)) {
-                xf.ov(frame, tr, self.ov.x, self.ov_hover == Some(OvId::Shell(k)));
-            }
+        if let Some(place) = card {
+            xf.ov(place, self.ov.x);
         }
         let jel = [self.shell_win(k).jel[0].x, self.shell_win(k).jel[1].x];
         if out.is_empty() && jel[0].abs() + jel[1].abs() > 0.4 {
@@ -5439,29 +5503,18 @@ impl State {
                             }
                         }
                     } else if id.starts_with("cursor:") {
-                        // a cursor preview of the Mouse page; the previews of an older look go back to the atlas
-                        if self.renderer.app_icon_get(&id).is_none() {
-                            if let Some((img, look)) = memrium_de::cursor::preview_image(&id) {
-                                // a few looks are kept: the page shows the current one and its variants (the shape
-                                // tiles) side by side, and dropping all but one would make them push each other out
-                                // every frame. The oldest look goes back to the atlas when there are too many.
-                                if let Some(i) = self.cursor_preview_looks.iter().position(|l| *l == look) {
-                                    let l = self.cursor_preview_looks.remove(i);
-                                    self.cursor_preview_looks.push(l);
-                                } else {
-                                    self.cursor_preview_looks.push(look);
-                                    if self.cursor_preview_looks.len() > 16 {
-                                        let gone = self.cursor_preview_looks.remove(0);
-                                        let look_of = |id: &str| memrium_de::cursor::preview_image(id).map(|(_, l)| l);
-                                        let (drop, keep): (Vec<String>, Vec<String>) = std::mem::take(&mut self.cursor_previews).into_iter().partition(|old| look_of(old).as_deref() == Some(gone.as_str()));
-                                        for old in drop {
-                                            self.renderer.app_icon_free(&old);
-                                        }
-                                        self.cursor_previews = keep;
+                        // a cursor preview of Settings: each place on the page has one cell, drawn over (before the
+                        // frame that shows it) when what the place shows is another, so dragging a slider takes no more
+                        if !self.cursor_previews.contains(&id) {
+                            if let Some((img, _)) = memrium_de::cursor::preview_image(&id) {
+                                let slot = memrium_de::cursor::preview_slot(&id);
+                                let new = self.renderer.app_icon_get(slot).is_none();
+                                if self.renderer.set_image_cell(slot, &img).is_some() {
+                                    self.cursor_previews.retain(|old| memrium_de::cursor::preview_slot(old) != slot);
+                                    self.cursor_previews.push(id.clone());
+                                    if new {
+                                        self.invalidate();
                                     }
-                                }
-                                if self.renderer.image_cell(&id, &img).is_some() {
-                                    self.cursor_previews.push(id);
                                 }
                             }
                         }
@@ -5516,6 +5569,17 @@ impl State {
         let ws = &frame_theme.window;
         decor::round_to_frame(&mut panels, frame, if self.shell_win(k).restore.is_some() && ws.max_gap < 0.5 { 0.0 } else { ws.radius });
         panels.extend(buttons);
+        // the buttons of the corner or the strip of a maximized window without its title bar, over everything
+        if self.theme.window.hide_title_max && self.shell_win(k).restore.is_some() {
+            let kk = match self.theme.window.max_controls {
+                memrium_de::theme::MaxControls::Strip => 1.0,
+                memrium_de::theme::MaxControls::Corner => self.corner_k(CornerOwner::Shell(k)),
+                memrium_de::theme::MaxControls::MenuBar => 0.0,
+            };
+            if kk > 0.01 {
+                panels.extend(decor::mark_panels(&frame_theme, frame, focused, hover, kk));
+            }
+        }
         panels
     }
 
@@ -5561,6 +5625,17 @@ impl State {
                 let opaque = tex.opaque;
                 surf = Some((tex, [origin[0], origin[1], sz[0], sz[1]], clip, !opaque));
             }
+        }
+        // in the overview it fades on its card
+        let mut f = f;
+        if let Some(card) = self.ov_ghost(i) {
+            let Some(xf) = card else { return };
+            panels.iter_mut().for_each(|p| *p = xf.panel(*p));
+            if let Some((_, rect, clip, _)) = &mut surf {
+                *rect = xf.rect(*rect);
+                *clip = clip.map(|(r, rad)| (xf.rect(r), rad * xf.s));
+            }
+            f = xf.rect(f);
         }
         panels.shrink_to_fit();
         // Spring::new starts with target == value, so aim it at 0 or the ghost never fades away
@@ -5620,6 +5695,10 @@ impl State {
         let an = self.theme.animations.clone();
         let dt = an.scale_dt(dt);
         self.shot_flash = (self.shot_flash - dt * 4.0).max(0.0);
+        self.corner.1.update(dt);
+        if self.corner.1.target == 0.0 && self.corner.1.at_rest() {
+            self.corner.0 = None;
+        }
         self.snap += ((self.snap_on as u8 as f32) - self.snap) * (1.0 - (-16.0 * dt).exp());
         if self.snap < 0.003 && !self.snap_on {
             self.snap = 0.0;
@@ -5653,6 +5732,8 @@ impl State {
         self.tick_cursor();
         self.watch_soft();
         self.process_shell_events();
+        self.launch_tick(raw_dt);
+        self.pinning_tick(raw_dt);
         let kind = self.launcher.kind(self.theme.launcher.style);
         self.launcher.figlet = kind == memrium_de::theme::LauncherKind::Figlet;
         self.launcher.grid = kind == memrium_de::theme::LauncherKind::Launchpad;
@@ -5687,15 +5768,20 @@ impl State {
         if self.ov_drag.is_none() {
             an.step("workspace_slide", &mut self.ov, dt);
         }
+        self.ov_tick(dt);
         for w in &mut self.wins {
             an.step("window_move", &mut w.x, dt);
             an.step("window_move", &mut w.y, dt);
             an.step("window_focus", &mut w.scale, dt);
             an.step("window_minimize", &mut w.min_k, dt);
             an.step("window_open", &mut w.open_k, dt);
-            Self::jelly_step(&an, &mut w.jel, &mut w.jprev, [w.x.x, w.y.x], raw_dt);
+            // (a widget is carried by the pointer: nothing wobbles)
+            if !w.desk {
+                Self::jelly_step(&an, &mut w.jel, &mut w.jprev, [w.x.x, w.y.x], raw_dt);
+            }
         }
         self.sync_x11_positions();
+        self.repick_pointer();
         self.update_lock(dt);
         self.sys_watcher.set_watching(self.scene.cc_open() || self.flyout.is_some() || (self.settings.open && !self.swin.minimized));
         self.sys = self.sys_watcher.info();
@@ -5729,6 +5815,7 @@ impl State {
         self.update_widgets(dt);
         self.update_vinyl(dt);
         self.update_visualizer();
+        self.update_desk_apps();
         self.update_flyout(dt);
         self.gestures_tick(dt);
         self.semindex_tick();
@@ -6275,16 +6362,6 @@ impl Xf {
         Xf { c, s: w.scale.x * (0.9 + 0.1 * o.min(1.08)), t: [0.0, 0.0], fade: (o * 1.7).clamp(0.0, 1.0) }
     }
 
-    /// Move and shrink towards an overview card `k` of the way (the card a little bigger while the pointer is on it).
-    fn ov(&mut self, f: [f32; 4], card: [f32; 4], k: f32, hover: bool) {
-        let c = [f[0] + f[2] / 2.0, f[1] + f[3] / 2.0];
-        let tc = [card[0] + card[2] / 2.0, card[1] + card[3] / 2.0];
-        let target = card[2] / f[2].max(1.0) * if hover { 1.04 } else { 1.0 };
-        self.s *= 1.0 + (target - 1.0) * k;
-        self.t[0] += (tc[0] - c[0]) * k;
-        self.t[1] += (tc[1] - c[1]) * k;
-    }
-
     fn rect(&self, r: [f32; 4]) -> [f32; 4] {
         let rc = [r[0] + r[2] / 2.0, r[1] + r[3] / 2.0];
         let nc = [self.c[0] + (rc[0] - self.c[0]) * self.s + self.t[0], self.c[1] + (rc[1] - self.c[1]) * self.s + self.t[1]];
@@ -6316,13 +6393,17 @@ fn build_items<'a>(
     titles: &HashMap<usize, Vec<Panel>>,
     theme: &Theme,
     hover: Option<(usize, Btn)>,
+    // the open magic corner: whose, and how far
+    corner: (Option<CornerOwner>, f32),
     shells: Vec<(u64, Vec<Item<'a>>)>,
     desktop: Option<Item<'a>>,
+    // drawn over the windows of the desktop widgets, under every other window
+    desk_over: Option<Item<'a>>,
     ghosts: &'a [Ghost],
     dev: f32,
     rules: &memrium_de::apprules::Rules,
     desks: (f32, f32),
-    ov: (f32, &[(OvId, [f32; 4])], Option<OvId>),
+    ov: &OvFrame,
 ) -> Vec<Item<'a>> {
     // A program's picture is put on whole device pixels: at a place between two the filter smears every letter (a window that
     // was moved by the pointer, or maximized into a fractional area, lands there).
@@ -6330,14 +6411,19 @@ fn build_items<'a>(
     let mut out = Vec::new();
     out.extend(desktop);
     // the overview dims the desktop behind the windows
-    if ov.0 > 0.001 {
+    if ov.k > 0.001 {
         let c = if theme.dark { [0.0; 3] } else { [0.12, 0.13, 0.18] };
-        let dim = Panel::solid(0.0, 0.0, 40000.0, 40000.0, 0.0, c, c).flat().alpha(0.38 * ov.0.min(1.0));
+        let dim = Panel::solid(0.0, 0.0, 40000.0, 40000.0, 0.0, c, c).flat().alpha(0.38 * ov.k.min(1.0));
         out.push(Item::Frame { panels: vec![dim], bbox: [-20000.0, -20000.0, 20000.0, 20000.0], fade: 1.0 });
+        // the plates under the cards
+        if let Some(bbox) = ov.under.iter().map(memrium_de::renderer::panel_box).reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]) {
+            out.push(Item::Frame { panels: ov.under.clone(), bbox, fade: 1.0 });
+        }
     }
     // shell windows (Settings, Files) and client windows stack by when each was last raised: a shell window goes in
     // before the first client window that was raised after it
     let mut shells = shells.into_iter().peekable();
+    let mut desk_over = desk_over;
     let node_size = |s: &WlSurface| -> Option<(&'a SurfaceTex, [f32; 2], Option<[f32; 4]>)> {
         let n = surfaces.get(&s.id())?;
         let t = n.tex.as_deref()?;
@@ -6346,23 +6432,37 @@ fn build_items<'a>(
     for (i, w) in wins.iter().enumerate() {
         // a window of another desktop is beside the one on show; it is seen only while the row slides
         let dx = if w.or { 0.0 } else { desk_dx(w.ws, desks.0, desks.1) };
-        if !w.mapped || w.min_k.x > 0.985 || dx.abs() >= desks.1 {
+        let id = OvId::Win(w.id);
+        let card = ov.cards.get(&id).copied().filter(|_| !w.or);
+        // (a minimized window has a card too)
+        if !w.mapped || (w.min_k.x > 0.985 && card.is_none()) || dx.abs() >= desks.1 || ov.hidden.contains(&id) {
             continue;
         }
         // an X11 menu or tooltip is above every window
-        let stamp = if w.or { u64::MAX } else { w.stamp };
+        let stamp = if w.desk { 0 } else if w.or { u64::MAX } else { w.stamp };
+        // (the desktop widgets' windows are the first in the list: what is over them goes in before the first of the others)
+        if !w.desk {
+            out.extend(desk_over.take());
+        }
         while shells.peek().is_some_and(|(s, _)| *s < stamp) {
             out.extend(shells.next().map(|(_, items)| items).unwrap_or_default());
         }
         let mut xf = Xf::new(w, docks.get(i).copied().unwrap_or([0.0, 0.0]));
         xf.t[0] = dx;
-        if ov.0 > 0.001 {
-            if let Some((_, tr)) = ov.1.iter().find(|(id, _)| *id == OvId::Win(i)) {
-                xf.ov(State::frame_rect(w), *tr, ov.0, ov.2 == Some(OvId::Win(i)));
+        if w.desk || w.or {
+            // the overview dims the desktop and the widgets on it; a program's X11 menus and tooltips go away with it
+            xf.fade *= (1.0 - ov.k).clamp(0.0, 1.0);
+        } else if let Some(place) = card {
+            let m = if ov.away.contains(&id) || w.min_k.x > 0.001 { w.min_k.x } else { 0.0 };
+            if m > 0.001 {
+                // minimized: out of its Dock icon onto the card, no genie
+                xf.fade = 1.0;
+                xf.ov_away(docks.get(i).copied().unwrap_or([0.0, 0.0]), m, ov.k);
             }
+            xf.ov(place, ov.k);
         }
         let f = State::frame_rect(w);
-        let genie = w.min_k.x.clamp(0.0, 1.0);
+        let genie = if card.is_some() { 0.0 } else { w.min_k.x.clamp(0.0, 1.0) };
         let wobble = w.jel[0].x.abs() + w.jel[1].x.abs() > 0.4;
         if genie > 0.001 {
             out.push(Item::Warp(Some(Warp { rect: f, t: genie, dock: docks.get(i).copied().unwrap_or([0.0, 0.0]), icon_w: 52.0, jelly: None })));
@@ -6375,7 +6475,10 @@ fn build_items<'a>(
         let fs = w.fs.is_some();
 
         // chrome: always a shadow; the decoration itself only when we draw it (server-side)
-        let mut panels: Vec<Panel> = if server {
+        let mut panels: Vec<Panel> = if w.desk {
+            // a widget has the card the shell drew on the desktop behind it, and nothing else
+            Vec::new()
+        } else if server {
             decor::frame_panels(&w.chrome_theme(theme), f, focused, maximized, hover.filter(|(hi, _)| *hi == i).map(|(_, b)| b))
         } else {
             let sh = if fs { [0.0; 3] } else if focused { theme.window.shadow } else { theme.window.shadow_idle };
@@ -6394,7 +6497,9 @@ fn build_items<'a>(
         // as far as the panels reach (the shadow mostly), not further: every pixel of the box runs the frame shader
         let bb = xf.rect([f[0] - 90.0, f[1] - 90.0, f[2] + 180.0, f[3] + 180.0]);
         let bbox = panels.iter().map(memrium_de::renderer::panel_box).reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]).unwrap_or([bb[0], bb[1], bb[0] + bb[2], bb[1] + bb[3]]);
-        out.push(Item::Frame { panels, bbox, fade: xf.fade });
+        if !w.desk {
+            out.push(Item::Frame { panels, bbox, fade: xf.fade });
+        }
 
         // the client's surfaces (root + subsurfaces), clipped to the window shape
         let Some(root) = w.role.surface() else { continue };
@@ -6402,7 +6507,7 @@ fn build_items<'a>(
         let origin = [f[0] + w.ins[0] - w.geo[0], f[1] + w.ins[1] - w.geo[1]];
         let client_rect = [f[0] + w.ins[0], f[1] + w.ins[1], f[2] - w.ins[0] - w.ins[2], f[3] - w.ins[1] - w.ins[3]];
         let clip = match (w.deco, theme.window.decoration) {
-            _ if fs => None,
+            _ if fs || w.desk => None,
             (Deco::Legacy, _) => None,
             // Aero: the glass frame supplies the rounded outline, the client is a plain rectangle
             (Deco::Server, _) if decor::glass_frame(theme) => Some((xf.rect(client_rect), 0.0)),
@@ -6427,7 +6532,7 @@ fn build_items<'a>(
             let rule = rules.find(&[w.app_id.as_str()]);
             let veil = if is_root { rule.and_then(|r| r.opacity).unwrap_or(1.0) } else { 1.0 };
             // (the maximum-efficiency mode blurs nothing: a see-through program shows what is behind it as it is)
-            let frosted = is_root && rule.and_then(|r| r.frost).unwrap_or((!tex.opaque || veil < 0.999) && !has_under) && !memrium_de::efficiency::enabled();
+            let frosted = is_root && !w.desk && rule.and_then(|r| r.frost).unwrap_or((!tex.opaque || veil < 0.999) && !has_under) && !memrium_de::efficiency::enabled();
             out.push(Item::Surface { tex, rect: r, clip, frosted, alpha: xf.fade, veil });
             // a window hides what is under its opaque part: the renderer leaves that out (not when it is thinned out). While it
             // wobbles (dragged) a pixel shows the window's picture from at most `slack` away, so a box that much smaller is
@@ -6447,10 +6552,26 @@ fn build_items<'a>(
                 }
             }
         }
+        // the buttons of the corner or the strip of a maximized window without its title bar: over the program's picture
+        if server && maximized && theme.window.hide_title_max && card.is_none() {
+            let k = match theme.window.max_controls {
+                memrium_de::theme::MaxControls::Strip => 1.0,
+                memrium_de::theme::MaxControls::Corner if corner.0 == Some(CornerOwner::Win(w.id)) => corner.1,
+                _ => 0.0,
+            };
+            if k > 0.01 {
+                let marks: Vec<Panel> = decor::mark_panels(&w.chrome_theme(theme), f, focused, hover.filter(|(hi, _)| *hi == i).map(|(_, b)| b), k).into_iter().map(|p| xf.panel(p)).collect();
+                if let Some(bbox) = marks.iter().map(memrium_de::renderer::panel_box).reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]) {
+                    out.push(Item::Frame { panels: marks, bbox, fade: xf.fade });
+                }
+            }
+        }
         if genie > 0.001 || wobble {
             out.push(Item::Warp(None));
         }
     }
+
+    out.extend(desk_over.take());
 
     // windows that just closed shrink and fade
     for g in ghosts {
@@ -6468,8 +6589,8 @@ fn build_items<'a>(
         out.extend(items);
     }
 
-    // popups on top of everything
-    for p in popups {
+    // popups on top of everything (the overview has moved what they belong to from under them)
+    for p in popups.iter().filter(|_| ov.k < 0.15) {
         let root = p.surface.wl_surface();
         let Some(parent) = p.surface.get_parent_surface() else { continue };
         // popup geometry origin chain

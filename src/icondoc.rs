@@ -3,7 +3,7 @@
 //! saved in the `.memicon` format, a small binary container of our own:
 //!
 //! ```text
-//!   "MEMICON5"            8 bytes   magic and format version (versions 1 to 4 are still read)
+//!   "MEMICON7"            8 bytes   magic and format version (versions 1 to 6 are still read)
 //!   flags                 1 byte    bit 0: the payload is deflated
 //!   raw length            u32 LE    size of the payload before deflating
 //!   payload               ...       the document, written field by field (see `Writer`)
@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const MAGIC: &[u8; 8] = b"MEMICON5";
+pub const MAGIC: &[u8; 8] = b"MEMICON7";
+const MAGIC_V6: &[u8; 8] = b"MEMICON6";
+const MAGIC_V5: &[u8; 8] = b"MEMICON5";
 const MAGIC_V4: &[u8; 8] = b"MEMICON4";
 const MAGIC_V3: &[u8; 8] = b"MEMICON3";
 const MAGIC_V2: &[u8; 8] = b"MEMICON2";
@@ -60,6 +62,41 @@ coded_enum!(
         Combined = 1, "Combined";
     }
 );
+
+coded_enum!(
+    /// What the icon stands for, as the icon themes sort their icons: a program (on a plate), or a thing in Files, a
+    /// place (a folder) or a kind of file, that is the object itself and has no plate in any look.
+    IconContext {
+        App = 0, "Application";
+        Place = 1, "Place";
+        MimeType = 2, "File type";
+    }
+);
+
+impl IconContext {
+    /// the folder of each size of an icon theme the icons of this context go in
+    pub fn dir(self) -> &'static str {
+        match self {
+            IconContext::App => "apps",
+            IconContext::Place => "places",
+            IconContext::MimeType => "mimetypes",
+        }
+    }
+
+    /// the `Context=` of those folders in `index.theme`
+    pub fn theme_context(self) -> &'static str {
+        match self {
+            IconContext::App => "Applications",
+            IconContext::Place => "Places",
+            IconContext::MimeType => "MimeTypes",
+        }
+    }
+
+    /// Is the icon the object itself, with no plate (a folder, a file)?
+    pub fn is_object(self) -> bool {
+        self != IconContext::App
+    }
+}
 
 coded_enum!(Shape {
     None = 0, "None";
@@ -626,7 +663,42 @@ pub struct IconDoc {
     pub margin: f32,
     /// the colour of the "tinted by icon" look, when it is set by hand (None: found from the colours of the layers)
     pub icon_tint: Option<[f32; 3]>,
+    /// where each look is drawn from, in the order of `Appearance::ALL` (see `Base`)
+    pub bases: [Base; 6],
+    /// a program's icon, or a folder or a kind of file (no plate; written into `places` / `mimetypes` of the themes)
+    pub context: IconContext,
     pub next_id: u32,
+}
+
+/// What a look of an icon is drawn from: its own settings, or the picture of another look (so that two looks can be one
+/// picture, or a look can take the system's "tinted by icon" as it is).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Base {
+    /// the look's own settings
+    #[default]
+    Own,
+    /// what another look draws
+    Look(Appearance),
+    /// the look tinted in the colour of the icon
+    TintedByIcon,
+}
+
+impl Base {
+    pub fn code(self) -> u8 {
+        match self {
+            Base::Own => 0,
+            Base::Look(a) => 1 + Appearance::ALL.iter().position(|x| *x == a).unwrap_or(0) as u8,
+            Base::TintedByIcon => 7,
+        }
+    }
+
+    pub fn from_code(c: u8) -> Base {
+        match c {
+            1..=6 => Base::Look(Appearance::ALL[c as usize - 1]),
+            7 => Base::TintedByIcon,
+            _ => Base::Own,
+        }
+    }
 }
 
 /// What the file holds in the place of the icon's tint when there is none (files from before it was kept held this).
@@ -634,7 +706,28 @@ const NO_ICON_TINT: [f32; 3] = [0.42, 0.34, 0.80];
 
 impl IconDoc {
     pub fn new(name: &str) -> IconDoc {
-        IconDoc { name: name.to_string(), background: Variants::new(Background::default()), nodes: Vec::new(), margin: 0.05, icon_tint: None, next_id: 1 }
+        IconDoc { name: name.to_string(), background: Variants::new(Background::default()), nodes: Vec::new(), margin: 0.05, icon_tint: None, bases: [Base::Own; 6], context: IconContext::App, next_id: 1 }
+    }
+
+    /// The look that really draws look `look` (and whether it is tinted in the colour of the icon): the look itself, or
+    /// what it is drawn from, and what that is drawn from in turn. A loop of looks drawn from each other is cut short, so
+    /// that the look is drawn as itself.
+    pub fn source(&self, look: Appearance) -> (Appearance, bool) {
+        let at = |a: Appearance| Appearance::ALL.iter().position(|x| *x == a).unwrap_or(0);
+        let mut seen = vec![look];
+        let mut cur = look;
+        loop {
+            match self.bases[at(cur)] {
+                Base::Own => return (cur, false),
+                Base::TintedByIcon => return (Appearance::TintedLight, true),
+                Base::Look(next) if next == cur => return (cur, false),
+                Base::Look(next) if seen.contains(&next) => return (look, false),
+                Base::Look(next) => {
+                    seen.push(next);
+                    cur = next;
+                }
+            }
+        }
     }
 
     pub fn fresh_id(&mut self) -> u32 {
@@ -1184,7 +1277,7 @@ fn pack(magic: &[u8; 8], raw: Vec<u8>) -> Vec<u8> {
 
 /// The document as the bytes of a `.memicon` file.
 pub fn encode(doc: &IconDoc) -> Vec<u8> {
-    let mut w = Writer { buf: Vec::new(), version: 5 };
+    let mut w = Writer { buf: Vec::new(), version: 7 };
     w.str(&doc.name);
     w.variants(&doc.background, |w, b| w.background(b), |w, p| w.background_patch(p));
     w.f32(doc.margin);
@@ -1194,6 +1287,10 @@ pub fn encode(doc: &IconDoc) -> Vec<u8> {
         Some(c) => [c[0] + 0.004, c[1], c[2]],
         None => NO_ICON_TINT,
     });
+    for b in doc.bases {
+        w.u8(b.code());
+    }
+    w.u8(doc.context.code());
     w.u32(doc.next_id);
     w.u32(doc.nodes.len() as u32);
     for n in &doc.nodes {
@@ -1204,10 +1301,10 @@ pub fn encode(doc: &IconDoc) -> Vec<u8> {
 
 /// The document in the bytes of a `.memicon` file.
 pub fn decode(bytes: &[u8]) -> Result<IconDoc, String> {
-    if bytes.len() < 17 || (&bytes[..8] != MAGIC && &bytes[..8] != MAGIC_V4 && &bytes[..8] != MAGIC_V3 && &bytes[..8] != MAGIC_V2 && &bytes[..8] != MAGIC_V1) {
+    if bytes.len() < 17 || (&bytes[..8] != MAGIC && &bytes[..8] != MAGIC_V6 && &bytes[..8] != MAGIC_V5 && &bytes[..8] != MAGIC_V4 && &bytes[..8] != MAGIC_V3 && &bytes[..8] != MAGIC_V2 && &bytes[..8] != MAGIC_V1) {
         return Err("this is not a .memicon file".into());
     }
-    let version = if &bytes[..8] == MAGIC_V1 { 1 } else if &bytes[..8] == MAGIC_V2 { 2 } else if &bytes[..8] == MAGIC_V3 { 3 } else if &bytes[..8] == MAGIC_V4 { 4 } else { 5 };
+    let version = if &bytes[..8] == MAGIC_V1 { 1 } else if &bytes[..8] == MAGIC_V2 { 2 } else if &bytes[..8] == MAGIC_V3 { 3 } else if &bytes[..8] == MAGIC_V4 { 4 } else if &bytes[..8] == MAGIC_V5 { 5 } else if &bytes[..8] == MAGIC_V6 { 6 } else { 7 };
     let flags = bytes[8];
     let raw_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
     if raw_len > 256 << 20 {
@@ -1235,6 +1332,13 @@ pub fn decode(bytes: &[u8]) -> Result<IconDoc, String> {
     let background = r.variants(|r| r.background(), |r| r.background_patch())?;
     let margin = r.f32()?;
     let icon_tint = Some(r.rgb()?).filter(|c| *c != NO_ICON_TINT);
+    let mut bases = [Base::Own; 6];
+    if version >= 6 {
+        for b in bases.iter_mut() {
+            *b = Base::from_code(r.u8()?);
+        }
+    }
+    let context = if version >= 7 { IconContext::from_code(r.u8()?).ok_or("unknown icon context")? } else { IconContext::App };
     let next_id = r.u32()?;
     let n = r.u32()? as usize;
     let mut nodes = Vec::new();
@@ -1244,7 +1348,7 @@ pub fn decode(bytes: &[u8]) -> Result<IconDoc, String> {
     if r.at != raw.len() {
         return Err("the file has extra data at the end".into());
     }
-    Ok(IconDoc { name, background, nodes, margin, icon_tint, next_id })
+    Ok(IconDoc { name, background, nodes, margin, icon_tint, bases, context, next_id })
 }
 
 pub fn save(path: &Path, doc: &IconDoc) -> Result<(), String> {
@@ -1370,6 +1474,55 @@ mod tests {
         let mut other = bytes.clone();
         other[7] = b'9';
         assert!(decode(&other).is_err(), "another version is not read as this one");
+    }
+
+    #[test]
+    fn the_context_is_saved_and_older_files_are_programs() {
+        let mut doc = sample();
+        doc.context = IconContext::MimeType;
+        assert_eq!(decode(&encode(&doc)).unwrap().context, IconContext::MimeType);
+        // the same document in the form of version 6 (no context)
+        let mut w = Writer { buf: Vec::new(), version: 6 };
+        w.str(&doc.name);
+        w.variants(&doc.background, |w, b| w.background(b), |w, p| w.background_patch(p));
+        w.f32(doc.margin);
+        w.rgb(NO_ICON_TINT);
+        for b in doc.bases {
+            w.u8(b.code());
+        }
+        w.u32(doc.next_id);
+        w.u32(doc.nodes.len() as u32);
+        for n in &doc.nodes {
+            w.node(n);
+        }
+        let old = decode(&pack(MAGIC_V6, w.buf)).expect("version 6 opens");
+        assert_eq!(old.context, IconContext::App);
+        assert_eq!(old.nodes, doc.nodes);
+    }
+
+    #[test]
+    fn what_a_look_is_drawn_from_is_saved_and_older_files_draw_every_look_from_itself() {
+        let mut doc = sample();
+        doc.bases[1] = Base::Look(Appearance::Default);
+        doc.bases[0] = Base::TintedByIcon;
+        doc.bases[5] = Base::Look(Appearance::TintedLight);
+        let back = decode(&encode(&doc)).unwrap();
+        assert_eq!(back.bases, doc.bases);
+        assert_eq!(Base::from_code(Base::Look(Appearance::ClearDark).code()), Base::Look(Appearance::ClearDark));
+        // the same document in the form of version 5 (no looks to draw from)
+        let mut w = Writer { buf: Vec::new(), version: 5 };
+        w.str(&doc.name);
+        w.variants(&doc.background, |w, b| w.background(b), |w, p| w.background_patch(p));
+        w.f32(doc.margin);
+        w.rgb(NO_ICON_TINT);
+        w.u32(doc.next_id);
+        w.u32(doc.nodes.len() as u32);
+        for n in &doc.nodes {
+            w.node(n);
+        }
+        let old = decode(&pack(MAGIC_V5, w.buf)).expect("version 5 opens");
+        assert_eq!(old.bases, [Base::Own; 6]);
+        assert_eq!(old.nodes, doc.nodes);
     }
 
     #[test]

@@ -517,7 +517,7 @@ fn cursor_picture(state: &State, scale: f32, phase: f32) -> memrium_de::cursor::
     }
     let img = memrium_de::cursor_theme::picture(state.cursor_shape, (prefs.size * scale).round().max(1.0) as u32, prefs, state.theme.accent, phase);
     match &state.busy_icon {
-        Some(icon) if state.cursor_shape == memrium_de::cursor::Shape::Progress && prefs.launch_icon => with_app_icon(state, img, icon, scale),
+        Some(icon) if state.launch_icon_on_cursor() => with_app_icon(state, img, icon, scale),
         _ => img,
     }
 }
@@ -533,22 +533,17 @@ fn cursor_plane_dim(card: &Card) -> u32 {
 /// The smallest hardware cursor buffer of all monitors (the one picture is put on each of them).
 static CURSOR_PLANE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(64);
 
-/// Seconds since the program that the busy cursor waits for was launched.
-fn launch_time(state: &State) -> f32 {
-    state.busy_until.map_or(0.0, |until| crate::pointer::BUSY_FOR.saturating_sub(until.saturating_duration_since(Instant::now())).as_secs_f32())
-}
-
 /// The busy cursor shows a launch icon that moves (it needs drawing again many times a second).
 fn launch_moving(state: &State) -> bool {
     let prefs = &state.config.input.cursor;
-    state.busy_icon.is_some() && state.cursor_shape == memrium_de::cursor::Shape::Progress && prefs.launch_icon && prefs.launch_anim != memrium_de::cursor::LaunchAnim::Still
+    state.launch_icon_on_cursor() && prefs.launch_anim != memrium_de::cursor::LaunchAnim::Still
 }
 
 /// The picture of `shape` is the shell's own drawing and nothing more (no program's picture, no launch icon beside it):
 /// only such pictures are blended geometrically when the shape changes (see `cursor::Morph`).
 fn cursor_plain(state: &State, shape: memrium_de::cursor::Shape) -> bool {
     use memrium_de::cursor::Shape;
-    shape != Shape::Client && !(shape == Shape::Progress && state.busy_icon.is_some() && state.config.input.cursor.launch_icon)
+    shape != Shape::Client && !(shape == Shape::Progress && state.launch_icon_on_cursor())
 }
 
 /// Like `cursor_theme::animation` (loops per second, pictures per loop), with enough pictures for a moving launch icon
@@ -568,7 +563,7 @@ fn cursor_animation(state: &State) -> Option<(f32, u32)> {
 /// larger picture that still fits the cursor planes.
 fn with_app_icon(state: &State, img: memrium_de::cursor::CursorImage, icon: &image::RgbaImage, scale: f32) -> memrium_de::cursor::CursorImage {
     let max = CURSOR_PLANE.load(std::sync::atomic::Ordering::Relaxed);
-    memrium_de::cursor::with_launch_icon(img, icon, &state.config.input.cursor, scale, launch_time(state), max)
+    memrium_de::cursor::with_launch_icon(img, state.launch.rest.as_ref(), icon, &state.config.input.cursor, scale, state.launch_time(), max)
 }
 
 /// Put a cursor picture on the monitor's hardware cursor plane (a `cursor_dim` square buffer; a larger picture is cut).
@@ -592,6 +587,22 @@ fn draw_cursor(out: &mut Output, img: &memrium_de::cursor::CursorImage) {
     // a plane that is off stays off (the pointer is on another monitor, or typing hid it): the loop turns it on
     if out.cursor_on {
         let _ = out.card.set_cursor(out.crtc, Some(&out.cursor));
+    }
+}
+
+/// A short name of an input event, for the log.
+fn input_event_kind(ev: &InputEvent) -> &'static str {
+    match ev {
+        InputEvent::Device(_) => "device",
+        InputEvent::Keyboard(_) => "key",
+        InputEvent::Pointer(PointerEvent::Motion(_)) => "motion",
+        InputEvent::Pointer(PointerEvent::MotionAbsolute(_)) => "absolute motion",
+        InputEvent::Pointer(PointerEvent::Button(_)) => "button",
+        InputEvent::Pointer(_) => "scroll",
+        InputEvent::Gesture(_) => "gesture",
+        InputEvent::Switch(_) => "switch",
+        InputEvent::Touch(_) => "touch",
+        _ => "other",
     }
 }
 
@@ -796,6 +807,11 @@ pub fn run(args: Args) {
     let mut motion_since: Option<u64> = None;
     let (mut lat_n, mut lat_sum, mut lat_max, mut ioctl_max) = (0u32, 0u64, 0u64, 0u64);
     let (mut put_off_n, mut put_off_sum) = (0u32, 0u64);
+    // what each input device sent: the first few events of every device go to the log, then a count every 30 s (a touchpad
+    // that is seen but moves nothing shows up here as a device with no events)
+    let mut input_seen: HashMap<String, u32> = HashMap::new();
+    let mut input_count: HashMap<String, u32> = HashMap::new();
+    let mut input_report = Instant::now();
     loop {
         // a pass of the loop that held everything up (input waited meanwhile) is named in the log, phase by phase
         if stats_on {
@@ -904,10 +920,33 @@ pub fn run(args: Args) {
         }
         for ev in &mut libinput {
             had_input = true;
+            {
+                let dev = ev.device();
+                let name = dev.name().to_string();
+                *input_count.entry(name.clone()).or_insert(0) += 1;
+                let seen = input_seen.entry(name.clone()).or_insert(0);
+                if *seen < 4 {
+                    *seen += 1;
+                    eprintln!("input: event from {name}: {}", input_event_kind(&ev));
+                }
+            }
+            if input_report.elapsed().as_secs() >= 30 {
+                input_report = Instant::now();
+                let mut v: Vec<String> = devices.iter().map(|d| format!("{} {}", d.name(), input_count.get(d.name()).copied().unwrap_or(0))).collect();
+                v.dedup();
+                eprintln!("input: events in the last 30 s: {}", v.join(", "));
+                input_count.clear();
+            }
             match ev {
                 InputEvent::Device(DeviceEvent::Added(a)) => {
                     let mut d = a.device();
                     apply_input(&mut d, &state.config.input, &kde_text);
+                    let caps: Vec<&str> = [(DeviceCapability::Keyboard, "keyboard"), (DeviceCapability::Pointer, "pointer"), (DeviceCapability::Touch, "touch"), (DeviceCapability::Gesture, "gesture"), (DeviceCapability::Switch, "switch")]
+                        .into_iter()
+                        .filter(|(c, _)| d.has_capability(*c))
+                        .map(|(_, n)| n)
+                        .collect();
+                    eprintln!("input: added {} ({}): {}, send events {:?}, tap fingers {}", d.name(), d.sysname(), caps.join(" "), d.config_send_events_mode(), d.config_tap_finger_count());
                     // a touchpad: a second reader of its raw fingers for Settings' touchpad test
                     if touch_probe.is_none() && d.config_tap_finger_count() > 0 {
                         let path = std::path::PathBuf::from(format!("/dev/input/{}", d.sysname()));
@@ -922,6 +961,7 @@ pub fn run(args: Args) {
                 }
                 InputEvent::Device(DeviceEvent::Removed(r)) => {
                     let name = r.device().sysname().to_string();
+                    eprintln!("input: removed {} ({name})", r.device().name());
                     devices.retain(|d| d.sysname() != name);
                 }
                 InputEvent::Keyboard(KeyboardEvent::Key(k)) => state.key(k.key(), k.key_state() == KeyState::Pressed),
@@ -973,6 +1013,10 @@ pub fn run(args: Args) {
                     let dx = if s.has_axis(Axis::Horizontal) { s.scroll_value(Axis::Horizontal) } else { 0.0 };
                     state.pointer_axis(dx, dy);
                 }
+                // a lid or tablet-mode switch: libinput turns the touchpad off while the lid is shut or the laptop is folded
+                InputEvent::Switch(input::event::SwitchEvent::Toggle(t)) => {
+                    eprintln!("input: switch {:?} is now {:?} ({})", t.switch(), t.switch_state(), t.device().name());
+                }
                 InputEvent::Pointer(PointerEvent::ScrollFinger(s)) => {
                     let dy = if s.has_axis(Axis::Vertical) { s.scroll_value(Axis::Vertical) } else { 0.0 };
                     let dx = if s.has_axis(Axis::Horizontal) { s.scroll_value(Axis::Horizontal) } else { 0.0 };
@@ -983,6 +1027,7 @@ pub fn run(args: Args) {
         }
         state.flush_relative();
         laps.mark("input");
+        state.launch.plane = Some(CURSOR_PLANE.load(std::sync::atomic::Ordering::Relaxed));
         if active {
             // the picture changes with the shape (and turns, for the busy ring or a theme's animated cursor)
             let (step, phase) = match cursor_animation(&state) {

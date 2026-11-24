@@ -5,10 +5,7 @@ use crate::renderer::{Align, Label, Panel};
 use chebrium::spring::Spring;
 use crate::theme::Theme;
 
-const ROW: f32 = 30.0;
-const SEP: f32 = 11.0;
-const PAD: f32 = 6.0;
-const FONT: f32 = 13.5;
+use chebrium::popmenu::{BG_DARK, BG_LIGHT, FONT, HL_RADIUS, ICON_X, KEY_FONT, LABEL_X, MIN_W, PAD, ROW, SEP};
 
 #[derive(Clone, Debug, Default)]
 pub struct MenuItem {
@@ -113,6 +110,8 @@ pub struct Menu {
     snap: Vec<(Vec<Panel>, Vec<Label>)>,
     xfade: Vec<(Option<(Vec<Panel>, Vec<Label>)>, Spring)>,
     last_path: Vec<usize>,
+    /// where the first panel was when the menu slid over to another (`slide_to`)
+    slid_from: Option<[f32; 2]>,
     /// since when the pointer has been on its way to a submenu (the "safe triangle")
     guard: Option<std::time::Instant>,
 }
@@ -138,6 +137,7 @@ impl Default for Menu {
             xfade: Vec::new(),
             last_path: Vec::new(),
             guard: None,
+            slid_from: None,
         }
     }
 }
@@ -157,6 +157,34 @@ impl Menu {
         self.open_k = Spring::new(0.0, 1100.0, 0.85);
         self.open_k.target = 1.0;
         self.hl_init = false;
+        self.sub_k.clear();
+        self.sub_rect.clear();
+        self.xfade.clear();
+        self.snap.clear();
+        self.slid_from = None;
+    }
+
+    /// Another menu of the same bar takes the open one's place: the panel glides over and changes its size, the old
+    /// entries fade into the new ones.
+    pub fn slide_to(&mut self, at: [f32; 2], items: Vec<MenuItem>) {
+        let (Some(level), Some(old), false) = (self.levels.first(), self.snap.first().cloned(), self.sub_rect.is_empty()) else {
+            return self.open_at(at, items);
+        };
+        self.slid_from = Some([level.rect[0], level.rect[1]]);
+        self.sub_rect.truncate(1);
+        self.xfade.truncate(1);
+        let mut k = Spring::new(0.0, 700.0, 1.0);
+        k.target = 1.0;
+        self.xfade[0] = (Some(old), k);
+        self.snap.clear();
+        self.last_path.clear();
+        self.items = items;
+        self.at = at;
+        self.path.clear();
+        self.hot = None;
+        self.levels.clear();
+        self.hl_init = false;
+        self.hl[4].x = 0.0;
         self.sub_k.clear();
     }
 
@@ -281,11 +309,11 @@ impl Menu {
             if items.is_empty() {
                 break;
             }
-            let mut w = 190.0f32;
+            let mut w = MIN_W;
             for it in items {
-                let mut need = 44.0 + measure(&it.label, FONT, false) + 28.0;
+                let mut need = LABEL_X + measure(&it.label, FONT, false) + 24.0;
                 if !it.shortcut.is_empty() {
-                    need += 28.0 + measure(&crate::keys::display(&it.shortcut), FONT - 1.0, false);
+                    need += 28.0 + measure(&crate::keys::display(&it.shortcut), KEY_FONT, false);
                 }
                 w = w.max(need);
             }
@@ -452,6 +480,16 @@ impl Menu {
         }
         self.sub_rect.truncate(self.levels.len());
         self.xfade.truncate(self.levels.len());
+        {
+            let r = self.levels[0].rect;
+            for (s, v) in self.sub_rect[0].iter_mut().zip([r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, r[2], r[3]]) {
+                s.target = v;
+                // (only a menu sliding over glides: one that is opened or filled in anew is where it is)
+                if self.slid_from.is_none() {
+                    s.snap();
+                }
+            }
+        }
         for lv in 1..self.levels.len() {
             let r = self.levels[lv].rect;
             let t = [r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, r[2], r[3]];
@@ -470,13 +508,13 @@ impl Menu {
         let mut ranges: Vec<(usize, usize, usize, usize)> = vec![(0, 0, 0, 0); self.levels.len()];
         for lv in 0..self.levels.len() {
             let mut rect = self.levels[lv].rect;
-            if lv >= 1 {
+            if lv >= 1 || self.slid_from.is_some() {
                 let g = &self.sub_rect[lv];
                 rect = [g[0].x - g[2].x / 2.0, g[1].x - g[3].x / 2.0, g[2].x, g[3].x];
             }
             ranges[lv].0 = p.len();
             let mut bg = theme.glass.panel(rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0, rect[2], rect[3], (theme.window.radius * 0.7).clamp(6.0, 14.0));
-            bg.tint = if dark { [0.11, 0.11, 0.11, 0.78] } else { [0.97, 0.98, 1.0, 0.80] };
+            bg.tint = if dark { [BG_DARK[0], BG_DARK[1], BG_DARK[2], 0.78] } else { [BG_LIGHT[0], BG_LIGHT[1], BG_LIGHT[2], 0.80] };
             bg.fx[0] = bg.fx[0].max(16.0);
             bg.extra[0] = bg.extra[0].max(0.28);
             p.push(bg);
@@ -486,7 +524,7 @@ impl Menu {
         if a > 0.01 {
             let (k, danger) = (self.hl[5].x.clamp(0.0, 1.0), [1.0, 0.27, 0.23]);
             let accent = [0, 1, 2].map(|i| accent[i] + (danger[i] - accent[i]) * k);
-            p.push(Panel::solid(self.hl[0].x, self.hl[1].x, self.hl[2].x, self.hl[3].x, 7.0, accent, accent).flat().alpha(0.92 * a));
+            p.push(Panel::solid(self.hl[0].x, self.hl[1].x, self.hl[2].x, self.hl[3].x, HL_RADIUS, accent, accent).flat().alpha(0.92 * a));
         }
         let mut item_ranges = vec![(0usize, 0usize, 0usize, 0usize); self.levels.len()];
         for lv in 0..self.levels.len() {
@@ -495,7 +533,7 @@ impl Menu {
             for (ri, it) in items.iter().enumerate() {
                 let r = self.levels[lv].rows[ri];
                 if it.separator {
-                    p.push(Panel::solid(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, r[2] - 12.0, 1.0, 0.5, ink, ink).flat().alpha(0.14));
+                    p.push(Panel::solid(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, r[2] - 16.0, 1.0, 0.5, ink, ink).flat().alpha(0.14));
                     continue;
                 }
                 let on_path = self.path.get(lv) == Some(&ri);
@@ -508,22 +546,22 @@ impl Menu {
                 let al = if it.enabled { 1.0 } else { 0.38 };
                 let cy = r[1] + r[3] / 2.0;
                 if let Some(cell) = it.cell {
-                    p.push(Panel::app_icon(r[0] + 18.0, cy, 17.0, cell, al));
+                    p.push(Panel::app_icon(r[0] + ICON_X, cy, 16.0, cell, al));
                 } else if let Some(ic) = it.icon {
-                    p.push(Panel::glyph(r[0] + 18.0, cy, 16.0, ic, fg, al * 0.92));
+                    p.push(Panel::glyph(r[0] + ICON_X, cy, 14.0, ic, fg, al * 0.92));
                 } else if it.checked {
-                    p.push(Panel::glyph(r[0] + 18.0, cy, 15.0, "check", fg, al));
+                    p.push(Panel::glyph(r[0] + ICON_X, cy, 13.0, "check", fg, al));
                 }
-                l.push(Label::new(it.label.clone(), r[0] + 36.0, cy + 4.8, FONT, false, fg, al, Align::Left));
+                l.push(Label::new(it.label.clone(), r[0] + LABEL_X, cy + 4.6, FONT, false, fg, al, Align::Left));
                 if !it.shortcut.is_empty() {
-                    l.push(Label::new(crate::keys::display(&it.shortcut), r[0] + r[2] - 12.0, cy + 4.5, FONT - 1.0, false, fg, al * 0.62, Align::Right));
+                    l.push(Label::new(crate::keys::display(&it.shortcut), r[0] + r[2] - 10.0, cy + 4.5, KEY_FONT, false, fg, al * 0.62, Align::Right));
                 }
                 if (it.icon.is_some() || it.cell.is_some()) && it.checked && it.sub.is_empty() {
                     // an icon takes the check's place on the left, so the choice is ticked on the right
-                    p.push(Panel::glyph(r[0] + r[2] - 16.0, cy, 14.0, "check", fg, al));
+                    p.push(Panel::glyph(r[0] + r[2] - 14.0, cy, 13.0, "check", fg, al));
                 }
                 if !it.sub.is_empty() {
-                    p.push(Panel::glyph(r[0] + r[2] - 14.0, cy, 14.0, "chevron-right", fg, al * 0.9));
+                    p.push(Panel::glyph(r[0] + r[2] - 12.0, cy, 13.0, "chevron-right", fg, al * 0.9));
                 }
             }
             item_ranges[lv].1 = p.len();
@@ -531,8 +569,25 @@ impl Menu {
         }
         // one submenu turning into another: the old content fades out as the new one fades in
         let new_snap: Vec<(Vec<Panel>, Vec<Label>)> = (0..self.levels.len()).map(|lv| (p[item_ranges[lv].0..item_ranges[lv].1].to_vec(), l[item_ranges[lv].2..item_ranges[lv].3].to_vec())).collect();
-        for lv in 1..self.levels.len() {
+        // a menu sliding over carries both its old and its new entries along
+        let mut was_carried = [0.0f32; 2];
+        if let Some(from) = self.slid_from {
+            let (g, to) = (&self.sub_rect[0], self.levels[0].rect);
+            let now = [g[0].x - g[2].x / 2.0, g[1].x - g[3].x / 2.0];
+            let carried = [now[0] - to[0], now[1] - to[1]];
+            was_carried = [now[0] - from[0], now[1] - from[1]];
+            for q in p[item_ranges[0].0..item_ranges[0].1].iter_mut() {
+                q.rect[0] += carried[0];
+                q.rect[1] += carried[1];
+            }
+            for t in l[item_ranges[0].2..item_ranges[0].3].iter_mut() {
+                t.x += carried[0];
+                t.y += carried[1];
+            }
+        }
+        for lv in 0..self.levels.len() {
             let k = self.xfade[lv].1.x.clamp(0.0, 1.0);
+            let off = if lv == 0 { was_carried } else { [0.0; 2] };
             if self.xfade[lv].0.is_none() || k >= 0.999 {
                 continue;
             }
@@ -545,11 +600,15 @@ impl Menu {
             if let Some((op, ol)) = &self.xfade[lv].0 {
                 for q in op {
                     let mut q = *q;
+                    q.rect[0] += off[0];
+                    q.rect[1] += off[1];
                     q.fade_by(1.0 - k);
                     p.push(q);
                 }
                 for t in ol {
                     let mut t = t.clone();
+                    t.x += off[0];
+                    t.y += off[1];
                     t.opacity *= 1.0 - k;
                     l.push(t);
                 }
@@ -655,6 +714,33 @@ mod tests {
         assert!(step[0] < sub0[0], "the pointer is still between the menus");
         m.set_mouse(step);
         assert_eq!(m.path, vec![0], "the submenu must stay open");
+    }
+
+    #[test]
+    fn a_menu_slides_over_to_the_next_name_and_comes_to_rest_there() {
+        let mut m = Menu::default();
+        let (theme, screen) = (crate::theme::Theme::default(), [1000.0, 800.0]);
+        let measure = |t: &str, s: f32, _: bool| t.len() as f32 * s * 0.5;
+        let an = theme.animations.clone();
+        m.open_at([100.0, 30.0], vec![MenuItem::new(1, "New"), MenuItem::new(2, "Open")]);
+        for _ in 0..120 {
+            m.update(1.0 / 60.0, &an);
+            m.draw(&theme, screen, &measure);
+        }
+        // (a panel's rect is its middle and half sizes)
+        let left = |p: &[Panel]| p[0].rect[0] - p[0].rect[2];
+        m.slide_to([300.0, 30.0], vec![MenuItem::new(3, "Undo")]);
+        let (p, l) = m.draw(&theme, screen, &measure);
+        assert!((left(&p) - 100.0).abs() < 1.0, "it starts where the last one was: {}", left(&p));
+        assert!(l.iter().any(|t| t.text == "New"), "the old entries are still fading");
+        for _ in 0..180 {
+            m.update(1.0 / 60.0, &an);
+            m.draw(&theme, screen, &measure);
+        }
+        let (p, l) = m.draw(&theme, screen, &measure);
+        assert!((left(&p) - 300.0).abs() < 1.0, "and ends at the new name: {}", left(&p));
+        assert_eq!(l.len(), 1);
+        assert_eq!(m.click([310.0, 30.0 + PAD + ROW / 2.0]), MenuClick::Item(3));
     }
 
     #[test]

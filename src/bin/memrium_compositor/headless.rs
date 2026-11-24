@@ -96,6 +96,8 @@ pub fn run(mut args: Args) {
     // how much of the screen each benched frame redrew (kpx)
     let mut redrawn: Vec<f32> = Vec::new();
     let mut gpus: Vec<(f32, f32, f32)> = Vec::new();
+    // what a pass of the loop costs on the CPU: (`update`, looking for something to draw when nothing changed), µs and count
+    let mut passes = ([0.0f64; 2], [0u32; 2]);
     // demo recording (see record.rs): a virtual clock, one picture pair per frame
     let mut rec = crate::record::Recorder::from_env();
     let mut vt_ms: u128 = 0;
@@ -266,6 +268,11 @@ pub fn run(mut args: Args) {
                     state.key(code, it.next() == Some("down"));
                 }
                 Some("notify") => state.test_notify(it.next().unwrap_or("")),
+                Some("overview") => state.ov_set(it.next() != Some("off")),
+                Some("mdown") => state.pointer_button(0x112, true),
+                Some("mup") => state.pointer_button(0x112, false),
+                // `windows`: the windows, their desktops and who has the pointer, written to stderr
+                Some("windows") => eprintln!("windows: at {now_ms} {}", state.ov_dump()),
                 Some("scroll") => state.pointer_axis(0.0, it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0)),
                 // `snap a.png`: save the screen as it is now (several pictures in one run)
                 Some("snap") => snap = it.next().map(str::to_string),
@@ -344,7 +351,14 @@ pub fn run(mut args: Args) {
         last = now;
         let view = target.create_view(&Default::default());
         let t0 = Instant::now();
-        if let Some(enc) = state.render_lazy(|| Some(view)) {
+        passes.0[0] += (t0 - now).as_secs_f64() * 1e6;
+        passes.1[0] += 1;
+        let drawn = state.render_lazy(|| Some(view));
+        if drawn.is_none() {
+            passes.0[1] += t0.elapsed().as_secs_f64() * 1e6;
+            passes.1[1] += 1;
+        }
+        if let Some(enc) = drawn {
             let cpu = t0.elapsed().as_secs_f32() * 1000.0;
             state.renderer.queue().submit([enc.finish()]);
             if bench && state.start.elapsed().as_millis() >= bench_from {
@@ -393,6 +407,7 @@ pub fn run(mut args: Args) {
                     eprintln!("bench: GPU window pass avg {:.2} ms, shell pass avg {:.2} ms, whole frame avg {:.2} ms", g.iter().map(|x| x.0).sum::<f32>() / g.len() as f32, g.iter().map(|x| x.1).sum::<f32>() / g.len() as f32, g.iter().map(|x| x.2).sum::<f32>() / g.len() as f32);
                 }
                 eprintln!("bench: CPU (building the frame) avg {:.2} ms", cpus[warm..].iter().sum::<f32>() / cpus[warm..].len() as f32);
+                eprintln!("bench: a pass of the loop: update avg {:.0} us over {} passes, an unchanged desktop is found out in {:.0} us ({} passes)", passes.0[0] / passes.1[0].max(1) as f64, passes.1[0], passes.0[1] / passes.1[1].max(1) as f64, passes.1[1]);
                 eprintln!("bench: {} frames drawn, avg {:.2} ms, median {:.2}, p95 {:.2}, max {:.2}", t.len(), avg, t[t.len() / 2], t[t.len() * 95 / 100], t[t.len() - 1]);
                 eprintln!("bench: redrawn avg {:.0} kpx of {:.0} per frame", redrawn[warm..].iter().sum::<f32>() / redrawn[warm..].len() as f32, (w * h) as f32 / 1000.0);
             }

@@ -276,13 +276,22 @@ fn rebuild(n: Node, e: &ElementEdit) -> String {
 
 /// An SVG text drawn into `px` x `px` pixels (fitted and centred), straight alpha.
 pub fn rasterize(svg: &str, px: u32) -> Option<RgbaImage> {
-    use resvg::{tiny_skia, usvg};
-    let tree = usvg::Tree::from_str(svg, &usvg::Options::default()).ok()?;
+    rasterize_tree(&parse_tree(svg)?, px)
+}
+
+/// An SVG text read, to be drawn (in several sizes) by `rasterize_tree`.
+pub fn parse_tree(svg: &str) -> Option<resvg::usvg::Tree> {
+    resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default()).ok()
+}
+
+/// `rasterize` of an SVG that was read already.
+pub fn rasterize_tree(tree: &resvg::usvg::Tree, px: u32) -> Option<RgbaImage> {
+    use resvg::tiny_skia;
     let mut pm = tiny_skia::Pixmap::new(px, px)?;
     let size = tree.size();
     let sc = (px as f32 / size.width()).min(px as f32 / size.height());
     let (ox, oy) = ((px as f32 - size.width() * sc) / 2.0, (px as f32 - size.height() * sc) / 2.0);
-    resvg::render(&tree, tiny_skia::Transform::from_scale(sc, sc).post_translate(ox, oy), &mut pm.as_mut());
+    resvg::render(tree, tiny_skia::Transform::from_scale(sc, sc).post_translate(ox, oy), &mut pm.as_mut());
     let mut img = RgbaImage::from_raw(px, px, pm.take())?;
     for p in img.pixels_mut() {
         let a = p.0[3] as f32 / 255.0;

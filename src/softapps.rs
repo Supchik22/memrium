@@ -33,8 +33,14 @@ pub fn learned() -> Vec<String> {
 }
 
 pub fn is_soft(names: &[&str]) -> bool {
-    let l = learned();
-    names.iter().map(|n| norm(n)).any(|n| !n.is_empty() && l.contains(&n))
+    matches_learned(&learned(), names)
+}
+
+/// Is one of the program's names (desktop id, window class, executable) one of the `learned` ones? A window names itself
+/// by its app id, which is often the shorter family name of what the desktop file calls it (the app id `jetbrains-idea`
+/// of a program whose StartupWMClass is `jetbrains-idea-ce`), so a name that continues a learned one with `-` or `.` counts.
+fn matches_learned(learned: &[String], names: &[&str]) -> bool {
+    names.iter().map(|n| norm(n)).filter(|n| !n.is_empty()).any(|n| learned.iter().any(|l| n == *l || n.strip_prefix(l.as_str()).is_some_and(|rest| rest.starts_with('-') || rest.starts_with('.'))))
 }
 
 /// Remember a program as soft. True if it was new.
@@ -76,4 +82,22 @@ pub fn prepare(names: &[&str], scale: f32) -> bool {
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_window_class_that_continues_the_learned_app_id_matches() {
+        // the Flatpak of IntelliJ IDEA: the window says `jetbrains-idea`, the desktop file `jetbrains-idea-ce`
+        let learned = vec!["jetbrains-idea".to_string(), "lmms".to_string()];
+        assert!(matches_learned(&learned, &["com.jetbrains.IntelliJ-IDEA-Community", "jetbrains-idea-ce", "flatpak"]));
+        assert!(matches_learned(&learned, &["", "jetbrains-idea", ""]));
+        assert!(matches_learned(&learned, &["lmms.desktop"]));
+        // a different program whose name merely starts the same way does not
+        assert!(!matches_learned(&learned, &["jetbrains-ideal", "", ""]));
+        assert!(!matches_learned(&learned, &["org.kde.kate", "kate", "kate"]));
+        assert!(!matches_learned(&[], &["lmms"]));
+    }
 }

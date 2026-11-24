@@ -187,6 +187,10 @@ impl Notifications {
     /// How many unread ones came from the app with this desktop id / name (the sender says its name as it likes:
     /// "Telegram Desktop", "telegram-desktop", "org.telegram.desktop").
     pub fn unread_for(&self, key: &str, name: &str) -> usize {
+        // asked for every Dock item on every frame: with nothing unread there is nothing to compare names for
+        if !self.history.iter().any(|s| s.at > self.seen_at) {
+            return 0;
+        }
         let norm = |t: &str| t.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>();
         let (key, name) = (norm(key.trim_end_matches(".desktop")), norm(name));
         self.history

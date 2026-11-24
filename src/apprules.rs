@@ -78,6 +78,13 @@ pub fn gtk3_program(names: &[&str]) -> bool {
     names.iter().map(|n| n.to_lowercase()).any(|n| KNOWN.iter().any(|k| n == *k || n.ends_with(&format!(".{k}")) || n.starts_with(&format!("org.{k}.")) || n.contains(&format!(".{k}."))))
 }
 
+/// The JetBrains IDEs (IntelliJ IDEA, PyCharm, CLion, ...): their Java toolkit draws on Wayland whenever it finds a Wayland
+/// display, only at whole scales (no fractional scale support), so at 125% the compositor stretches it. They are sharp on X11,
+/// where the desktop's Xft.dpi gives them the exact scale.
+pub fn jetbrains_ide(names: &[&str]) -> bool {
+    names.iter().map(|n| n.to_lowercase()).any(|n| n.contains("jetbrains") || ["idea", "pycharm", "clion", "webstorm", "goland", "rider", "rustrover", "phpstorm", "datagrip", "android-studio"].iter().any(|k| n == *k || n.starts_with(&format!("{k}-")) || n.contains(&format!(".{k}"))))
+}
+
 /// Chromium, Chrome, Electron programs and the like: they take the same flags.
 pub fn is_chromium(exec: &str) -> bool {
     let e = exec.to_lowercase();
@@ -301,5 +308,13 @@ mod x11_tests {
         assert!(gtk3_program(&["", "Gimp", ""]));
         assert!(!gtk3_program(&["org.kde.kate", "", "kate"]));
         assert!(!gtk3_program(&["firefox", "", "firefox"]));
+    }
+
+    #[test]
+    fn known_jetbrains_ides() {
+        assert!(jetbrains_ide(&["com.jetbrains.IntelliJ-IDEA-Community", "jetbrains-idea-ce", "flatpak"]));
+        assert!(jetbrains_ide(&["", "jetbrains-pycharm", "pycharm.sh"]));
+        assert!(!jetbrains_ide(&["org.kde.kate", "kate", "kate"]));
+        assert!(!jetbrains_ide(&["org.videolan.VLC", "vlc", "vlc"]));
     }
 }

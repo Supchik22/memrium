@@ -300,6 +300,8 @@ pub struct ControlCenter {
     /// which list the edit mode's gallery shows: 0 = controls, 1 = desktop widgets
     pub(crate) gallery_tab: usize,
     media_tile: usize,
+    /// the media card shows its cover under its words (they stay white over the picture)
+    pictured: bool,
     wifi_tile: usize,
     bt_tile: usize,
     dark_tile: usize,
@@ -405,6 +407,7 @@ impl ControlCenter {
             hold: None,
             gallery_tab: 0,
             media_tile: FREE,
+            pictured: false,
             wifi_tile: FREE,
             bt_tile: FREE,
             dark_tile: FREE,
@@ -1012,6 +1015,7 @@ impl ControlCenter {
             self.media_tile = np;
         }
         let look = CcMediaStyle::from_name(spec.opt("look").unwrap_or(""));
+        self.pictured = false;
         // y positions below were designed for a card 154 px tall centred on 131; `y(v)` maps them to this tile
         let y = |v: f32| cy + v - 131.0;
         let short = |s: &str, n: usize| if s.chars().count() > n { format!("{}…", s.chars().take(n).collect::<String>()) } else { s.to_string() };
@@ -1066,6 +1070,7 @@ impl ControlCenter {
                 // white text and buttons read on any picture
                 match self.media.cover.filter(|_| self.media.present) {
                     Some(cell) => {
+                        self.pictured = true;
                         let mut art = Panel::app_icon(cx, cy, w.max(h), cell, 1.0);
                         // (asks for the cut to the tile's shape when the panels are made)
                         art.color2 = [0.0, 0.0, -1.0, 0.0];
@@ -1461,10 +1466,27 @@ impl ControlCenter {
         if tile == FREE {
             return bar.then_some(self.bar_under);
         }
+        let fettle = self.style == CcStyle::Fettle;
         match self.tiles[tile].kind {
             Kind::Light => Some(self.glass.tint),
             // the glass tiles: white ink on a dark backdrop, dark ink over a bright wallpaper
-            Kind::Dark if self.style == CcStyle::Mac => Some(self.dark_tint()),
+            Kind::Dark if matches!(self.style, CcStyle::Mac | CcStyle::Fettle) => Some(self.dark_tint()),
+            // Fettle's controls that are off are the same glass (on the accent sheet they are a dense pane: `dark_ink`)
+            Kind::Chip if fettle && self.sheet_glass < 0.5 => Some(self.dark_tint()),
+            // what is written on Fettle's sheet itself (a list's title, the battery line) reads against what is under it
+            Kind::Sheet if fettle && self.sheet_glass < 0.5 => match self.backing {
+                crate::theme::QuickBacking::Glass => Some(self.dark_tint()),
+                crate::theme::QuickBacking::Blur => Some(if self.dark { [0.05, 0.05, 0.07, 0.14] } else { [1.0, 1.0, 1.0, 0.10] }),
+                crate::theme::QuickBacking::None => Some([0.0, 0.0, 0.0, 0.0]),
+            },
+            // a row or a button inside a control reads as the control does
+            Kind::Clear if fettle => {
+                let main = self.owner.get(tile).and_then(|&o| self.spec_tile.get(o)).copied().filter(|&m| m < self.tiles.len() && m != tile)?;
+                let p = &self.tiles[main];
+                let t = &self.tiles[tile];
+                let inside = (t.c[0] - p.c[0]).abs() <= p.size[0] / 2.0 && (t.c[1] - p.c[1]).abs() <= p.size[1] / 2.0;
+                if inside && p.kind != Kind::Clear { self.under(main, bar) } else { None }
+            }
             _ => None,
         }
     }
@@ -1494,6 +1516,15 @@ impl ControlCenter {
             }
             _ => false,
         }
+    }
+
+    /// By day Fettle's white (`PURE`) on its glass reads as ink: dark over a pale wallpaper, white over a dark one. On
+    /// what is on (accent), on a cover and on the bar it stays white. The tint to read it against, or None.
+    fn day_pure(&self, tile: usize, bar: bool) -> Option<[f32; 4]> {
+        if self.style != CcStyle::Fettle || self.dark || bar || tile == FREE || (tile == self.media_tile && self.pictured) {
+            return None;
+        }
+        self.under(tile, bar)
     }
 
     fn is_ink(c: [f32; 3]) -> bool {
@@ -1651,6 +1682,10 @@ impl ControlCenter {
             let mut p = a.item;
             if p.params[1] == 5.0 && (p.tint[..3] == PURE || p.tint[..3] == WHITE) && self.dark_ink(a.tile) {
                 p.tint[..3].copy_from_slice(&INK);
+            } else if p.params[1] == 5.0 && p.tint[..3] == PURE {
+                if let Some(u) = self.day_pure(a.tile, bar) {
+                    p = p.auto_ink(u);
+                }
             }
             // the pill's glyph with no glass under it sits on the bar itself: it takes the bar's ink like the other widgets
             // (the glass tint says nothing about an opaque bar, and over a dark wallpaper it made the glyph white on a white bar)
@@ -1767,6 +1802,10 @@ impl ControlCenter {
             let mut l = a.item.clone();
             if (l.color == PURE || l.color == WHITE) && self.dark_ink(a.tile) {
                 l.color = INK;
+            } else if l.color == PURE {
+                if let Some(u) = self.day_pure(a.tile, bar) {
+                    l = l.auto_ink(u);
+                }
             }
             if Self::is_ink(l.color) {
                 if let Some(u) = self.under(a.tile, bar) {

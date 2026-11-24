@@ -57,8 +57,8 @@ struct Params {
     plate_span: f32,
     fade: f32,
     edge_sharp: f32,
-    _f1: f32,
-    _f2: f32,
+    tr_top: f32,
+    tr_span: f32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -419,7 +419,10 @@ fn put_layer(@builtin(global_invocation_id) g: vec3<u32>) {
     let i = g.y * p.n + g.x;
     let l = planes[at(p.src, i)];
     if l.w <= 0.0 { return; }
-    put(p.dst, i, l.rgb / l.w, clamp(l.w * p.opacity * p.see_through, 0.0, 1.0), p.blend);
+    // the translucency is a gradient down the layer: opaque at the top, see-through at the bottom
+    let row = clamp((f32(g.y) + 0.5 - p.tr_top) / p.tr_span, 0.0, 1.0);
+    let see = clamp(1.0 - p.see_through * row, 0.0, 1.0);
+    put(p.dst, i, l.rgb / l.w, clamp(l.w * p.opacity * see, 0.0, 1.0), p.blend);
 }
 
 // the bevel and the shade inside along the edge (src: the layer; src2: the bevel's slope; src3: the layer blurred)

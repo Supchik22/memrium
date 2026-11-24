@@ -12,10 +12,11 @@ fn show(n: &Node, depth: usize) {
 fn main() {
     let name = std::env::args().nth(1).unwrap();
     let doc = icondoc::saved_docs().into_iter().find(|d| d.name == name).expect("no such document");
-    println!("== {} margin={} tint={:?}", doc.name, doc.margin, doc.tint);
+    println!("== {} margin={} tint={:?} bases={:?}", doc.name, doc.margin, doc.icon_tint, doc.bases);
     for look in [Appearance::Default, Appearance::Dark] {
         let b = background_for(&doc, look);
         println!("plate {:?}: {:?} {:?} top={:?} bottom={:?} glass={:?}", look, b.shape, b.fill, b.top, b.bottom, b.glass);
     }
     for n in &doc.nodes { show(n, 0); }
+    if std::env::var("SVG").is_ok() { fn walk(n: &Node) { if let Kind::Layer(l) = &n.kind { println!("--- {}\n{}", n.name, l.svg); } for c in n.children() { walk(c); } } for n in &doc.nodes { walk(n); } }
 }

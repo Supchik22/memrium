@@ -70,6 +70,8 @@ pub struct DockWidget {
     hot: bool,
     /// icon centres of the last layout, for minimise animations
     centers: Vec<(String, [f32; 2])>,
+    sizes: Vec<f32>,
+    quiet: bool,
     /// per-widget overrides of the theme's `[dock]` values
     icon_size: Option<f32>,
     gap: Option<f32>,
@@ -138,6 +140,8 @@ impl DockWidget {
             pulse: Spring::new(0.0, 220.0, 0.3),
             hot: false,
             centers: Vec::new(),
+            sizes: Vec::new(),
+            quiet: false,
             icon_size: spec.num("icon_size"),
             gap: spec.num("gap"),
             magnify: spec.bool("magnify"),
@@ -342,7 +346,7 @@ impl Widget for DockWidget {
         let bloom = c.theme.dock.bloom.clamp(0.0, 1.0);
         if bloom > 0.01 {
             let spread = 0.18 + 0.30 * bloom;
-            for (slot, e) in slots.iter().zip(&self.entries) {
+            for (slot, e) in slots.iter().zip(&self.entries).filter(|(_, e)| !e.item.arriving) {
                 if let DockIcon::App(cell) = &e.item.icon {
                     let cy = slot.cy - self.lift * e.hover.x;
                     let size = (slot.s + e.press.x) * (1.0 + 2.0 * spread);
@@ -368,6 +372,7 @@ impl Widget for DockWidget {
             }
             let before = out.panels.len();
             match &e.item.icon {
+                _ if e.item.arriving => {}
                 DockIcon::Procedural(id, top, bot) => out.panels.push(Panel::icon(cx, cy, sz, *id, *top, *bot).shadow(0.22, 10.0, 4.0)),
                 DockIcon::App(cell) => crate::theme::push_app_icon(c.theme, &mut out.panels, cx, cy, sz, *cell, (0.20, 10.0, 4.0)),
             }
@@ -430,7 +435,7 @@ impl Widget for DockWidget {
             }
         }
         // tooltip with the app name above the hovered icon
-        if let Some(i) = slots.iter().position(|sl| inside(c.mouse, sl.rect)).filter(|_| self.tooltips && !c.vertical) {
+        if let Some(i) = slots.iter().position(|sl| inside(c.mouse, sl.rect)).filter(|_| self.tooltips && !self.quiet && !c.vertical) {
             let sl = slots[i];
             let name = &self.entries[i].item.name;
             let w = (c.measure)(name, 13.0, true) + 28.0;
@@ -483,6 +488,7 @@ impl Widget for DockWidget {
             e.press.update(dt);
         }
         c.theme.animations.step("dock", &mut self.pulse, dt);
+        self.sizes = slots.iter().map(|sl| sl.s).collect();
         self.centers = self.entries.iter().zip(&slots).map(|(e, sl)| (e.item.key.clone(), [sl.cx, sl.cy])).collect();
     }
 
@@ -504,6 +510,25 @@ impl Widget for DockWidget {
 
     fn item_center(&self, key: &str) -> Option<[f32; 2]> {
         self.centers.iter().find(|(k, _)| k == key).map(|(_, p)| *p)
+    }
+
+    fn item_size(&self, key: &str) -> Option<f32> {
+        let i = self.centers.iter().position(|(k, _)| k == key)?;
+        self.sizes.get(i).copied()
+    }
+
+    fn set_quiet(&mut self, on: bool) {
+        self.quiet = on;
+    }
+
+    fn landed(&mut self, key: &str) {
+        for e in self.entries.iter_mut().filter(|e| e.item.key == key) {
+            e.item.arriving = false;
+            // it dips as the icon hits it, and springs up
+            e.press.kick(-120.0);
+            e.bounce.kick(190.0);
+            self.pulse.kick(5.0);
+        }
     }
 
     fn item_at(&self, c: &BarCtx, r: [f32; 4]) -> Option<DockHover> {

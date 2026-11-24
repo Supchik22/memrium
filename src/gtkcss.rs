@@ -39,7 +39,7 @@ pub fn css(theme: &Theme) -> String {
     let card = if dark { c(41, 41, 41) } else { white };
     let popover = if dark { c(43, 43, 43) } else { white };
     let ctl = &theme.ui.controls;
-    let flat = ctl.look == ControlLook::Flat;
+    let flat = ctl.look != ControlLook::Keys;
     let depth = if flat { 0.0 } else { ctl.depth.clamp(0.0, 1.5) };
     let round = ctl.round.clamp(0.0, 1.0);
     // pills when the controls are round all the way, a squarer corner below

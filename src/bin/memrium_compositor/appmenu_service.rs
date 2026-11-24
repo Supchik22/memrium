@@ -11,7 +11,8 @@ use zbus::{
     interface,
 };
 
-type Menus = Arc<Mutex<HashMap<String, Vec<Menu>>>>;
+/// Each program's menus are shared, not copied: the bar asks for them several times every frame.
+type Menus = Arc<Mutex<HashMap<String, Arc<Vec<Menu>>>>>;
 
 struct Service {
     menus: Menus,
@@ -21,7 +22,7 @@ struct Service {
 impl Service {
     fn set(&self, app_id: String, rows: Vec<Row>) {
         if let Ok(mut m) = self.menus.lock() {
-            m.insert(app_id, unflatten(&rows));
+            m.insert(app_id, Arc::new(unflatten(&rows)));
         }
     }
 
@@ -129,8 +130,13 @@ impl AppMenuService {
     }
 
     /// The menus a program gave for its windows.
-    pub fn menus_of(&self, app_id: &str) -> Vec<Menu> {
+    pub fn menus_of(&self, app_id: &str) -> Arc<Vec<Menu>> {
         self.menus.lock().ok().and_then(|m| m.get(app_id).cloned()).unwrap_or_default()
+    }
+
+    /// Whether a program gave any menus (asked for every window, every frame: nothing is copied).
+    pub fn has_menus(&self, app_id: &str) -> bool {
+        self.menus.lock().is_ok_and(|m| m.get(app_id).is_some_and(|v| !v.is_empty()))
     }
 
     /// Tell the program an entry was chosen.
@@ -194,7 +200,7 @@ impl crate::state::State {
 
     /// Where the menus of window `w` come from (see `menu_target`).
     pub fn menu_target_of(&self, w: &crate::state::Win) -> Option<MenuTarget> {
-        if !self.appmenu.menus_of(&w.app_id).is_empty() {
+        if self.appmenu.has_menus(&w.app_id) {
             return Some(MenuTarget::App(w.app_id.clone()));
         }
         if let Some(x) = w.role.x11() {
@@ -212,16 +218,16 @@ impl crate::state::State {
     }
 
     /// The menus the window in front gave for the bar.
-    pub fn app_menus(&self) -> Vec<Menu> {
+    pub fn app_menus(&self) -> Arc<Vec<Menu>> {
         self.menus_at(self.menu_target())
     }
 
     /// The menus found at a target.
-    pub fn menus_at(&self, target: Option<MenuTarget>) -> Vec<Menu> {
+    pub fn menus_at(&self, target: Option<MenuTarget>) -> Arc<Vec<Menu>> {
         match target {
             Some(MenuTarget::App(id)) => self.appmenu.menus_of(&id),
             Some(MenuTarget::Dbus(xid)) => self.appmenu.bridge.menus_of(xid),
-            None => Vec::new(),
+            None => Arc::default(),
         }
     }
 
@@ -232,7 +238,7 @@ impl crate::state::State {
 
     /// The entries of the menu called `title` found at a target.
     pub fn menu_items_at(&self, target: Option<MenuTarget>, title: &str) -> Option<Vec<memrium_de::menu::MenuItem>> {
-        self.menus_at(target).into_iter().find(|m| m.title == title).map(|m| m.items.iter().map(to_item).collect())
+        self.menus_at(target).iter().find(|m| m.title == title).map(|m| m.items.iter().map(to_item).collect())
     }
 
     /// Open the search over the commands of the front program's menus: every entry that does something, with the menus it

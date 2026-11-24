@@ -22,6 +22,13 @@ pub const MAX_PANELS: usize = 576;
 /// app icon atlas: 16 x 16 cells of 128 px, 3 mip levels
 pub const APP_CELL: u32 = 128;
 const APP_COLS: u32 = 24;
+/// The last rows of the atlas hold "big" icons: an icon drawn larger than a cell gets a block of 2 x 2 cells (256 px, with
+/// its own mips), so it stays sharp without a bigger atlas. Blocks are numbered row by row; the shader finds them from
+/// the cell id `BIG_BASE + block`.
+const BIG_ROWS: u32 = 6;
+const BIG_PER_ROW: u32 = APP_COLS / 2;
+const BIG_BLOCKS: u32 = BIG_PER_ROW * (BIG_ROWS / 2);
+const BIG_BASE: u32 = 1000;
 const APP_MIPS: u32 = 3;
 const TEXT_W: u32 = 2048;
 const TEXT_H: u32 = 1024;
@@ -210,6 +217,28 @@ impl Panel {
             params: [0.0, 7.0, cell as f32, 0.0],
             tint: [1.0, 1.0, 1.0, opacity],
             ..Default::default()
+        }
+    }
+
+    /// An application icon deformed along `dir` (a unit vector) by `stretch` (along it, across it), the picture itself
+    /// not turned. The panel's rect is the box round the deformed picture; the shader finds the rest in `color2` and
+    /// `extra[3]` (kind 7 with a negative `fx[1]`, see glass.wgsl).
+    #[allow(clippy::too_many_arguments)]
+    pub fn flying_icon(at: [f32; 2], size: f32, cell: u32, opacity: f32, dir: [f32; 2], stretch: [f32; 2], pad: f32, mask: f32) -> Self {
+        let ([dx, dy], [along, across]) = (dir, stretch);
+        // the deformation is the symmetric matrix [xx xy; xy yy]
+        let xx = along * dx * dx + across * dy * dy;
+        let yy = along * dy * dy + across * dx * dx;
+        let xy = (along - across) * dx * dy;
+        let half = size / 2.0;
+        Self {
+            rect: [at[0], at[1], half * (xx.abs() + xy.abs()), half * (xy.abs() + yy.abs())],
+            params: [0.0, 7.0, cell as f32, mask],
+            tint: [1.0, 1.0, 1.0, opacity],
+            fx: [pad, -1.0, 0.0, 0.0],
+            color2: [dx, dy, along, across],
+            extra: [0.0, 0.0, 0.0, half],
+            clip: [0.0; 4],
         }
     }
 
@@ -453,6 +482,8 @@ fn lw_level(i: i32) -> f32 {
 const SLOTS: u64 = 128;
 /// slots 2..WINDOW_SLOTS: window items; SHELL_SLOT0.. : spatial groups of the shell; MIP_SLOT0.. : mip-chain passes
 const WINDOW_SLOTS: u64 = 96;
+/// How many draws of window items (frames, surfaces; a layer takes two) one frame holds: more are not drawn.
+pub const MAX_WINDOW_DRAWS: usize = WINDOW_SLOTS as usize - 2;
 const SHELL_SLOT0: u64 = 100;
 /// slots of the flat fills (`split_flat_fills`), up to SHELL_SLOT0
 const FILL_SLOT0: u64 = 96;
@@ -627,10 +658,10 @@ fn level_sources(img: &image::RgbaImage) -> Vec<image::RgbaImage> {
 /// The cell pictures of an icon, one per level of the chain, premultiplied (so bilinear filtering does not bleed colour from
 /// transparent pixels). `sources[mip]` is the picture of that level; `tile`: the style of the tile it sits on, or None to
 /// show the icon as it is.
-fn bake_icon(sources: &[image::RgbaImage], tile: Option<TileStyle>) -> Vec<image::RgbaImage> {
+fn bake_icon(sources: &[image::RgbaImage], tile: Option<TileStyle>, base: u32) -> Vec<image::RgbaImage> {
     (0..APP_MIPS as usize)
         .map(|mip| {
-            let cell = APP_CELL >> mip;
+            let cell = base >> mip;
             let src = &sources[mip.min(sources.len() - 1)];
             let mut level = match tile.as_ref() {
                 Some(t) => tile::bake(src, t, cell),
@@ -655,7 +686,26 @@ pub fn bake_app_icon(img: &image::RgbaImage, tile: Option<TileStyle>) -> BakedIc
 
 /// Like `bake_app_icon`, from a picture for each level (`apps::load_icon_levels`: an SVG drawn at every size).
 pub fn bake_app_icon_levels(sources: Vec<image::RgbaImage>, tile: Option<TileStyle>) -> BakedIcon {
-    BakedIcon { tile, levels: bake_icon(&sources, tile), sources }
+    BakedIcon { tile, levels: bake_icon(&sources, tile, APP_CELL), sources }
+}
+
+/// Like `bake_app_icon_levels` for a big icon (`apps::load_icon_levels_big`: 256, 128 and 64 px), see `Renderer::app_icon_big_insert`.
+pub fn bake_app_icon_levels_big(sources: Vec<image::RgbaImage>, tile: Option<TileStyle>) -> BakedIcon {
+    BakedIcon { tile, levels: bake_icon(&sources, tile, APP_CELL * 2), sources }
+}
+
+/// The icons that have a block of the atlas to themselves (see `BIG_ROWS`).
+#[derive(Default)]
+struct BigIcons {
+    /// small cell id -> (block, last drawn, key)
+    blocks: HashMap<u32, (u32, std::time::Instant, String)>,
+    free: Vec<u32>,
+    next: u32,
+    /// cells drawn larger than a cell and not (yet) big
+    want: std::collections::HashSet<u32>,
+    /// cells that found no block: not asked for again until one is free
+    denied: std::collections::HashSet<u32>,
+    sources: HashMap<String, Vec<image::RgbaImage>>,
 }
 
 /// A client's pixels on the GPU (BGRA8).
@@ -791,6 +841,7 @@ pub struct Renderer {
     app_next: u32,
     /// the icons as loaded, kept so they can be set on tiles (or taken off them) when the style changes
     app_sources: HashMap<String, Vec<image::RgbaImage>>,
+    big: RefCell<BigIcons>,
     icon_tile: Option<TileStyle>,
     text_fonts: TextFonts,
     text_atlas: wgpu::Texture,
@@ -1030,6 +1081,7 @@ impl Renderer {
             app_free: Vec::new(),
             app_next: 0,
             app_sources: HashMap::new(),
+            big: RefCell::new(BigIcons::default()),
             icon_tile: None,
             text_fonts: TextFonts::load(),
             dmabuf,
@@ -1295,6 +1347,22 @@ impl Renderer {
         true
     }
 
+    /// Changes when the texture behind `wall_surface` is another one.
+    pub fn wall_key(&self) -> u64 {
+        self.generation
+    }
+
+    /// The wallpaper as it lies on the whole canvas, as a picture to draw small about `width` logical px wide: the level
+    /// of its blur pyramid that is nearest above that size, so it does not shimmer. It follows the wallpaper by itself
+    /// (live ones too) until `wall_key` changes.
+    pub fn wall_surface(&self, width: f32) -> SurfaceTex {
+        let full = (self.wall.width(), self.wall.height());
+        let ratio = full.0 as f32 / (width * self.scale).max(1.0);
+        let level = (ratio.max(1.0).log2().floor() as u32).min(self.wall.mip_level_count() - 1);
+        let view = self.wall.create_view(&wgpu::TextureViewDescriptor { base_mip_level: level, mip_level_count: Some(1), ..Default::default() });
+        SurfaceTex { tex: self.wall.clone(), view, size: ((full.0 >> level).max(1), (full.1 >> level).max(1)), opaque: true, bind: RefCell::new((u64::MAX, None)), gen: Cell::new(0) }
+    }
+
     /// How many layers the wallpaper has (more than one: it is a parallax wallpaper).
     pub fn wall_layers(&self) -> u32 {
         self.wall_view[3] as u32
@@ -1400,6 +1468,7 @@ impl Renderer {
         self.app_free.clear();
         self.app_next = 0;
         self.app_sources.clear();
+        *self.big.borrow_mut() = BigIcons::default();
         self.touch();
     }
 
@@ -1592,7 +1661,7 @@ impl Renderer {
         if let Some(id) = self.app_free.pop() {
             return Some(id);
         }
-        (self.app_next < APP_COLS * APP_COLS).then(|| {
+        (self.app_next < APP_COLS * (APP_COLS - BIG_ROWS)).then(|| {
             self.app_next += 1;
             self.app_next - 1
         })
@@ -1602,7 +1671,8 @@ impl Renderer {
     pub fn app_icon_free(&mut self, key: &str) -> bool {
         match self.app_cells.remove(key) {
             Some(id) => {
-                        self.app_sources.remove(key);
+                self.app_sources.remove(key);
+                self.big_release(id);
                 self.app_free.push(id);
                 true
             }
@@ -1622,7 +1692,7 @@ impl Renderer {
         // (a new cell is used by panels that are new themselves, so the frame's diff sees them: no full redraw)
         let id = self.take_cell()?;
         let sources = level_sources(img);
-        self.write_icon_levels(id, &bake_icon(&sources, self.icon_tile.filter(|_| application)));
+        self.write_icon_levels(id, &bake_icon(&sources, self.icon_tile.filter(|_| application), APP_CELL));
         if application {
             // the sources are kept to bake the icon again when the tile style changes (at most a cell each: a bigger picture
             // would only waste memory)
@@ -1634,8 +1704,16 @@ impl Renderer {
 
     /// Put the icon in atlas cell `id`, on its tile when tiles are on.
     fn upload_icon_cell(&self, id: u32, img: &image::RgbaImage, application: bool) {
-        let levels = bake_icon(&level_sources(img), self.icon_tile.filter(|_| application));
+        let levels = bake_icon(&level_sources(img), self.icon_tile.filter(|_| application), APP_CELL);
         self.write_icon_levels(id, &levels);
+    }
+
+    /// `img` as the atlas shows an application icon: on its tile when tiles are on (straight alpha).
+    pub fn on_tile(&self, img: image::RgbaImage) -> image::RgbaImage {
+        match self.icon_tile {
+            Some(style) => tile::bake(&img, &style, APP_CELL),
+            None => img,
+        }
     }
 
     /// The tile the application icons sit on now (what `bake_app_icon` is asked for).
@@ -1673,6 +1751,101 @@ impl Renderer {
         }
     }
 
+    /// Put the levels of a big icon in the 2 x 2 cells of `block`.
+    fn write_big_levels(&self, block: u32, levels: &[image::RgbaImage]) {
+        let (bx, by) = ((block % BIG_PER_ROW) * 2, APP_COLS - BIG_ROWS + (block / BIG_PER_ROW) * 2);
+        for (mip, level) in levels.iter().enumerate() {
+            let mip = mip as u32;
+            let cell = APP_CELL >> mip;
+            let n = cell * 2;
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &self.app_atlas, mip_level: mip, origin: wgpu::Origin3d { x: bx * cell, y: by * cell, z: 0 }, aspect: wgpu::TextureAspect::All },
+                level.as_raw(),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * 4), rows_per_image: Some(n) },
+                wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+            );
+        }
+    }
+
+    /// Give back the block of the icon in small cell `id`, if it has one.
+    fn big_release(&mut self, id: u32) {
+        let mut big = self.big.borrow_mut();
+        if let Some((block, _, key)) = big.blocks.remove(&id) {
+            big.sources.remove(&key);
+            big.free.push(block);
+            big.denied.clear();
+        }
+        big.want.remove(&id);
+    }
+
+    /// The keys of the application icons that are drawn larger than their cell and have no big picture yet (each
+    /// is named once until it is drawn large again): the caller loads them at 256 px and passes them to `app_icon_big_insert`.
+    pub fn take_big_wanted(&mut self) -> Vec<String> {
+        let mut big = self.big.borrow_mut();
+        let ids: Vec<u32> = big.want.drain().collect();
+        ids.into_iter()
+            .filter(|id| !big.blocks.contains_key(id))
+            .filter_map(|id| self.app_cells.iter().find(|(k, &c)| c == id && self.app_sources.contains_key(*k)).map(|(k, _)| k.clone()))
+            .collect()
+    }
+
+    /// Put a big icon (`bake_app_icon_levels_big`) in a block of its own, for the icon called `key`. False when it was made
+    /// for another tile style than the current one (ask again). With no block free (or none unused for 5 s) it is dropped.
+    pub fn app_icon_big_insert(&mut self, key: &str, baked: BakedIcon) -> bool {
+        if baked.tile != self.icon_tile {
+            return false;
+        }
+        let Some(&id) = self.app_cells.get(key) else { return true };
+        let mut big = self.big.borrow_mut();
+        if big.blocks.contains_key(&id) {
+            return true;
+        }
+        let block = if let Some(b) = big.free.pop() {
+            Some(b)
+        } else if big.next < BIG_BLOCKS {
+            big.next += 1;
+            Some(big.next - 1)
+        } else {
+            // the block whose icon has not been drawn the longest, if that was a while ago
+            let stale = big.blocks.iter().min_by_key(|(_, v)| v.1).filter(|(_, v)| v.1.elapsed().as_secs() >= 5).map(|(&c, _)| c);
+            stale.and_then(|c| {
+                let (block, _, k) = big.blocks.remove(&c)?;
+                big.sources.remove(&k);
+                Some(block)
+            })
+        };
+        let Some(block) = block else {
+            big.denied.insert(id);
+            return true;
+        };
+        self.write_big_levels(block, &baked.levels);
+        big.sources.insert(key.to_string(), baked.sources);
+        big.blocks.insert(id, (block, std::time::Instant::now(), key.to_string()));
+        drop(big);
+        self.touch();
+        true
+    }
+
+    /// Panels of icons that have a big picture point at it; panels drawn larger than a cell are noted for `take_big_wanted`.
+    fn remap_big(&self, panels: &[Panel]) -> Option<Vec<Panel>> {
+        let mut big = self.big.borrow_mut();
+        let now = std::time::Instant::now();
+        let mut out: Option<Vec<Panel>> = None;
+        for (i, p) in panels.iter().enumerate() {
+            if p.params[1] != 7.0 || p.params[2] >= BIG_BASE as f32 {
+                continue;
+            }
+            let id = (p.params[2] + 0.5) as u32;
+            if let Some(b) = big.blocks.get_mut(&id) {
+                b.1 = now;
+                out.get_or_insert_with(|| panels.to_vec())[i].params[2] = (BIG_BASE + b.0) as f32;
+            } else if p.fx[3] <= 0.0 && 2.0 * p.rect[2] * self.scale > APP_CELL as f32 * 1.05 && !big.denied.contains(&id) {
+                big.want.insert(id);
+            }
+        }
+        out
+    }
+
     /// Set application icons on tiles (`Some`) or show them as they are (`None`); loaded icons are redone at once.
     pub fn set_icon_tile(&mut self, tile: Option<TileStyle>) {
         if self.icon_tile == tile {
@@ -1682,7 +1855,13 @@ impl Renderer {
         self.touch();
         for (key, &id) in &self.app_cells {
             if let Some(src) = self.app_sources.get(key) {
-                self.write_icon_levels(id, &bake_icon(src, tile));
+                self.write_icon_levels(id, &bake_icon(src, tile, APP_CELL));
+            }
+        }
+        let big = self.big.borrow();
+        for (block, _, key) in big.blocks.values() {
+            if let Some(src) = big.sources.get(key) {
+                self.write_big_levels(*block, &bake_icon(src, tile, APP_CELL * 2));
             }
         }
     }
@@ -1817,6 +1996,8 @@ impl Renderer {
                 eprintln!("renderer: {} panels in one draw, only the first {MAX_PANELS} are drawn", panels.len());
             }
         }
+        let remapped = self.remap_big(panels);
+        let panels: &[Panel] = remapped.as_deref().unwrap_or(panels);
         let n = panels.len().min(MAX_PANELS);
         // (the wallpaper pass reads its view from `grid`, which only the binned draws use otherwise)
         let grid = if slot == 0 { self.wall_view } else { [0.0; 4] };

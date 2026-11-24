@@ -388,6 +388,8 @@ pub struct BarCtx<'a> {
 pub struct Drawn {
     pub panels: Vec<Panel>,
     pub labels: Vec<Label>,
+    /// the highlights among the panels: which one, and its x and width (the bar draws one that glides in their place)
+    lights: Vec<(usize, f32, f32)>,
 }
 
 /// How a widget relates to the Quick Settings dropdown.
@@ -429,6 +431,14 @@ pub trait Widget {
     fn item_center(&self, _key: &str) -> Option<[f32; 2]> {
         None
     }
+    /// How big the Dock's icon of `key` is at the moment.
+    fn item_size(&self, _key: &str) -> Option<f32> {
+        None
+    }
+    /// No name tips for now (an icon is being carried over the Dock).
+    fn set_quiet(&mut self, _on: bool) {}
+    /// The icon that was on its way to the Dock's `key` is there.
+    fn landed(&mut self, _key: &str) {}
     /// The Dock item under the pointer and its rectangle on screen (for previews and the context menu).
     fn item_at(&self, _c: &BarCtx, _r: [f32; 4]) -> Option<DockHover> {
         None
@@ -441,6 +451,7 @@ pub trait Widget {
 
 pub(crate) fn highlight(c: &BarCtx, r: [f32; 4], out: &mut Drawn, x: f32, w: f32) {
     let ink = c.ink;
+    out.lights.push((out.panels.len(), x, w));
     out.panels.push(Panel::solid(x + w / 2.0, r[1] + r[3] / 2.0, w - 4.0, r[3] - 6.0, 7.0, ink, ink).flat().alpha(0.14));
 }
 
@@ -1464,8 +1475,41 @@ pub struct Bar {
     /// 1 = shown, 0 = slid off the screen (auto-hide), and how long it has had no reason to be shown
     reveal: Spring,
     away: f32,
+    /// the shell calls it up (something is being brought to it): an auto-hiding bar shows
+    called: bool,
+    /// the one highlight of the bar: its middle, its width, how much it shows (1 hovered, more while its menu is open)
+    light: [Spring; 3],
     /// the real screen's width as of the last update (the Dock's item positions are asked for without a context)
     screen_w: std::cell::Cell<f32>,
+}
+
+fn new_light() -> [Spring; 3] {
+    [Spring::new(0.0, 620.0, 0.78), Spring::new(0.0, 620.0, 0.85), Spring::new(0.0, 520.0, 1.0)]
+}
+
+/// How much the highlight shows under an open menu's name (1 under the pointer).
+const LIGHT_OPEN: f32 = 1.45;
+/// Farther than this it fades in where it is wanted: gliding the width of the screen would be a streak.
+const LIGHT_REACH: f32 = 240.0;
+
+/// Send the highlight to `to` (middle, width, strength), or away.
+fn aim_light(light: &mut [Spring; 3], to: Option<(f32, f32, f32)>) {
+    let Some((x, w, a)) = to else {
+        light[2].target = 0.0;
+        return;
+    };
+    let seen = light[2].x > 0.02;
+    if !seen || (light[0].x - x).abs() > LIGHT_REACH {
+        // it grows where it is, from a little narrower
+        for (s, v) in [(0, x), (1, w * 0.7)] {
+            light[s].x = v;
+            light[s].v = 0.0;
+        }
+        light[2].x = 0.0;
+    }
+    light[0].target = x;
+    light[1].target = w;
+    light[2].target = a;
 }
 
 impl Bar {
@@ -1488,7 +1532,7 @@ impl Bar {
                 }
             }
         }
-        Bar { index, widgets, origin, cfg: cfg.clone(), shift: Vec::new(), last_x: Vec::new(), reveal: Spring::new(1.0, 240.0, 0.9), away: 0.0, screen_w: std::cell::Cell::new(0.0) }
+        Bar { index, widgets, origin, cfg: cfg.clone(), shift: Vec::new(), last_x: Vec::new(), reveal: Spring::new(1.0, 240.0, 0.9), away: 0.0, called: false, light: new_light(), screen_w: std::cell::Cell::new(0.0) }
     }
 
     /// Rebuild when the config changed; widget state (the Dock's springs) survives otherwise.
@@ -1818,6 +1862,31 @@ impl Bar {
         Some(h)
     }
 
+    pub fn set_called(&mut self, on: bool) {
+        self.called = on;
+    }
+
+    /// Some of it can still be seen (an auto-hiding bar sliding away).
+    pub fn revealed(&self) -> bool {
+        self.reveal.x > 0.01
+    }
+
+    pub fn set_quiet(&mut self, on: bool) {
+        for (_, w) in &mut self.widgets {
+            w.set_quiet(on);
+        }
+    }
+
+    pub fn item_size(&self, key: &str) -> Option<f32> {
+        self.widgets.iter().find_map(|(_, w)| w.item_size(key))
+    }
+
+    pub fn landed(&mut self, key: &str) {
+        for (_, w) in &mut self.widgets {
+            w.landed(key);
+        }
+    }
+
     pub fn set_dock(&mut self, items: &[DockItem], focused: Option<&str>) {
         for (_, w) in &mut self.widgets {
             w.set_dock(items, focused);
@@ -1854,6 +1923,23 @@ impl Bar {
             let r = [p.x, f.rect[1], p.w, f.rect[3]];
             self.widgets[p.widget].1.update(dt, &c, r);
         }
+        self.update_light(dt, &c);
+    }
+
+    /// The highlight glides to what is under the pointer or has its menu open.
+    fn update_light(&mut self, dt: f32, c: &BarCtx) {
+        let lit = c.open.filter(|h| h.bar == self.index).map(|h| (h, LIGHT_OPEN)).or_else(|| c.hover.filter(|h| h.bar == self.index).map(|h| (h, 1.0)));
+        let to = lit.and_then(|(h, a)| {
+            let f = self.frame_for(c, true);
+            let p = f.placed.iter().find(|p| p.widget == h.widget)?;
+            let mut out = Drawn::default();
+            self.widgets[p.widget].1.draw(c, [p.x, f.rect[1], p.w, f.rect[3]], Some(h.part), &mut out);
+            out.lights.first().map(|&(_, x, w)| (x + w / 2.0, w, a))
+        });
+        aim_light(&mut self.light, to);
+        for s in &mut self.light {
+            c.theme.animations.step("menu_highlight", s, dt);
+        }
     }
 
     /// Decide whether an auto-hiding bar is shown, and glide it there.
@@ -1872,7 +1958,7 @@ impl Bar {
         let on_bar = self.reveal.x > 0.3 && m[0] >= full[0] - 4.0 && m[0] <= full[0] + full[2] + 4.0 && m[1] >= full[1] - up - 6.0 && m[1] <= full[1] + full[3] + 6.0;
         let menu = c.open.is_some_and(|o| o.bar == self.index);
         let covered = c.windows.iter().any(|r| r[0] < full[0] + full[2] && r[0] + r[2] > full[0] && r[1] < full[1] + full[3] && r[1] + r[3] > full[1]);
-        let show = at_edge || on_bar || menu || (self.cfg.autohide == AutoHide::Smart && !covered);
+        let show = self.called || at_edge || on_bar || menu || (self.cfg.autohide == AutoHide::Smart && !covered);
         if show {
             self.away = 0.0;
             self.reveal.target = 1.0;
@@ -1938,10 +2024,21 @@ impl Bar {
                 }
             }
         }
+        let under = out.panels.len();
         for pl in &f.placed {
             let lit = [c.open, c.hover].into_iter().flatten().find(|h| h.bar == self.index && h.widget == pl.widget).map(|h| h.part);
             let r = [pl.x, f.rect[1], pl.w, f.rect[3]];
             self.widgets[pl.widget].1.draw(&c, r, lit, &mut out);
+        }
+        // the widgets say where a highlight belongs; the one that glides there is drawn in their place
+        for (i, _, _) in std::mem::take(&mut out.lights).into_iter().rev() {
+            out.panels.remove(i);
+        }
+        let [x, w, a] = [self.light[0].x, self.light[1].x, self.light[2].x];
+        if a > 0.004 {
+            let k = a.min(1.0);
+            let (r, ink) = (f.rect, c.ink);
+            out.panels.insert(under, Panel::solid(x, r[1] + r[3] / 2.0, (w - 4.0).max(2.0), ((r[3] - 6.0) * (0.75 + 0.25 * k)).max(2.0), 7.0, ink, ink).flat().alpha(0.14 * a));
         }
         self.out_to_screen(&c, &f, &mut out);
         self.hide_effect(&c, &f, &mut out);
@@ -2076,6 +2173,26 @@ mod tests {
         for (kind, _) in CATALOG {
             assert!(create(&WidgetSpec::new(kind)).is_some(), "catalog widget {kind:?} does not build");
         }
+    }
+
+    #[test]
+    fn the_highlight_glides_between_names_and_goes_out_exactly() {
+        let mut l = new_light();
+        aim_light(&mut l, Some((200.0, 70.0, 1.0)));
+        assert_eq!((l[0].x, l[2].x), (200.0, 0.0), "it fades in where it is wanted");
+        for _ in 0..120 {
+            l.iter_mut().for_each(|s| s.update(1.0 / 60.0));
+        }
+        aim_light(&mut l, Some((290.0, 90.0, 1.0)));
+        l.iter_mut().for_each(|s| s.update(1.0 / 60.0));
+        assert!(l[0].x > 200.0 && l[0].x < 290.0, "on its way: {}", l[0].x);
+        aim_light(&mut l, Some((1500.0, 36.0, 1.0)));
+        assert_eq!(l[0].x, 1500.0, "it does not streak across the screen");
+        aim_light(&mut l, None);
+        for _ in 0..240 {
+            l.iter_mut().for_each(|s| s.update(1.0 / 60.0));
+        }
+        assert!(l.iter().all(|s| s.at_rest()), "at rest nothing is drawn again");
     }
 
     #[test]

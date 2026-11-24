@@ -1,11 +1,154 @@
 //! Widgets that sit on the desktop itself (clock, calendar, ...): which ones, and where.
+//!
+//! A widget is one of two things. The built-in ones (`KINDS`) are drawn by the shell. An *external* one is a program of
+//! its own (any chebrium app) that the shell starts, puts on the desktop under every window and moves for it: its
+//! `kind` is `ext:<name>` and its window's app id is `memrium.widget.<name>`. What the shell needs to know about one is
+//! in a small manifest, `<name>.toml`, found in `$MEMRIUM_WIDGETS`, `~/.local/share/memrium/widgets`, next to the shell
+//! (`../share/memrium/widgets`, or `widgets/manifests` of a checkout) or in `<data dir>/memrium/widgets`:
+//!
+//! ```toml
+//! label = "Disk"                  # shown when the widget is added (default: the name)
+//! exec  = "memrium_widget_disk"   # program: next to the shell, or on PATH (default: memrium_widget_<name>)
+//! size  = [270, 84]               # logical px, until the window has told its own
+//! card  = true                    # the shell draws the glass card behind it (default); false: the program is all of it
+//! ```
 
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+
+/// Start of the `kind` of a widget that is a program of its own.
+pub const EXT: &str = "ext:";
+/// Start of the app id of such a program's window.
+pub const APP_ID: &str = "memrium.widget.";
+
+/// An external widget, as its manifest describes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ext {
+    /// the manifest's file name without `.toml`: `kind` is `ext:<name>`
+    pub name: String,
+    pub label: String,
+    pub exec: String,
+    pub size: [f32; 2],
+    pub card: bool,
+}
+
+impl Ext {
+    pub fn kind(&self) -> String {
+        format!("{EXT}{}", self.name)
+    }
+
+    pub fn app_id(&self) -> String {
+        format!("{APP_ID}{}", self.name)
+    }
+}
+
+#[derive(Deserialize)]
+struct ExtFile {
+    label: Option<String>,
+    exec: Option<String>,
+    size: Option<[f32; 2]>,
+    card: Option<bool>,
+}
+
+/// A manifest's text for the widget `name` (`None`: not valid, or the name is not a plain word).
+pub fn parse_ext(name: &str, text: &str) -> Option<Ext> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return None;
+    }
+    let f: ExtFile = toml::from_str(text).ok()?;
+    let size = f.size.filter(|s| s[0] >= 40.0 && s[1] >= 20.0 && s[0] <= 4000.0 && s[1] <= 4000.0).unwrap_or([240.0, 120.0]);
+    Some(Ext {
+        name: name.to_string(),
+        label: f.label.filter(|l| !l.trim().is_empty()).unwrap_or_else(|| name.to_string()),
+        exec: f.exec.filter(|e| !e.trim().is_empty()).unwrap_or_else(|| format!("memrium_widget_{name}")),
+        size,
+        card: f.card.unwrap_or(true),
+    })
+}
+
+/// Where manifests are looked for, the first place that has a name winning.
+pub fn ext_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(list) = std::env::var_os("MEMRIUM_WIDGETS") {
+        dirs.extend(std::env::split_paths(&list));
+    }
+    let home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    dirs.extend(home.map(|h| h.join("memrium/widgets")));
+    // installed with the shell (`<prefix>/bin/..` has `share/memrium/widgets`), or a checkout run from `target/<profile>`
+    if let Some(bin) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+        dirs.push(bin.join("../share/memrium/widgets"));
+        dirs.push(bin.join("../../widgets/manifests"));
+    }
+    let system = std::env::var("XDG_DATA_DIRS").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    dirs.extend(system.split(':').filter(|d| !d.is_empty()).map(|d| Path::new(d).join("memrium/widgets")));
+    dirs
+}
+
+/// The manifests in `dirs`, by name.
+pub fn discover_in(dirs: &[PathBuf]) -> Vec<Ext> {
+    let mut out: Vec<Ext> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let mut found: Vec<Ext> = entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                let name = path.file_name()?.to_str()?.strip_suffix(".toml")?.to_string();
+                parse_ext(&name, &std::fs::read_to_string(&path).ok()?)
+            })
+            .collect();
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        for ext in found {
+            if !out.iter().any(|o| o.name == ext.name) {
+                out.push(ext);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    out
+}
+
+/// Every external widget installed.
+pub fn discover() -> Vec<Ext> {
+    discover_in(&ext_dirs())
+}
+
+static REGISTRY: RwLock<Vec<Ext>> = RwLock::new(Vec::new());
+
+/// Tell the rest of the library which external widgets exist (the shell does it once at start): `size` knows their sizes then.
+pub fn set_ext(list: Vec<Ext>) {
+    if let Ok(mut r) = REGISTRY.write() {
+        *r = list;
+    }
+}
+
+/// The external widgets known to the shell.
+pub fn ext_list() -> Vec<Ext> {
+    REGISTRY.read().map(|r| r.clone()).unwrap_or_default()
+}
+
+pub fn is_ext(kind: &str) -> bool {
+    kind.starts_with(EXT)
+}
+
+/// The external widget a `kind` names, if it is installed.
+pub fn ext_of(kind: &str) -> Option<Ext> {
+    let name = kind.strip_prefix(EXT)?;
+    REGISTRY.read().ok()?.iter().find(|e| e.name == name).cloned()
+}
+
+/// The widget a window's app id belongs to (`memrium.widget.disk` -> `disk`).
+pub fn name_of_app_id(app_id: &str) -> Option<&str> {
+    app_id.strip_prefix(APP_ID).filter(|n| !n.is_empty())
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeskWidget {
     pub kind: String,
+    /// which window is this one's (external widgets only: they are told apart by it, not by their place in the list)
+    pub uid: u64,
     /// size factor (the glass clock can be made bigger or smaller)
     pub scale: f32,
     /// look of the glass clock: 0 Jelly Glass, 1 Crystal, 2 Frosted
@@ -20,12 +163,15 @@ pub struct DeskWidget {
 
 impl Default for DeskWidget {
     fn default() -> Self {
-        DeskWidget { kind: String::new(), scale: 1.0, style: 0, h24: true, date: true, x: 0.0, y: 0.0 }
+        DeskWidget { kind: String::new(), uid: 0, scale: 1.0, style: 0, h24: true, date: true, x: 0.0, y: 0.0 }
     }
 }
 
 /// Names of the glass clock's looks.
 pub const CLOCK_STYLES: &[&str] = &["Jelly Glass", "Crystal", "Frosted"];
+
+/// Names of the calendar's looks: the month with today as a square, the date large beside a small month, and the old one.
+pub const CAL_STYLES: &[&str] = &["Modern", "Date", "Classic"];
 
 /// Names of the visualizer's looks.
 pub const VIZ_STYLES: &[&str] = &["Bars", "Mirror", "Dots"];
@@ -49,7 +195,7 @@ pub const KINDS: &[(&str, &str, [f32; 2])] = &[
 ];
 
 pub fn size(kind: &str) -> [f32; 2] {
-    KINDS.iter().find(|(k, ..)| *k == kind).map(|(.., s)| *s).unwrap_or([200.0, 100.0])
+    KINDS.iter().find(|(k, ..)| *k == kind).map(|(.., s)| *s).or_else(|| ext_of(kind).map(|e| e.size)).unwrap_or([200.0, 100.0])
 }
 
 /// Where a new widget goes: centred on `at`, kept inside `area` (x0, y0, x1, y1).
@@ -196,6 +342,43 @@ mod tests {
     use super::*;
 
     const AREA: [f32; 4] = [0.0, 0.0, 1000.0, 800.0];
+
+    #[test]
+    fn a_manifest_gives_defaults_for_what_it_leaves_out() {
+        let e = parse_ext("disk", "").unwrap();
+        assert_eq!((e.label.as_str(), e.exec.as_str(), e.size, e.card), ("disk", "memrium_widget_disk", [240.0, 120.0], true));
+        let e = parse_ext("disk", "label = \"Disk\"\nexec = \"my-disk\"\nsize = [270, 84]\ncard = false").unwrap();
+        assert_eq!((e.label.as_str(), e.exec.as_str(), e.size, e.card), ("Disk", "my-disk", [270.0, 84.0], false));
+        assert_eq!((e.kind().as_str(), e.app_id().as_str()), ("ext:disk", "memrium.widget.disk"));
+        // an absurd size is not taken, a name that is not a word is not a widget, nor is text that is not TOML
+        assert_eq!(parse_ext("disk", "size = [1, 1]").unwrap().size, [240.0, 120.0]);
+        assert!(parse_ext("../x", "").is_none() && parse_ext("", "").is_none() && parse_ext("a b", "").is_none());
+        assert!(parse_ext("disk", "label = ").is_none());
+    }
+
+    #[test]
+    fn manifests_are_found_by_name_and_the_first_folder_wins() {
+        let root = std::env::temp_dir().join(format!("memrium-widgets-test-{}", std::process::id()));
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("disk.toml"), "label = \"Disk A\"").unwrap();
+        std::fs::write(b.join("disk.toml"), "label = \"Disk B\"").unwrap();
+        std::fs::write(b.join("clock.toml"), "label = \"Clock\"").unwrap();
+        std::fs::write(b.join("notes.txt"), "not a manifest").unwrap();
+        std::fs::write(b.join("bad name.toml"), "").unwrap();
+        let found = discover_in(&[a, b, root.join("missing")]);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found.iter().map(|e| (e.name.as_str(), e.label.as_str())).collect::<Vec<_>>(), vec![("clock", "Clock"), ("disk", "Disk A")]);
+    }
+
+    #[test]
+    fn a_window_is_told_by_its_app_id() {
+        assert_eq!(name_of_app_id("memrium.widget.disk"), Some("disk"));
+        assert_eq!(name_of_app_id("memrium.widget."), None);
+        assert_eq!(name_of_app_id("memrium.files"), None);
+        assert!(is_ext("ext:disk") && !is_ext("disk"));
+    }
 
     #[test]
     fn the_keys_pick_the_mode() {

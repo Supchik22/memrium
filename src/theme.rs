@@ -32,6 +32,9 @@ pub enum DecoKind {
     Minimal,
     /// built from the parts in `WindowStyle::frame`
     Custom,
+    /// a title bar of a few pixels with small marks on it: what a maximized window keeps of its title bar when that is
+    /// left out (`MaxControls::Strip`). Put in by the compositor, never chosen in Settings.
+    Strip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -370,8 +373,82 @@ pub struct WindowStyle {
     /// the frame of a program's window follows how light or dark the program's own top edge is (a dark editor under a
     /// light title bar looks pasted on)
     pub adapt: bool,
-    /// a maximized window loses its title bar, and its close / minimize / zoom buttons go to the menu bar (`window-buttons`)
+    /// a maximized window loses its title bar; `max_controls` says where its close / minimize / zoom buttons go
     pub hide_title_max: bool,
+    /// what a maximized window without its title bar keeps of it
+    pub max_controls: MaxControls,
+    /// the look of the buttons of `max_controls` (the corner and the strip)
+    pub max_marks: MaxMarks,
+    /// the program's own icon in the title bar
+    pub title_icon: TitleIcon,
+    /// its size, px
+    pub title_icon_size: f32,
+}
+
+/// Where the buttons of a maximized window go when its title bar is left out (`WindowStyle::hide_title_max`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxControls {
+    /// into the menu bar (the `window-buttons` widget)
+    #[default]
+    MenuBar,
+    /// a magic corner of the window: the pointer in it brings the buttons out of the corner
+    Corner,
+    /// a title bar of a few pixels with small marks on it
+    Strip,
+}
+
+/// Which buttons the corner and the strip have, from the edge inwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkSet {
+    #[default]
+    Close,
+    CloseMin,
+    All,
+}
+
+/// The buttons of a maximized window without its title bar (`MaxControls::Corner` and `Strip`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaxMarks {
+    /// the window's corner (or the end of the strip) they are at
+    pub side: ButtonSide,
+    pub set: MarkSet,
+    /// `Bar` is a short line, `Flat` and `Dot` a dot that grows under the pointer
+    pub shape: ButtonShape,
+    pub colors: ButtonColors,
+    pub glyphs: GlyphShow,
+    /// size of one mark, px
+    pub size: f32,
+    /// height of the strip, px
+    pub strip: f32,
+    /// the side of the square in the window's corner that brings the buttons out, px
+    pub corner: f32,
+    /// a mark under the pointer grows
+    pub grow: bool,
+    /// the marks of the corner sit on a plate of glass (else on nothing)
+    pub plate: bool,
+}
+
+impl Default for MaxMarks {
+    fn default() -> Self {
+        MaxMarks { side: ButtonSide::Left, set: MarkSet::Close, shape: ButtonShape::Circle, colors: ButtonColors::Traffic, glyphs: GlyphShow::Hover, size: 12.0, strip: 4.0, corner: 18.0, grow: true, plate: true }
+    }
+}
+
+/// Where a window's title bar shows the program's icon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleIcon {
+    #[default]
+    None,
+    /// at the start of the title bar (after the buttons when they are on the left)
+    Left,
+    /// at the end of the title bar
+    Right,
+    /// just before the title
+    Title,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -408,6 +485,10 @@ pub enum ButtonShape {
     Flat,
     /// as tall as the bar and hardly wider than tall (Windows)
     Bar,
+    /// a capsule, wider than tall
+    Pill,
+    /// a small dot that grows into the button under the pointer
+    Dot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -501,7 +582,7 @@ impl FrameStyle {
 impl Default for WindowStyle {
     fn default() -> Self {
         // a macOS window: large round corners, a wide soft shadow with a darker tight one under it, a faint hairline
-        WindowStyle { decoration: DecoKind::Mac, radius: 16.0, titlebar: 40.0, title_align: TitleAlign::Center, shadow: [0.30, 56.0, 20.0], shadow_idle: [0.16, 36.0, 10.0], shadow_near: [0.16, 5.0], shadow_near_idle: [0.10, 4.0], outline: 0.12, outline_light: 0.12, client_opacity: 0.80, frame: FrameStyle::default(), max_gap: 0.0, adapt: true, hide_title_max: false }
+        WindowStyle { decoration: DecoKind::Mac, radius: 16.0, titlebar: 40.0, title_align: TitleAlign::Center, shadow: [0.30, 56.0, 20.0], shadow_idle: [0.16, 36.0, 10.0], shadow_near: [0.16, 5.0], shadow_near_idle: [0.10, 4.0], outline: 0.12, outline_light: 0.12, client_opacity: 0.80, frame: FrameStyle::default(), max_gap: 0.0, adapt: true, hide_title_max: false, max_controls: MaxControls::MenuBar, max_marks: MaxMarks::default(), title_icon: TitleIcon::None, title_icon_size: 16.0 }
     }
 }
 
@@ -701,6 +782,58 @@ pub enum ControlLook {
     #[default]
     Keys,
     Flat,
+    /// clear glass with a bright rim
+    Glass,
+    /// matte frosted plates with a soft shadow
+    Frost,
+    /// clay pressed up from the surface
+    Soft,
+    /// ink and paper
+    Mono,
+    /// white pearls with the accent where something is on
+    Pearl,
+}
+
+/// The idea added to the Mono controls (see `chebrium::style::Flavour`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlFlavour {
+    #[default]
+    Plain,
+    Halo,
+    Edge,
+    Aurora,
+    Line,
+    Tint,
+}
+
+impl ControlFlavour {
+    pub fn flavour(self) -> chebrium::style::Flavour {
+        use chebrium::style::Flavour as F;
+        match self {
+            ControlFlavour::Plain => F::Plain,
+            ControlFlavour::Halo => F::Halo,
+            ControlFlavour::Edge => F::Edge,
+            ControlFlavour::Aurora => F::Aurora,
+            ControlFlavour::Line => F::Line,
+            ControlFlavour::Tint => F::Tint,
+        }
+    }
+}
+
+impl ControlLook {
+    pub fn kind(self) -> chebrium::style::ControlKind {
+        use chebrium::style::ControlKind as K;
+        match self {
+            ControlLook::Keys => K::Keys,
+            ControlLook::Flat => K::Flat,
+            ControlLook::Glass => K::Glass,
+            ControlLook::Frost => K::Frost,
+            ControlLook::Soft => K::Soft,
+            ControlLook::Mono => K::Mono,
+            ControlLook::Pearl => K::Pearl,
+        }
+    }
 }
 
 /// The look of switches, sliders and segmented pickers, for the shell and for every Chebrium program.
@@ -718,17 +851,19 @@ pub struct ControlStyle {
     pub multi: bool,
     /// 0 .. 1: slim (flattened) switches and sliders .. the full round size
     pub thickness: f32,
+    /// the idea added to the Mono controls
+    pub flavour: ControlFlavour,
 }
 
 impl Default for ControlStyle {
     fn default() -> Self {
-        ControlStyle { look: ControlLook::Keys, depth: 1.0, round: 1.0, accent_pick: false, multi: false, thickness: 0.0 }
+        ControlStyle { look: ControlLook::Keys, depth: 1.0, round: 1.0, accent_pick: false, multi: false, thickness: 0.0, flavour: ControlFlavour::Plain }
     }
 }
 
 impl ControlStyle {
     pub fn to_chebrium(&self) -> chebrium::style::Controls {
-        chebrium::style::Controls { kind: if self.look == ControlLook::Flat { chebrium::style::ControlKind::Flat } else { chebrium::style::ControlKind::Keys }, depth: self.depth, round: self.round, accent_pick: self.accent_pick, multi: self.multi, thickness: self.thickness }
+        chebrium::style::Controls { kind: self.look.kind(), depth: self.depth, round: self.round, accent_pick: self.accent_pick, multi: self.multi, thickness: self.thickness, flavour: self.flavour.flavour() }
     }
 }
 
@@ -794,6 +929,7 @@ pub const EFFECTS: &[(&str, &str, &str)] = &[
     ("Shell", "launcher", "Launcher"),
     ("Shell", "control_center", "Fettle"),
     ("Shell", "dock", "Dock (magnify, bounce)"),
+    ("Shell", "launch_flight", "Launch (icon flies)"),
     ("Shell", "notifications", "Notifications"),
     ("Shell", "popups", "Previews and tooltips"),
     ("Shell", "session_start", "Desktop slides in at the start"),
@@ -1257,14 +1393,18 @@ pub fn push_app_icon(theme: &Theme, out: &mut Vec<crate::renderer::Panel>, cx: f
             g.fx[1] = g.fx[1].min(0.04);
             // the clear plates of the editor: a pale frost in the light look, a smoky one in the dark
             g.tint = style.plate_tint(dark);
+            if style == crate::iconrender::ClearStyle::Auto {
+                // (a negative dispersion tells the shader this plate goes from frost to smoky glass over a light picture)
+                g.fx[1] = if dark { -2.0 } else { -1.0 };
+            }
             g.extra = [shadow.0, shadow.1, shadow.2, theme.glass.saturation];
             out.push(g);
             let mut ic = Panel::app_icon(cx, cy, size, cell, 1.0);
             ic.params[0] = r;
             ic.params[3] = 0.0;
             if style.follows_backdrop() {
-                // the symbol takes the colour of what is behind it (glass.wgsl, kind 7)
-                ic.fx[1] = 2.0;
+                // the symbol takes the colour of what is behind it (glass.wgsl, kind 7); 3: and turns white over a light picture
+                ic.fx[1] = if style == crate::iconrender::ClearStyle::Auto { 3.0 } else { 2.0 };
                 ic.color2 = [0.0, 0.0, 0.0, if dark { 1.0 } else { 0.0 }];
             }
             out.push(ic);
@@ -1346,13 +1486,13 @@ pub fn appearance_text(theme: &Theme, language: &str) -> String {
         DecoKind::Win11 => "win11",
         DecoKind::Aero => "aero",
         DecoKind::Gnome => "gnome",
-        DecoKind::Minimal => "minimal",
+        DecoKind::Minimal | DecoKind::Strip => "minimal",
         DecoKind::Custom => "mac",
     };
     let g = &theme.glass;
     format!(
-        "# written by the shell: the look the programs follow\ndark = {}\naccent = [{:.4}, {:.4}, {:.4}]\nradius = {:.1}\ntitlebar = {:.1}\ndecoration = \"{deco}\"\nopacity = {:.3}\nlanguage = \"{}\"\nglass_tint = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_border = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_look = [{:.3}, {:.3}, {:.3}, {:.4}, {:.3}, {:.3}, {:.3}]\ncontrols = \"{}\"\ncontrols_depth = {:.3}\ncontrols_round = {:.3}\ncontrols_accent = {}\ncontrols_multi = {}\ncontrols_thickness = {:.3}\nmenubar = {}\npopup_opacity = {:.3}\nslide = {}\ncorners = {:.3}\n",
-        theme.dark, theme.accent[0], theme.accent[1], theme.accent[2], theme.window.radius, theme.window.titlebar, theme.window.client_opacity, language, g.tint[0], g.tint[1], g.tint[2], g.tint[3], g.border[0], g.border[1], g.border[2], g.border[3], g.blur, g.refraction, g.bezel, g.dispersion, g.rim, g.rim_sharp, g.saturation, if theme.ui.controls.look == ControlLook::Flat { "flat" } else { "keys" }, theme.ui.controls.depth, theme.ui.controls.round, theme.ui.controls.accent_pick, theme.ui.controls.multi, theme.ui.controls.thickness, theme.bars.iter().any(|b| b.left.iter().chain(&b.center).chain(&b.right).any(|w| w.kind == "app-menu")), theme.ui.popup_opacity, theme.ui.slide, theme.ui.corners
+        "# written by the shell: the look the programs follow\ndark = {}\naccent = [{:.4}, {:.4}, {:.4}]\nradius = {:.1}\ntitlebar = {:.1}\ndecoration = \"{deco}\"\nopacity = {:.3}\nlanguage = \"{}\"\nglass_tint = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_border = [{:.4}, {:.4}, {:.4}, {:.4}]\nglass_look = [{:.3}, {:.3}, {:.3}, {:.4}, {:.3}, {:.3}, {:.3}]\ncontrols = \"{}\"\ncontrols_depth = {:.3}\ncontrols_round = {:.3}\ncontrols_accent = {}\ncontrols_multi = {}\ncontrols_thickness = {:.3}\ncontrols_flavour = \"{}\"\nmenubar = {}\npopup_opacity = {:.3}\nslide = {}\ncorners = {:.3}\n{}",
+        theme.dark, theme.accent[0], theme.accent[1], theme.accent[2], theme.window.radius, theme.window.titlebar, theme.window.client_opacity, language, g.tint[0], g.tint[1], g.tint[2], g.tint[3], g.border[0], g.border[1], g.border[2], g.border[3], g.blur, g.refraction, g.bezel, g.dispersion, g.rim, g.rim_sharp, g.saturation, theme.ui.controls.look.kind().name(), theme.ui.controls.depth, theme.ui.controls.round, theme.ui.controls.accent_pick, theme.ui.controls.multi, theme.ui.controls.thickness, theme.ui.controls.flavour.flavour().name(), theme.bars.iter().any(|b| b.left.iter().chain(&b.center).chain(&b.right).any(|w| w.kind == "app-menu")), theme.ui.popup_opacity, theme.ui.slide, theme.ui.corners, crate::decor::chrome_text(theme)
     )
 }
 

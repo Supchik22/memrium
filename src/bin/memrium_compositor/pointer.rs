@@ -64,6 +64,9 @@ impl State {
         if self.file_drag.as_ref().is_some_and(|d| d.active) {
             return Some(Shape::Grabbing);
         }
+        if let Some(shape) = self.ov_cursor() {
+            return Some(shape);
+        }
         if self.menu.open {
             return None;
         }

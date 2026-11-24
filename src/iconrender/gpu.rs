@@ -58,7 +58,9 @@ struct Params {
     plate_span: f32,
     fade: f32,
     edge_sharp: f32,
-    _fpad: [f32; 2],
+    // the rows the layer being drawn covers: its first row and how many (for the gradient of the translucency)
+    tr_top: f32,
+    tr_span: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -126,7 +128,9 @@ fn gpu() -> Option<&'static Gpu> {
 
 impl Gpu {
     fn new() -> Result<Gpu, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        // (Vulkan only: the dedicated card is reached through it, and asking for every backend loads the GL drivers too,
+        // which takes longer than drawing a whole icon)
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..Default::default() });
         // the dedicated card, when the preset would start a program there now (gpu.toml: on mains power by default)
         if !crate::gpu::wants_discrete(crate::gpu::load_mode(), None, crate::gpu::on_ac()) {
             return Err("the GPU preset keeps the dedicated card off now".into());
@@ -209,6 +213,8 @@ struct Job {
     data: Vec<u8>,
     peaks: u32,
     mask_off: Option<u32>,
+    /// the first and the one past the last row the layer being drawn covers
+    layer_rows: [f32; 2],
 }
 
 impl Job {
@@ -285,7 +291,9 @@ impl Job {
             pk,
             blend: p.blend.code() as u32,
             opacity: p.opacity,
-            see_through: if glass { 1.0 - 0.85 * g.translucency } else { 1.0 },
+            see_through: if glass { TRANSLUCENT_FADE * g.translucency } else { 0.0 },
+            tr_top: self.layer_rows[0],
+            tr_span: (self.layer_rows[1] - self.layer_rows[0]).max(1.0),
             glow: g.glow,
             shadow_amount: g.shadow_amount,
             bevel: g.bevel,
@@ -364,6 +372,9 @@ fn draw_node(r: &mut Renderer, job: &mut Job, node: &Node, doc: &IconDoc, app: A
     if !p.visible {
         return;
     }
+    if let Kind::Layer(_) = node.kind {
+        p.glass = r.dressed(p.glass, app);
+    }
     p.glass = if r.flat { primitive_glass(p.glass) } else { r.tune.apply(p.glass) };
     let nf = job.n as f32;
     match &node.kind {
@@ -372,7 +383,16 @@ fn draw_node(r: &mut Renderer, job: &mut Job, node: &Node, doc: &IconDoc, app: A
             let m = (nf * k).round().clamp(8.0, 2.0 * nf.max(512.0)) as u32;
             let img = r.raster(layer, &p, doc, app, m);
             let off = [p.offset[0] * nf * place.scale + place.off[0], p.offset[1] * nf * place.scale + place.off[1]];
-            job.place(&img, [(nf / 2.0 + off[0] - m as f32 / 2.0).round() as i32, (nf / 2.0 + off[1] - m as f32 / 2.0).round() as i32], LAYER);
+            let at = [(nf / 2.0 + off[0] - m as f32 / 2.0).round() as i32, (nf / 2.0 + off[1] - m as f32 / 2.0).round() as i32];
+            job.place(&img, at, LAYER);
+            // the rows the picture covers, for the gradient of the translucency
+            let w = img.width() as usize;
+            let raw = img.as_raw();
+            let filled = |y: usize| raw[y * w * 4..(y + 1) * w * 4].chunks_exact(4).any(|c| c[3] != 0);
+            if let Some(y0) = (0..img.height() as usize).find(|&y| filled(y)) {
+                let y1 = (y0..img.height() as usize).rev().find(|&y| filled(y)).unwrap_or(y0) + 1;
+                job.layer_rows = [(y0 as i32 + at[1]) as f32, (y1 as i32 + at[1]) as f32];
+            }
             let tune = r.tune;
             job.composite(ACC + level, &p, masked, &tune);
         }
@@ -414,20 +434,11 @@ pub(super) fn render(r: &mut Renderer, doc: &IconDoc, app: Appearance, n: u32) -
     if px * 16 * planes_count as u64 > g.max_buffer {
         return None;
     }
-    let nn = n as usize;
-    let mut job = Job { n, ops: Vec::new(), data: Vec::new(), peaks: 0, mask_off: None };
+    let mut job = Job { n, ops: Vec::new(), data: Vec::new(), peaks: 0, mask_off: None, layer_rows: [0.0, 1.0] };
     let fit = plate_fit();
     let bg = r.plate_for(doc, app);
     if bg.shape != Shape::None {
-        let key = (bg.shape.code(), n, r.tune.corner.to_bits());
-        let mask = match r.masks.get(&key) {
-            Some(m) => m.clone(),
-            None => {
-                let m = Arc::new(shape_mask(bg.shape, nn, n as f32 * fit / 2.0, r.tune.corner));
-                r.masks.insert(key, m.clone());
-                m
-            }
-        };
+        let mask = r.mask(bg.shape, n);
         job.mask_off = Some(0);
         job.data.extend_from_slice(bytemuck::cast_slice(&mask[..]));
     }
@@ -469,15 +480,24 @@ fn run(g: &Gpu, r: &mut Renderer, job: Job, planes_count: u32) -> Option<RgbaIma
         if r.gpu.len() >= 6 {
             r.gpu.clear();
         }
+        let since = std::time::Instant::now();
         let old = r.gpu.remove(&n);
         let planes = old.as_ref().map_or(planes_count, |c| c.planes_count.max(planes_count));
         r.gpu.insert(n, Ctx::new(g, n, planes, data_len, ops, peaks));
+        prof(1, since);
     }
     let ctx = r.gpu.get(&n)?;
     // one render on the card at a time: the threads draw their layers' SVGs side by side, but several waiting on the card
-    // at once spin in the driver and slow everything down
+    // at once spin in the driver and slow everything down. A thread of a theme build does not wait for its turn: its
+    // picture is drawn on the processor (None), which is as quick as the wait is when every thread wants the card
     static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = match TURN.try_lock() {
+        Ok(turn) => turn,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) if r.share_card => return None,
+        Err(std::sync::TryLockError::WouldBlock) => TURN.lock().unwrap_or_else(|e| e.into_inner()),
+    };
+    let since = std::time::Instant::now();
     debug_assert_eq!(ctx.n, n);
     let mut params = vec![0u8; (ops * g.align) as usize];
     for (k, (_, p)) in job.ops.iter().enumerate() {
@@ -517,5 +537,6 @@ fn run(g: &Gpu, r: &mut Renderer, job: Job, planes_count: u32) -> Option<RgbaIma
     rx.recv().ok()?.ok()?;
     let img = RgbaImage::from_raw(n, n, slice.get_mapped_range().to_vec());
     ctx.read.unmap();
+    prof(2, since);
     img
 }

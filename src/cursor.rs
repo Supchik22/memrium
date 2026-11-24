@@ -4,6 +4,8 @@
 use resvg::tiny_skia::{Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, Path, PathBuilder, Pixmap, Point, SpreadMode, Stroke, Transform};
 use serde::{Deserialize, Serialize};
 
+pub mod custom;
+
 /// What the pointer looks like.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Shape {
@@ -209,30 +211,101 @@ pub enum ResizeStyle {
 /// The shapes the Mouse settings page shows, in its order (a preview's key names a shape by its place here).
 pub const PREVIEW_SHAPES: [Shape; 12] = [Shape::Default, Shape::Pointer, Shape::Text, Shape::Grab, Shape::Move, Shape::ResizeEw, Shape::ResizeNs, Shape::ResizeNwse, Shape::Wait, Shape::Progress, Shape::NotAllowed, Shape::Crosshair];
 
-/// The atlas key of a settings preview of `shape` (one of `PREVIEW_SHAPES`) with these preferences and accent: it carries
-/// all of them, so whoever draws it needs nothing else, and a changed choice is a new key.
-pub fn preview_key(shape: Shape, prefs: &CursorPrefs, accent: [f32; 3]) -> String {
-    let i = PREVIEW_SHAPES.iter().position(|s| *s == shape).unwrap_or(0);
-    format!("cursor:{i}:{},{},{}:{}", accent[0], accent[1], accent[2], serde_json::to_string(prefs).unwrap_or_default())
+/// What can be previewed: the page's strip, and the shapes only a shape editor shows.
+fn previewed() -> impl Iterator<Item = Shape> {
+    PREVIEW_SHAPES.into_iter().chain([Shape::Grabbing, Shape::Copy])
 }
 
-/// The picture behind a `preview_key` (straight RGBA, 64 px), and the part of the key that names the preferences (shared
+/// The key of a settings preview of `shape` (one of `previewed`) in the place `slot` of the page, with these
+/// preferences and accent: it carries all that the picture depends on and nothing else (so moving the arrow's slider
+/// leaves the text beam's preview alone), so whoever draws it needs nothing else, and a changed choice is a new key.
+pub fn preview_key(slot: &str, shape: Shape, prefs: &CursorPrefs, accent: [f32; 3]) -> String {
+    let i = previewed().position(|s| s == shape).unwrap_or(0);
+    let json = serde_json::to_string(&drawn_prefs(shape, prefs)).unwrap_or_default();
+    format!("cursor:{slot}:{i}:{},{},{}:{json}", accent[0], accent[1], accent[2])
+}
+
+/// The name of a preview's place (the atlas cell that is drawn over when the key in that place changes): the page has
+/// only so many places, however long a slider is dragged.
+pub fn preview_slot(key: &str) -> &str {
+    key.match_indices(':').nth(1).map_or(key, |(at, _)| &key[..at])
+}
+
+/// The preferences that `shape`'s picture depends on; the rest are the defaults.
+fn drawn_prefs(shape: Shape, p: &CursorPrefs) -> CursorPrefs {
+    let mut k = CursorPrefs { look: p.look, outline: p.outline, edge: p.edge, shadow: p.shadow, ..CursorPrefs::default() };
+    if p.look == CursorLook::Custom {
+        (k.hue, k.sat, k.bright) = (p.hue, p.sat, p.bright);
+    }
+    let links = shape == Shape::Pointer;
+    if links {
+        k.hand = p.hand;
+    }
+    if matches!(shape, Shape::Default | Shape::Copy | Shape::Progress) || (links && p.hand == HandStyle::Arrow) {
+        k.arrow = p.arrow;
+        if p.custom.arrow.on {
+            k.custom.arrow = custom::Made { last: None, ..p.custom.arrow.clone() };
+            k.arrow = ArrowStyle::Classic;
+        }
+    } else if matches!(shape, Shape::Pointer | Shape::Grab | Shape::Grabbing) && p.custom.hand.on {
+        k.custom.hand = custom::Made { last: None, ..p.custom.hand.clone() };
+    }
+    if shape == Shape::Text {
+        if p.custom.beam.on {
+            k.custom.beam = custom::Made { last: None, ..p.custom.beam.clone() };
+        } else {
+            k.beam = p.beam;
+        }
+    }
+    if matches!(shape, Shape::Move | Shape::ResizeEw | Shape::ResizeNs | Shape::ResizeNesw | Shape::ResizeNwse) {
+        if p.custom.resize.on {
+            k.custom.resize = custom::Made { last: None, ..p.custom.resize.clone() };
+        } else {
+            k.resize = p.resize;
+        }
+    }
+    if matches!(shape, Shape::Wait | Shape::Progress) {
+        k.busy = p.busy;
+        if p.custom.busy.on {
+            k.custom.busy = custom::Made { last: None, ..p.custom.busy.clone() };
+        }
+    }
+    if matches!(shape, Shape::Crosshair | Shape::NotAllowed) && p.custom.signs.on {
+        k.custom.signs = custom::Made { last: None, ..p.custom.signs.clone() };
+    }
+    k
+}
+
+/// A preview is a picture of `PREVIEW_PX` with the design box `PREVIEW_BOX` of it across, in the middle: every shape
+/// shows at one scale, and a custom one has room to reach out of the box.
+const PREVIEW_PX: u32 = 128;
+const PREVIEW_BOX: u32 = 108;
+
+/// The picture behind a `preview_key` (straight RGBA, 128 px), and the part of the key that names the preferences (shared
 /// by every shape of one look). None for any other key.
 pub fn preview_image(key: &str) -> Option<(image::RgbaImage, String)> {
-    let rest = key.strip_prefix("cursor:")?;
+    let (_slot, rest) = key.strip_prefix("cursor:")?.split_once(':')?;
     let (i, rest) = rest.split_once(':')?;
     let (accent, json) = rest.split_once(':')?;
-    let shape = *PREVIEW_SHAPES.get(i.parse::<usize>().ok()?)?;
+    let shape = previewed().nth(i.parse::<usize>().ok()?)?;
     let a: Vec<f32> = accent.split(',').filter_map(|v| v.parse().ok()).collect();
     let accent = [*a.first()?, *a.get(1)?, *a.get(2)?];
     let prefs: CursorPrefs = serde_json::from_str(json).ok()?;
     // a still moment of the busy ones; drawn at the plane's largest size and shown smaller: sharp on a scaled monitor
-    let c = render_with(shape, 64, &prefs, accent, 0.3);
-    let mut img = image::RgbaImage::new(c.size, c.size);
-    for (px, p) in img.pixels_mut().zip(&c.argb) {
+    let c = draw(shape, PREVIEW_BOX, PREVIEW_PX, &prefs, accent, 0.3);
+    // the pointer's point where the box in the middle has it, or as near to that as the picture allows
+    let k = PREVIEW_BOX as f32 / DESIGN;
+    let margin = ((PREVIEW_PX - PREVIEW_BOX) / 2) as i32;
+    let spare = PREVIEW_PX.saturating_sub(c.size) as i32;
+    let place = |at: f32, hot: i32| (margin + (at * k).round() as i32 - hot).clamp(0, spare);
+    let at = pieces(shape, 0.3, &prefs).1;
+    let (ox, oy) = (place(at.0, c.hot.0), place(at.1, c.hot.1));
+    let mut img = image::RgbaImage::new(PREVIEW_PX, PREVIEW_PX);
+    for (n, p) in c.argb.iter().enumerate() {
         let (a, r, g, b) = ((p >> 24) & 255, (p >> 16) & 255, (p >> 8) & 255, p & 255);
         let un = |v: u32| if a == 0 { 0 } else { ((v * 255 + a / 2) / a).min(255) as u8 };
-        *px = image::Rgba([un(r), un(g), un(b), a as u8]);
+        let (x, y) = ((n as u32 % c.size) as i32 + ox, (n as u32 / c.size) as i32 + oy);
+        img.put_pixel(x as u32, y as u32, image::Rgba([un(r), un(g), un(b), a as u8]));
     }
     Some((img, rest.to_string()))
 }
@@ -287,6 +360,9 @@ pub struct CursorPrefs {
     pub morph: bool,
     /// how fast that change runs, times the usual pace (0.5 .. 2)
     pub morph_speed: f32,
+    /// the shapes built with the sliders (a table of its own, and last: see `custom` for why it is not a style name)
+    #[serde(skip_serializing_if = "custom::CustomShapes::is_default")]
+    pub custom: custom::CustomShapes,
 }
 
 impl Default for CursorPrefs {
@@ -319,6 +395,7 @@ impl Default for CursorPrefs {
             launch_speed: 1.0,
             morph: true,
             morph_speed: 1.0,
+            custom: Default::default(),
         }
     }
 }
@@ -344,6 +421,41 @@ pub struct CursorImage {
 const BOUNCE_PERIOD: f32 = 0.72;
 const BOUNCE_AIR: f32 = 0.8;
 const BOUNCE_SQUASH: f32 = 0.14;
+/// How far into its animation the launch icon starts when it has just dropped in (see `launch_flight`): a hopping one
+/// starts where it hits the ground, so the squash is the landing. Seconds at the preferences' speed.
+pub fn landing_time(prefs: &CursorPrefs) -> f32 {
+    match prefs.launch_anim {
+        LaunchAnim::Bounce => BOUNCE_PERIOD * BOUNCE_AIR / prefs.launch_speed.clamp(0.25, 3.0),
+        LaunchAnim::Pulse | LaunchAnim::Still => 0.0,
+    }
+}
+
+/// All that the busy cursor covers over one turn: the launch icon stands by this, not by the turning picture (whose edge
+/// moves by a pixel or two, and the icon would twitch with it). `at(phase)` draws the cursor.
+pub fn busy_envelope(at: impl Fn(f32) -> CursorImage) -> CursorImage {
+    const STEPS: usize = 16;
+    let mut all = at(0.0);
+    for i in 1..STEPS {
+        let img = at(i as f32 / STEPS as f32);
+        if img.size == all.size {
+            for (a, p) in all.argb.iter_mut().zip(&img.argb) {
+                if p >> 24 > *a >> 24 {
+                    *a = *p;
+                }
+            }
+        }
+    }
+    all
+}
+
+/// Where the launch icon stands at rest beside the cursor `img`: its middle from the pointer's point, and its side
+/// (logical px).
+pub fn launch_spot(img: &CursorImage, prefs: &CursorPrefs, scale: f32, max: u32) -> ([f32; 2], f32) {
+    let lay = LaunchLayout::new(img, prefs, scale, max);
+    let (cx, cy) = (lay.left + lay.side / 2.0, lay.bottom - lay.side / 2.0);
+    ([(cx - img.hot.0 as f32) / scale, (cy - img.hot.1 as f32) / scale], lay.side / scale)
+}
+
 /// One breath of the `Pulse` launch icon, seconds at speed 1.
 const PULSE_PERIOD: f32 = 1.1;
 
@@ -447,9 +559,11 @@ impl LaunchLayout {
 
 /// The starting program's icon beside the busy cursor `img` (like KDE's launch feedback): right of the cursor's visible
 /// shape, so that it never covers it, `launch_dx` / `launch_dy` logical px away, moving as `launch_anim` says `t` seconds
-/// after the launch. `scale`: device px per logical px; `max`: the largest picture the cursor plane takes.
-pub fn with_launch_icon(img: CursorImage, icon: &image::RgbaImage, prefs: &CursorPrefs, scale: f32, t: f32, max: u32) -> CursorImage {
-    let lay = LaunchLayout::new(&img, prefs, scale, max);
+/// after the launch. `scale`: device px per logical px; `max`: the largest picture the cursor plane takes; `rest`: what the
+/// cursor covers over a turn (`busy_envelope`), the icon stands by it.
+pub fn with_launch_icon(img: CursorImage, rest: Option<&CursorImage>, icon: &image::RgbaImage, prefs: &CursorPrefs, scale: f32, t: f32, max: u32) -> CursorImage {
+    // (one of another size was drawn for another zoom: "shake to find")
+    let lay = LaunchLayout::new(rest.filter(|r| r.size == img.size).unwrap_or(&img), prefs, scale, max);
     let size = lay.size as usize;
     let (ox, oy) = lay.origin;
     let n = img.size as usize;
@@ -508,6 +622,20 @@ enum Piece {
     Line(Path, f32),
     /// a closed shape filled with the accent colour (whatever the look)
     Accent(Path),
+    /// not drawn: room that a fitted shape keeps free whatever its phase or angle is
+    Room(Path),
+}
+
+impl Piece {
+    /// The piece moved by `tf`, which must not scale it (a line keeps its width).
+    fn moved(self, tf: Transform) -> Option<Piece> {
+        Some(match self {
+            Piece::Fill(p) => Piece::Fill(p.transform(tf)?),
+            Piece::Line(p, w) => Piece::Line(p.transform(tf)?, w),
+            Piece::Accent(p) => Piece::Accent(p.transform(tf)?),
+            Piece::Room(p) => Piece::Room(p.transform(tf)?),
+        })
+    }
 }
 
 const DESIGN: f32 = 32.0;
@@ -575,15 +703,24 @@ fn arrow_points(style: ArrowStyle, k: f32, dx: f32, dy: f32) -> Vec<(f32, f32)> 
 
 /// An hourglass of half-height 11.5 around (`cx`, `cy`), scaled by `s`; `p` (0 .. 1) is the sand running down, then the turn over.
 fn hourglass(cx: f32, cy: f32, s: f32, p: f32) -> Vec<Piece> {
+    hourglass_sized(cx, cy, s, p, [1.0; 3])
+}
+
+/// The hourglass made narrower or wider, lower or taller, its lines thinner or thicker (`size`).
+fn hourglass_sized(cx: f32, cy: f32, s: f32, p: f32, size: [f32; 3]) -> Vec<Piece> {
+    let [sx, sy, sw] = size;
     let (fall, flip) = if p < 0.8 { (p / 0.8, 0.0) } else { (1.0, (p - 0.8) / 0.2) };
     let ease = flip * flip * (3.0 - 2.0 * flip);
     let (sin, cos) = (ease * std::f32::consts::PI).sin_cos();
-    let pt = |x: f32, y: f32| (cx + s * (x * cos - y * sin), cy + s * (x * sin + y * cos));
+    let pt = |x: f32, y: f32| {
+        let (x, y) = (x * sx, y * sy);
+        (cx + s * (x * cos - y * sin), cy + s * (x * sin + y * cos))
+    };
     let mut v = Vec::new();
     let glass = [pt(-7.0, -10.5), pt(7.0, -10.5), pt(1.0, 0.0), pt(7.0, 10.5), pt(-7.0, 10.5), pt(-1.0, 0.0)];
-    v.extend(poly(&glass).map(|g| Piece::Line(g, 1.7)));
+    v.extend(poly(&glass).map(|g| Piece::Line(g, 1.7 * sw)));
     for y in [-11.5f32, 11.5] {
-        v.extend(line(pt(-9.0, y), pt(9.0, y)).map(|l| Piece::Line(l, 2.2)));
+        v.extend(line(pt(-9.0, y), pt(9.0, y)).map(|l| Piece::Line(l, 2.2 * sw)));
     }
     // the sand above (a cone that sinks) and below (a pile that grows)
     let top = 9.0 * (1.0 - fall);
@@ -597,7 +734,7 @@ fn hourglass(cx: f32, cy: f32, s: f32, p: f32) -> Vec<Piece> {
         v.extend(poly(&[pt(-hw(9.8), 9.8), pt(hw(9.8), 9.8), pt(hw(9.8 - pile), 9.8 - pile), pt(-hw(9.8 - pile), 9.8 - pile)]).map(Piece::Fill));
     }
     if fall < 1.0 && flip == 0.0 {
-        v.extend(line(pt(0.0, -0.6), pt(0.0, 9.8 - pile)).map(|l| Piece::Line(l, 0.9)));
+        v.extend(line(pt(0.0, -0.6), pt(0.0, 9.8 - pile)).map(|l| Piece::Line(l, 0.9 * sw)));
     }
     v
 }
@@ -642,6 +779,9 @@ fn hand_pieces(boxes: &[[f32; 5]; 6]) -> Vec<Piece> {
 
 /// The pieces of a shape in the 32 x 32 design box, the pointer's point, and the angle (degrees) to turn it by.
 fn pieces(shape: Shape, phase: f32, prefs: &CursorPrefs) -> (Vec<Piece>, (f32, f32), f32) {
+    if custom::is_custom(shape, prefs) {
+        return custom::pieces(shape, phase, prefs);
+    }
     let arrow = prefs.arrow;
     let mut v: Vec<Piece> = Vec::new();
     let mut hot = (16.0, 16.0);
@@ -829,22 +969,96 @@ pub fn render(shape: Shape, box_px: u32, look: CursorLook, accent: [f32; 3], pha
 
 /// Like `render`, with all the preferences: arrow shape, outline, busy style, custom hue.
 pub fn render_with(shape: Shape, box_px: u32, prefs: &CursorPrefs, accent: [f32; 3], phase: f32) -> CursorImage {
+    draw(shape, box_px, CURSOR_MAX, prefs, accent, phase)
+}
+
+/// The largest cursor picture: what every cursor plane and Xcursor client takes.
+const CURSOR_MAX: u32 = 64;
+
+/// `render_with` into a picture of at most `limit` px a side (Settings' previews are bigger than any cursor).
+fn draw(shape: Shape, box_px: u32, limit: u32, prefs: &CursorPrefs, accent: [f32; 3], phase: f32) -> CursorImage {
     if shape == Shape::Hidden {
-        let n = box_px.clamp(12, 64);
+        let n = box_px.clamp(12, limit);
         return CursorImage { size: n, hot: (0, 0), argb: vec![0u32; (n * n) as usize] };
     }
     let (pieces, hot, turn) = pieces(shape, phase, prefs);
-    paint(shape, &pieces, hot, turn, false, box_px, prefs, accent, phase)
+    let place = if custom::is_custom(shape, prefs) { Place::Fitted } else { Place::Boxed };
+    paint(shape, &pieces, hot, turn, place, box_px, limit, prefs, accent, phase)
+}
+
+/// How a drawing is put into its picture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    /// as it lies in the design box (the built-in shapes)
+    Boxed,
+    /// the same, moved by the fraction of a pixel that rounding the pointer's point to a whole pixel loses, so that a
+    /// point that glides (a morph's in-between pictures) stays exactly under the pointer instead of wobbling by half a pixel
+    Snapped,
+    /// snapped, and all of it inside, wherever it reaches (a custom shape): see `Fit`
+    Fitted,
+}
+
+/// Where a drawing goes so that none of it, its outline included, is cut off.
+#[derive(Clone, Copy, Debug)]
+struct Fit {
+    /// the picture's side: the box, or more where the drawing reaches out of it
+    size: u32,
+    /// below 1 only when not even the largest picture holds the drawing
+    shrink: f32,
+    /// the pointer's point in the picture, whole px
+    hot: (f32, f32),
+}
+
+impl Fit {
+    /// `hot`: the pointer's point in design units; `k`: device px per design unit in a box of `n` px; `reach`: how far
+    /// the outline goes beyond the drawing, design units.
+    fn new(pieces: &[Piece], hot: (f32, f32), k: f32, n: u32, limit: u32, reach: f32, shadow: f32) -> Fit {
+        let (mut lo, mut hi) = ([hot.0, hot.1], [hot.0, hot.1]);
+        for p in pieces {
+            let (b, out) = match p {
+                Piece::Fill(path) | Piece::Accent(path) | Piece::Room(path) => (path.bounds(), 0.0),
+                Piece::Line(path, w) => (path.bounds(), w / 2.0),
+            };
+            lo = [lo[0].min(b.left() - out), lo[1].min(b.top() - out)];
+            hi = [hi[0].max(b.right() + out), hi[1].max(b.bottom() + out)];
+        }
+        // (a third of a pixel for the soft edge; another whole one is what rounding the point may take)
+        const EDGE: f32 = 0.3;
+        let edge = EDGE + reach * k;
+        let span = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(0.01) * k;
+        let shrink = ((limit as f32 - 1.0 - 2.0 * edge) / span).clamp(0.05, 1.0);
+        // the shadow lies down and to the right, and blurs a little to every side
+        let (before, after) = if shadow > 0.0 {
+            let (down, blur) = ((1.2 * k).round(), 2.0 * (1.1 * k).round().max(1.0));
+            ((blur - (0.6 * k).round()).max(0.0), blur + down)
+        } else {
+            (0.0, 0.0)
+        };
+        let h = [hot.0, hot.1];
+        let mut at = [0.0f32; 2];
+        let mut size = n;
+        for a in 0..2 {
+            let (left, right) = ((h[a] - lo[a]) * k * shrink + edge, (hi[a] - h[a]) * k * shrink + edge);
+            let first = left.ceil();
+            let last = (limit as f32 - right).floor().max(first);
+            at[a] = (h[a] * k).round().max((left + before).ceil()).clamp(first, last);
+            size = size.max(((at[a] + right + after).ceil() as u32).min(limit));
+        }
+        Fit { size, shrink, hot: (at[0], at[1]) }
+    }
 }
 
 /// Paint `pieces` (design units) into a box of `box_px` device px, in the colours `shape` has with these preferences,
-/// turned by `turn` degrees around the box's middle. `snap`: move the drawing by the fraction of a pixel that rounding
-/// the pointer's point to a whole pixel loses, so that a point that glides (a morph's in-between pictures) stays exactly
-/// under the pointer instead of wobbling by half a pixel.
+/// turned by `turn` degrees around the box's middle, and placed as `place` says in a picture of at most `limit` px.
 #[allow(clippy::too_many_arguments)]
-fn paint(shape: Shape, pieces: &[Piece], hot: (f32, f32), turn: f32, snap: bool, box_px: u32, prefs: &CursorPrefs, accent: [f32; 3], phase: f32) -> CursorImage {
+fn paint(shape: Shape, pieces: &[Piece], hot: (f32, f32), turn: f32, place: Place, box_px: u32, limit: u32, prefs: &CursorPrefs, accent: [f32; 3], phase: f32) -> CursorImage {
     let look = prefs.look;
-    let n = box_px.clamp(12, 64);
+    let box_n = box_px.clamp(12, limit);
+    let k = box_n as f32 / DESIGN;
+    // (a turned shape is given room all round, so it is measured as it lies before the turn)
+    let fit = (place == Place::Fitted).then(|| Fit::new(pieces, hot, k, box_n, limit, prefs.outline.clamp(0.0, 3.0).max(if look == CursorLook::Hollow { 1.8 } else { 0.0 }), prefs.shadow));
+    let n = fit.map_or(box_n, |f| f.size);
+    let shrink = fit.map_or(1.0, |f| f.shrink);
     let mut argb = vec![0u32; (n * n) as usize];
     let mut out = CursorImage { size: n, hot: (0, 0), argb: Vec::new() };
     const INK: [f32; 3] = [0.05, 0.06, 0.08];
@@ -877,7 +1091,6 @@ fn paint(shape: Shape, pieces: &[Piece], hot: (f32, f32), turn: f32, snap: bool,
         out.argb = argb;
         return out;
     };
-    let k = n as f32 / DESIGN;
     // the hot spot, turned like the picture
     let (mut hx, mut hy) = hot;
     if turn != 0.0 {
@@ -886,17 +1099,20 @@ fn paint(shape: Shape, pieces: &[Piece], hot: (f32, f32), turn: f32, snap: bool,
         hx = 16.0 + dx * a.cos() - dy * a.sin();
         hy = 16.0 + dx * a.sin() + dy * a.cos();
     }
-    let (hpx, hpy) = ((hx * k).round(), (hy * k).round());
-    let tf = if turn != 0.0 { Transform::from_rotate_at(turn, 16.0, 16.0).post_scale(k, k) } else { Transform::from_scale(k, k) };
-    let tf = if snap { tf.post_translate(hpx - hx * k, hpy - hy * k) } else { tf };
+    let (hpx, hpy) = fit.map_or(((hx * k).round(), (hy * k).round()), |f| f.hot);
+    let ks = k * shrink;
+    let tf = if turn != 0.0 { Transform::from_rotate_at(turn, 16.0, 16.0).post_scale(ks, ks) } else { Transform::from_scale(ks, ks) };
+    let tf = if place == Place::Boxed { tf } else { tf.post_translate(hpx - hx * ks, hpy - hy * ks) };
     let mut paint = Paint { anti_alias: true, ..Paint::default() };
-    let outline = prefs.outline.clamp(0.0, 3.0);
+    // (a shrunk shape keeps the outline's width)
+    let outline = prefs.outline.clamp(0.0, 3.0) / shrink;
     // the outlines first, so that touching pieces (a hand's fingers) do not draw lines through each other
     paint.set_color(color(edge, 0.92));
     for p in pieces.iter().filter(|_| outline > 0.0 || hollow) {
         let (path, w) = match p {
             Piece::Fill(path) | Piece::Accent(path) => (path, if hollow { 3.6 } else { outline * 2.0 }),
             Piece::Line(path, w) => (path, w + if hollow { 2.0 } else { outline * 2.0 }),
+            Piece::Room(_) => continue,
         };
         let stroke = Stroke { width: w, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
         pm.stroke_path(path, &paint, &stroke, tf, None);
@@ -911,6 +1127,7 @@ fn paint(shape: Shape, pieces: &[Piece], hot: (f32, f32), turn: f32, snap: bool,
     }
     for p in pieces {
         match p {
+            Piece::Room(_) => {}
             Piece::Fill(path) if hollow => {
                 let stroke = Stroke { width: 1.6, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
                 pm.stroke_path(path, &paint, &stroke, tf, None);
@@ -1094,15 +1311,19 @@ fn pose_of(shape: Shape, prefs: &CursorPrefs) -> Option<Pose> {
         return None;
     }
     let plain = Pose::Arrow([1.0, 0.0, 0.0], 0.0, 0.0);
+    let hand = |base: &Hand| {
+        let (boxes, hot) = if prefs.custom.hand.on { prefs.custom.hand.shape.hand(base, shape == Shape::Pointer) } else { *base };
+        Pose::Hand(boxes, hot)
+    };
     Some(match shape {
         Shape::Default => plain,
         Shape::Pointer if prefs.hand == HandStyle::Arrow => plain,
         Shape::Copy => Pose::Arrow([0.85, 1.0, 1.0], 1.0, 0.0),
         // (a rainbow busy cursor has colours of its own: it cross-fades)
         Shape::Progress if prefs.busy != BusyStyle::Rainbow => Pose::Arrow([0.8, 1.0, 1.0], 0.0, 1.0),
-        Shape::Pointer => Pose::Hand(HAND_POINTER.0, HAND_POINTER.1),
-        Shape::Grab => Pose::Hand(HAND_GRAB.0, HAND_GRAB.1),
-        Shape::Grabbing => Pose::Hand(HAND_GRABBING.0, HAND_GRABBING.1),
+        Shape::Pointer => hand(&HAND_POINTER),
+        Shape::Grab => hand(&HAND_GRAB),
+        Shape::Grabbing => hand(&HAND_GRABBING),
         Shape::ResizeEw => Pose::Resize(0.0),
         Shape::ResizeNs => Pose::Resize(90.0),
         Shape::ResizeNesw => Pose::Resize(-45.0),
@@ -1130,6 +1351,17 @@ impl Pose {
         })
     }
 
+    /// How this pose is put into its picture: a custom shape's is fitted like the shape itself.
+    fn place(&self, prefs: &CursorPrefs) -> Place {
+        let c = &prefs.custom;
+        let fitted = match self {
+            Pose::Resize(_) => c.resize.on,
+            Pose::Hand(..) => c.hand.on,
+            Pose::Arrow(_, _, busy) => c.arrow.on || (c.busy.on && *busy > 0.12),
+        };
+        if fitted { Place::Fitted } else { Place::Snapped }
+    }
+
     /// The pieces, the pointer's point and the turn, as `pieces` gives them for a shape.
     fn pieces(&self, phase: f32, prefs: &CursorPrefs) -> (Vec<Piece>, (f32, f32), f32) {
         match self {
@@ -1137,7 +1369,15 @@ impl Pose {
                 let (v, hot, _) = pieces(Shape::ResizeEw, phase, prefs);
                 (v, hot, *angle)
             }
+            Pose::Hand(boxes, hot) if prefs.custom.hand.on => {
+                let (v, hot) = prefs.custom.hand.shape.finish(boxes, *hot);
+                (v, hot, 0.0)
+            }
             Pose::Hand(boxes, hot) => (hand_pieces(boxes), *hot, 0.0),
+            Pose::Arrow(at, plus, busy) if self.place(prefs) == Place::Fitted => {
+                let (v, hot) = custom::arrow_family(*at, *plus, *busy, phase, prefs);
+                (v, hot, 0.0)
+            }
             Pose::Arrow([k, dx, dy], plus, busy) => {
                 let mut v: Vec<Piece> = poly(&arrow_points(prefs.arrow, *k, *dx, *dy)).map(Piece::Fill).into_iter().collect();
                 // the badges grow from their middles (too small to see: left out, rather than a speck of outline)
@@ -1348,7 +1588,7 @@ impl Morph {
                     Start::Pose(a, b) => match a.lerp(b, ease_spring(u)) {
                         Some(p) => {
                             let (pieces, hot, turn) = p.pieces(phase, prefs);
-                            paint(Shape::Default, &pieces, hot, turn, true, box_px, prefs, accent, phase)
+                            paint(Shape::Default, &pieces, hot, turn, p.place(prefs), box_px, CURSOR_MAX, prefs, accent, phase)
                         }
                         None => picture(),
                     },
@@ -1612,13 +1852,39 @@ mod tests {
                             let (ox, oy) = (lay.origin.0 as f32, lay.origin.1 as f32);
                             let room = max >= 128 || box_px <= 35;
                             assert!(!room || x + ox >= -0.01 && y + oy >= -0.01 && x + w + ox <= lay.size as f32 + 0.01 && y + h + oy <= lay.size as f32 + 0.01, "{box_px} {anim:?} {max} t {t}: {:?} outside {}", [x + ox, y + oy, w, h], lay.size);
-                            let pic = with_launch_icon(render_with(Shape::Progress, box_px, &prefs, [0.1, 0.5, 1.0], 0.3), &icon, &prefs, scale, t, max);
+                            let pic = with_launch_icon(render_with(Shape::Progress, box_px, &prefs, [0.1, 0.5, 1.0], 0.3), None, &icon, &prefs, scale, t, max);
                             // the hot spot stays put while the icon moves
                             assert_eq!(*hot.get_or_insert(pic.hot), pic.hot);
                             if i > 20 {
                                 break;
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_landing_icon_meets_the_one_in_the_cursor() {
+        for speed in [0.25, 1.0, 2.4] {
+            for anim in [LaunchAnim::Bounce, LaunchAnim::Pulse, LaunchAnim::Still] {
+                let prefs = CursorPrefs { launch_speed: speed, launch_anim: anim, ..CursorPrefs::default() };
+                let (lift, sx, sy, a) = launch_pose(&prefs, landing_time(&prefs));
+                assert!(lift < 1e-4 && (sx - 1.0).abs() < 1e-4 && (sy - 1.0).abs() < 1e-4 && (a - 1.0).abs() < 1e-4, "{anim:?} {speed}");
+                for scale in [1.0f32, 1.25, 2.0] {
+                    let box_px = (prefs.size * scale).round() as u32;
+                    let draw = |phase| render_with(Shape::Progress, box_px, &prefs, [0.1, 0.5, 1.0], phase);
+                    let rest = busy_envelope(draw);
+                    let (at, side) = launch_spot(&rest, &prefs, scale, 256);
+                    let lay = LaunchLayout::new(&rest, &prefs, scale, 256);
+                    let [x, y, w, h] = lay.icon_box(launch_pose(&prefs, landing_time(&prefs)), anim);
+                    let cursors = [(x + w / 2.0 - rest.hot.0 as f32) / scale, (y + h / 2.0 - rest.hot.1 as f32) / scale];
+                    assert!((cursors[0] - at[0]).abs() < 0.02 && (cursors[1] - at[1]).abs() < 0.02 && (w / scale - side).abs() < 0.02, "{anim:?} {scale}: {cursors:?} / {at:?}");
+                    // the icon stands clear of the ring wherever it has turned to
+                    for i in 0..16 {
+                        let (_, _, bx1, _) = visible_bounds(&draw(i as f32 / 16.0)).unwrap();
+                        assert!(x >= bx1 as f32, "{anim:?} {scale} {i}: {x} < {bx1}");
                     }
                 }
             }
@@ -1653,7 +1919,7 @@ mod tests {
             let mut sheet = image::RgbaImage::from_pixel(cell * times.len() as u32 * mag, cell * mag, image::Rgba([120, 130, 150, 255]));
             for (i, t) in times.iter().enumerate() {
                 let cur = render_with(Shape::Progress, box_px, &prefs, [0.1, 0.5, 1.0], *t);
-                let pic = with_launch_icon(cur, &icon, &prefs, scale, *t, 128);
+                let pic = with_launch_icon(cur, None, &icon, &prefs, scale, *t, 128);
                 // the hot spot at the same place in every cell
                 let (x0, y0) = (i as i32 * cell as i32 + 8, cell as i32 * 2 / 5 - pic.hot.1);
                 for y in 0..pic.size {
@@ -1753,7 +2019,7 @@ mod tests {
         for (a, b) in [(Shape::Grab, Shape::Grabbing), (Shape::Grabbing, Shape::Pointer), (Shape::Pointer, Shape::Grab), (Shape::ResizeEw, Shape::ResizeNwse), (Shape::Default, Shape::Copy), (Shape::Copy, Shape::Progress)] {
             let pose = pose_of(a, &p).unwrap().lerp(&pose_of(b, &p).unwrap(), 1.0).unwrap();
             let (pieces, hot, turn) = pose.pieces(0.0, &p);
-            let img = paint(Shape::Default, &pieces, hot, turn, true, 32, &p, [0.1, 0.5, 1.0], 0.0);
+            let img = paint(Shape::Default, &pieces, hot, turn, Place::Snapped, 32, CURSOR_MAX, &p, [0.1, 0.5, 1.0], 0.0);
             let want = render_with(b, 32, &p, [0.1, 0.5, 1.0], 0.0);
             assert_eq!(img.hot, want.hot, "{a:?} -> {b:?}");
             let diff = img.argb.iter().zip(&want.argb).filter(|(x, y)| x != y).count();

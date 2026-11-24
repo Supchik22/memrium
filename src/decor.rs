@@ -2,7 +2,7 @@
 //! titlebar, Aero glass frame. Pure functions: geometry, hit rectangles and panels.
 
 use crate::renderer::{Align, Label, Panel};
-use crate::theme::{BarMaterial, BodyTone, ButtonColors, ButtonOrder, ButtonShape, ButtonSide, DecoKind, FrameStyle, GlyphShow, Theme, TitleAlign};
+use crate::theme::{BarMaterial, BodyTone, ButtonColors, ButtonOrder, ButtonShape, ButtonSide, DecoKind, FrameStyle, GlyphShow, MarkSet, MaxControls, Theme, TitleAlign};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Btn {
@@ -18,11 +18,240 @@ pub fn insets(theme: &Theme) -> [f32; 4] {
         DecoKind::Mac | DecoKind::Win11 | DecoKind::Gnome => [0.0, tb, 0.0, 0.0],
         DecoKind::Aero => [8.0, tb, 8.0, 8.0],
         DecoKind::Minimal => [0.0, 0.0, 0.0, 0.0],
+        DecoKind::Strip => [0.0, theme.window.max_marks.strip, 0.0, 0.0],
         DecoKind::Custom => {
             let b = theme.window.frame.border;
             [b, tb, b, b]
         }
     }
+}
+
+/// Insets of a maximized (or snapped) window: what is left of the title bar when it is left out, else the usual ones.
+pub fn max_insets(theme: &Theme) -> [f32; 4] {
+    if !theme.window.hide_title_max {
+        insets(theme)
+    } else if theme.window.max_controls == MaxControls::Strip {
+        [0.0, theme.window.max_marks.strip, 0.0, 0.0]
+    } else {
+        [0.0; 4]
+    }
+}
+
+/// The frame a maximized window has when its title bar is left out: the strip, or nothing.
+pub fn bare_kind(theme: &Theme) -> DecoKind {
+    if theme.window.max_controls == MaxControls::Strip {
+        DecoKind::Strip
+    } else {
+        DecoKind::Minimal
+    }
+}
+
+/// Width of a button of a custom frame (a pill is wider than tall).
+fn button_w(fs: &FrameStyle) -> f32 {
+    if fs.shape == ButtonShape::Pill {
+        fs.button * 1.7
+    } else {
+        fs.button
+    }
+}
+
+// ------------------------------------------------------------ the corner and the strip of a maximized window
+
+/// The buttons of the corner or the strip, from the edge inwards.
+fn mark_set(set: MarkSet) -> &'static [Btn] {
+    match set {
+        MarkSet::Close => &[Btn::Close],
+        MarkSet::CloseMin => &[Btn::Close, Btn::Minimize],
+        MarkSet::All => &[Btn::Close, Btn::Minimize, Btn::Maximize],
+    }
+}
+
+/// Width and height of one mark of size `s`.
+fn mark_wh(shape: ButtonShape, s: f32) -> (f32, f32) {
+    match shape {
+        ButtonShape::Pill => (s * 1.7, s),
+        ButtonShape::Bar => (s * 2.2, (s * 0.42).max(3.0)),
+        _ => (s, s),
+    }
+}
+
+const MARK_PAD: f32 = 7.0;
+
+/// The square in the window's corner that brings the buttons out (`MaxControls::Corner`).
+pub fn corner_zone(theme: &Theme, frame: [f32; 4]) -> [f32; 4] {
+    let mm = &theme.window.max_marks;
+    let c = mm.corner.max(1.0);
+    let x = if mm.side == ButtonSide::Left { frame[0] } else { frame[0] + frame[2] - c };
+    [x, frame[1], c, c]
+}
+
+/// The plate the corner's buttons sit on, fully out (`k` = 1) or on its way (`k` < 1): while the pointer is over it, the
+/// buttons stay out.
+pub fn corner_plate(theme: &Theme, frame: [f32; 4], k: f32) -> [f32; 4] {
+    let mm = &theme.window.max_marks;
+    let set = mark_set(mm.set);
+    let (mw, mh) = mark_wh(mm.shape, mm.size);
+    let gap = (mm.size * 0.55).max(4.0);
+    let (pw, ph) = ((set.len() as f32 * mw + (set.len() - 1) as f32 * gap + 2.0 * MARK_PAD) * k, (mh.max(mm.size) + 2.0 * MARK_PAD) * k);
+    let x = if mm.side == ButtonSide::Left { frame[0] } else { frame[0] + frame[2] - pw };
+    [x, frame[1], pw, ph]
+}
+
+/// Where the marks are, as (button, mark rectangle, rectangle a click hits). `k`: how far the corner's buttons are out
+/// (the strip's are always there).
+fn mark_layout(theme: &Theme, frame: [f32; 4], k: f32) -> Vec<(Btn, [f32; 4], [f32; 4])> {
+    let ws = &theme.window;
+    let mm = &ws.max_marks;
+    let set = mark_set(mm.set);
+    let (mw, mh) = mark_wh(mm.shape, mm.size);
+    let gap = (mm.size * 0.55).max(4.0);
+    let left = mm.side == ButtonSide::Left;
+    let [x, y, w, _] = frame;
+    let mut out = Vec::new();
+    match ws.max_controls {
+        MaxControls::Strip => {
+            // on the strip, or hanging from it on a tab when they are taller than it
+            let tab = ws.max_marks.strip.max(mh.max(mm.size) + 4.0);
+            let cy = y + tab / 2.0;
+            for (i, b) in set.iter().enumerate() {
+                let off = 10.0 + i as f32 * (mw + gap);
+                let mx = if left { x + off } else { x + w - off - mw };
+                let r = [mx, cy - mh / 2.0, mw, mh];
+                // (a click hits from the top edge of the window down, a little round the mark)
+                let hit = [mx - gap / 2.0, y, mw + gap, tab + 2.0];
+                out.push((*b, r, hit));
+            }
+        }
+        MaxControls::Corner if k > 0.02 => {
+            let corner_x = if left { x } else { x + w };
+            let dir = if left { 1.0 } else { -1.0 };
+            let cy = y + (MARK_PAD + mh.max(mm.size) / 2.0) * k;
+            for (i, b) in set.iter().enumerate() {
+                let off = (MARK_PAD + i as f32 * (mw + gap) + mw / 2.0) * k;
+                let cx = corner_x + dir * off;
+                let r = [cx - mw * k / 2.0, cy - mh * k / 2.0, mw * k, mh * k];
+                let hit = [cx - (mw + gap) * k / 2.0, y, (mw + gap) * k, (MARK_PAD * 2.0 + mh.max(mm.size)) * k];
+                out.push((*b, r, hit));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The buttons of the corner or the strip, as rectangles a click hits.
+pub fn mark_buttons(theme: &Theme, frame: [f32; 4], k: f32) -> Vec<(Btn, [f32; 4])> {
+    mark_layout(theme, frame, k).into_iter().map(|(b, _, hit)| (b, hit)).collect()
+}
+
+/// Colour of the strip of a maximized window.
+fn strip_colour(theme: &Theme) -> [f32; 3] {
+    if theme.dark {
+        [0.17, 0.17, 0.19]
+    } else {
+        [0.93, 0.93, 0.95]
+    }
+}
+
+/// The marks of the corner or the strip, drawn over the program's picture (with the tab they hang on, or the corner's plate
+/// of glass). `k`: how far the corner's buttons are out.
+pub fn mark_panels(theme: &Theme, frame: [f32; 4], focused: bool, hover: Option<Btn>, k: f32) -> Vec<Panel> {
+    let ws = &theme.window;
+    let mm = &ws.max_marks;
+    let layout = mark_layout(theme, frame, k);
+    let mut out = Vec::new();
+    if layout.is_empty() {
+        return out;
+    }
+    let [x, y, w, h] = frame;
+    let (mw, mh) = mark_wh(mm.shape, mm.size);
+    let bg;
+    match ws.max_controls {
+        MaxControls::Strip => {
+            bg = strip_colour(theme);
+            let tab = mm.strip.max(mh.max(mm.size) + 4.0);
+            if tab > mm.strip + 0.5 {
+                // a tab of the strip's colour under the marks, round at the bottom
+                let x0 = layout.iter().map(|(_, r, _)| r[0]).fold(f32::MAX, f32::min) - 5.0;
+                let x1 = layout.iter().map(|(_, r, _)| r[0] + r[2]).fold(f32::MIN, f32::max) + 5.0;
+                let rad = tab / 2.0;
+                out.push(Panel::solid((x0 + x1) / 2.0, y + tab / 2.0, x1 - x0, tab, rad, bg, bg).flat().shadow(0.18, 6.0, 1.5));
+                out.push(Panel::solid((x0 + x1) / 2.0, y + rad / 2.0, x1 - x0, rad, 0.0, bg, bg).flat());
+            }
+        }
+        _ => {
+            bg = if theme.dark { [0.12, 0.12, 0.14] } else { [0.97, 0.97, 0.98] };
+            if mm.plate {
+                // a plate of glass coming out of the corner: square in the corner, round elsewhere (drawn bigger, cut back)
+                let p = corner_plate(theme, frame, k);
+                let r = p[3] / 2.0;
+                let left = mm.side == ButtonSide::Left;
+                let (ex, ew) = if left { (p[0] - r, p[2] + r) } else { (p[0], p[2] + r) };
+                let (ey, eh) = (p[1] - r, p[3] + r);
+                let g = theme.glass.panel(ex + ew / 2.0, ey + eh / 2.0, ew, eh, r).shadow(0.22 * k, 14.0, 3.0);
+                out.push(g.cut_to([x, y, w, h]).faded(k.clamp(0.0, 1.0)));
+            }
+        }
+    }
+    let any_hover = hover.is_some();
+    let show_glyphs = match mm.glyphs {
+        GlyphShow::Always => true,
+        GlyphShow::Hover => any_hover && focused,
+        GlyphShow::Never => false,
+    };
+    let ink_c = if theme.dark { [0.92, 0.93, 0.96] } else { [0.12, 0.13, 0.16] };
+    let alpha = if ws.max_controls == MaxControls::Corner { k.clamp(0.0, 1.0) } else { 1.0 };
+    for (b, r, _) in layout {
+        let is_h = hover == Some(b);
+        let grow = if is_h && mm.grow { 1.25 } else { 1.0 };
+        let (cx, cy) = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+        let (mut pw, mut ph) = (r[2] * grow, r[3] * grow);
+        let close = b == Btn::Close;
+        let grey = if theme.dark { [0.45, 0.45, 0.48] } else { [0.70, 0.70, 0.73] };
+        let (plate, glyph) = match mm.colors {
+            ButtonColors::Traffic => (
+                if !focused {
+                    grey
+                } else {
+                    match b {
+                        Btn::Close => [1.0, 0.37, 0.34],
+                        Btn::Minimize => [1.0, 0.75, 0.18],
+                        Btn::Maximize => [0.16, 0.80, 0.26],
+                    }
+                },
+                [0.25, 0.08, 0.06],
+            ),
+            ButtonColors::Accent => (theme.accent, [1.0; 3]),
+            ButtonColors::Mono => (ink_c, bg),
+            ButtonColors::CloseRed => (if close { [0.90, 0.26, 0.22] } else { grey }, [1.0; 3]),
+        };
+        // a dot until the pointer is near
+        let dot = matches!(mm.shape, ButtonShape::Dot | ButtonShape::Flat) && !any_hover;
+        if dot {
+            pw *= 0.45;
+            ph *= 0.45;
+        }
+        let rad = match mm.shape {
+            ButtonShape::Circle | ButtonShape::Pill | ButtonShape::Bar | ButtonShape::Dot | ButtonShape::Flat => pw.min(ph) / 2.0,
+            ButtonShape::Rounded => pw.min(ph) * 0.28,
+            ButtonShape::Square => (pw.min(ph) * 0.12).min(2.0),
+        };
+        let hi = [plate[0] * 0.8 + 0.2, plate[1] * 0.8 + 0.2, plate[2] * 0.8 + 0.2];
+        out.push(Panel::solid(cx, cy, pw, ph, rad, hi, plate).flat().alpha(alpha));
+        if is_h {
+            out.push(Panel::solid(cx, cy, pw, ph, rad, [1.0; 3], [1.0; 3]).flat().alpha(0.18 * alpha));
+        }
+        if show_glyphs && !dot && mm.shape != ButtonShape::Bar && ph >= 8.5 {
+            let name = match b {
+                Btn::Close => "x",
+                Btn::Minimize => "minus",
+                Btn::Maximize => "copy",
+            };
+            out.push(Panel::glyph(cx, cy, (ph * 0.68).clamp(7.0, 12.0), name, glyph, 0.8 * alpha));
+        }
+    }
+    let _ = (mw, h);
+    out
 }
 
 /// Is the whole frame a slab of glass with the client in a hole in it (Aero, or a custom frame with a glass bar)?
@@ -62,6 +291,7 @@ pub fn buttons(theme: &Theme, frame: [f32; 4]) -> Vec<(Btn, [f32; 4])> {
             vec![(Btn::Minimize, [x0, top, 29.0, bh]), (Btn::Maximize, [x0 + 29.0, top, 27.0, bh]), (Btn::Close, [x0 + 56.0, top, 47.0, bh])]
         }
         DecoKind::Minimal => Vec::new(),
+        DecoKind::Strip => mark_buttons(theme, frame, 1.0),
         DecoKind::Custom => custom_buttons(theme, frame),
     }
 }
@@ -78,7 +308,7 @@ fn custom_buttons(theme: &Theme, frame: [f32; 4]) -> Vec<(Btn, [f32; 4])> {
         ButtonOrder::MinCloseMax => [Btn::Minimize, Btn::Close, Btn::Maximize],
     };
     let bar = fs.shape == ButtonShape::Bar;
-    let (bw, bh) = if bar { (fs.button, tb) } else { (fs.button, fs.button) };
+    let (bw, bh) = if bar { (fs.button, tb) } else { (button_w(fs), fs.button) };
     let margin = if bar { 0.0 } else { 14.0 + fs.border };
     let by = if bar { y } else { y + (tb - bh) / 2.0 + if fs.bar == BarMaterial::Glass { 1.0 } else { 0.0 } };
     order
@@ -92,6 +322,65 @@ fn custom_buttons(theme: &Theme, frame: [f32; 4]) -> Vec<(Btn, [f32; 4])> {
         .collect()
 }
 
+/// The window buttons of the theme as `appearance.toml` lines, for programs that draw their own header (Chebrium): the
+/// geometry comes out of [`buttons`] itself, so a program's buttons sit exactly where the compositor's would.
+/// `chrome = false` for a frame without even-sized buttons (Aero, Minimal): those programs go by the decoration name.
+pub fn chrome_text(theme: &Theme) -> String {
+    let kind = theme.window.decoration;
+    let fs = match kind {
+        DecoKind::Custom => theme.window.frame,
+        DecoKind::Mac | DecoKind::Win11 | DecoKind::Gnome => FrameStyle::from_kind(kind),
+        _ => return "chrome = false\n".into(),
+    };
+    let probe = [0.0, 0.0, 1000.0, theme.window.titlebar];
+    let mut bs = buttons(theme, probe);
+    if bs.len() != 3 {
+        return "chrome = false\n".into();
+    }
+    let right = bs.iter().map(|(_, r)| r[0] + r[2] / 2.0).sum::<f32>() / 3.0 > 500.0;
+    let dist = |r: &[f32; 4]| if right { 1000.0 - (r[0] + r[2]) } else { r[0] };
+    bs.sort_by(|a, b| dist(&a.1).total_cmp(&dist(&b.1)));
+    let hit = bs[0].1;
+    let gap = dist(&bs[1].1) - dist(&hit) - hit[2];
+    let name = |b: Btn| match b {
+        Btn::Close => "close",
+        Btn::Minimize => "minimize",
+        Btn::Maximize => "maximize",
+    };
+    let shape = match fs.shape {
+        ButtonShape::Circle => "circle",
+        ButtonShape::Square => "square",
+        ButtonShape::Rounded => "rounded",
+        ButtonShape::Flat => "flat",
+        ButtonShape::Bar => "bar",
+        ButtonShape::Pill => "pill",
+        ButtonShape::Dot => "dot",
+    };
+    let colors = match fs.colors {
+        ButtonColors::Traffic => "traffic",
+        ButtonColors::Accent => "accent",
+        ButtonColors::Mono => "mono",
+        ButtonColors::CloseRed => "close_red",
+    };
+    let glyphs = match fs.glyphs {
+        GlyphShow::Hover => "hover",
+        GlyphShow::Always => "always",
+        GlyphShow::Never => "never",
+    };
+    format!(
+        "chrome = true\nchrome_side = \"{}\"\nchrome_order = [\"{}\", \"{}\", \"{}\"]\nchrome_shape = \"{shape}\"\nchrome_colors = \"{colors}\"\nchrome_glyphs = \"{glyphs}\"\nchrome_hit = [{:.2}, {:.2}]\nchrome_dot = {:.2}\nchrome_margin = {:.2}\nchrome_gap = {:.2}\n",
+        if right { "right" } else { "left" },
+        name(bs[0].0),
+        name(bs[1].0),
+        name(bs[2].0),
+        hit[2],
+        hit[3],
+        fs.button.min(hit[2].max(hit[3])),
+        dist(&hit),
+        gap
+    )
+}
+
 /// Horizontal span available for the title text (x0, x1).
 pub fn title_span(theme: &Theme, frame: [f32; 4]) -> (f32, f32) {
     let [x, _, w, _] = frame;
@@ -100,11 +389,11 @@ pub fn title_span(theme: &Theme, frame: [f32; 4]) -> (f32, f32) {
         DecoKind::Win11 => (x + 14.0, x + w - 150.0),
         DecoKind::Aero => (x + 14.0, x + w - 120.0),
         DecoKind::Gnome => (x + 110.0, x + w - 120.0),
-        DecoKind::Minimal => (x, x),
+        DecoKind::Minimal | DecoKind::Strip => (x, x),
         DecoKind::Custom => {
             let fs = &theme.window.frame;
             let bar = fs.shape == ButtonShape::Bar;
-            let cluster = (if bar { 0.0 } else { 14.0 + fs.border }) + 3.0 * fs.button + 2.0 * fs.gap + 10.0;
+            let cluster = (if bar { 0.0 } else { 14.0 + fs.border }) + 3.0 * button_w(fs) + 2.0 * fs.gap + 10.0;
             match (theme.window.title_align, fs.side) {
                 (TitleAlign::Center, _) => (x + cluster, x + w - cluster),
                 (TitleAlign::Left, ButtonSide::Left) => (x + cluster, x + w - 14.0),
@@ -173,7 +462,7 @@ pub fn title_menu_panels(theme: &Theme, rects: &[[f32; 4]], lit: Option<usize>, 
 }
 
 pub fn title_labels(theme: &Theme, frame: [f32; 4], title: &str, focused: bool) -> Vec<Label> {
-    if title.is_empty() || theme.window.decoration == DecoKind::Minimal {
+    if title.is_empty() || matches!(theme.window.decoration, DecoKind::Minimal | DecoKind::Strip) {
         return Vec::new();
     }
     let [x, y, w, _] = frame;
@@ -198,7 +487,7 @@ pub fn title_labels(theme: &Theme, frame: [f32; 4], title: &str, focused: bool) 
             v.push(Label::new(title, ax, base - 2.0, 12.0, false, [0.0, 0.0, 0.0], if focused { 0.92 } else { 0.55 }, align));
             v
         }
-        DecoKind::Minimal => Vec::new(),
+        DecoKind::Minimal | DecoKind::Strip => Vec::new(),
         DecoKind::Custom => {
             let fs = &theme.window.frame;
             let (on_dark, glow) = bar_ink(theme);
@@ -413,6 +702,11 @@ pub fn frame_panels(theme: &Theme, frame: [f32; 4], focused: bool, maximized: bo
         DecoKind::Minimal => {
             out.push(client_shadow(theme, frame, r, sh, focused, line));
         }
+        DecoKind::Strip => {
+            // the strip along the top (its marks are drawn over the program's picture: `mark_panels`)
+            let c = strip_colour(theme);
+            out.push(window_edge(theme, Panel::solid(cx, cy, w, h, r, c, c).flat().shadow(sh[0], sh[1], sh[2]), focused, line, theme.dark));
+        }
         DecoKind::Custom => custom_panels(theme, frame, focused, maximized, hover, &mut out),
     }
     out
@@ -471,8 +765,15 @@ fn custom_panels(theme: &Theme, frame: [f32; 4], focused: bool, maximized: bool,
         let (bx, by) = (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0);
         let is_h = hover == Some(b);
         let close = b == Btn::Close;
+        // a dot grows into the button while the pointer is over the buttons
+        let rect = if fs.shape == ButtonShape::Dot && hover.is_none() {
+            let s = rect[2] * 0.42;
+            [bx - s / 2.0, by - s / 2.0, s, s]
+        } else {
+            rect
+        };
         let rad = match fs.shape {
-            ButtonShape::Circle => rect[2].min(rect[3]) / 2.0,
+            ButtonShape::Circle | ButtonShape::Pill | ButtonShape::Dot => rect[2].min(rect[3]) / 2.0,
             ButtonShape::Rounded => rect[2].min(rect[3]) * 0.28,
             ButtonShape::Square => 3.0,
             // a close plate keeps the window's rounded corner when it sits at the edge
@@ -527,7 +828,8 @@ fn custom_panels(theme: &Theme, frame: [f32; 4], focused: bool, maximized: bool,
                 }
             }
         };
-        if show_glyphs || (!plate_always && matches!(fs.glyphs, GlyphShow::Always)) {
+        let shrunk = fs.shape == ButtonShape::Dot && hover.is_none();
+        if (show_glyphs || (!plate_always && matches!(fs.glyphs, GlyphShow::Always))) && !shrunk {
             let size = (rect[2].min(rect[3]) * 0.6).clamp(8.0, 12.0);
             out.push(Panel::glyph(bx, by, size, name, hover_glyph, if focused { 0.9 } else { 0.5 }));
         }
@@ -566,6 +868,72 @@ mod tests {
         t.window.decoration = deco;
         t.window.titlebar = 36.0;
         t
+    }
+
+    fn bare(controls: MaxControls) -> Theme {
+        let mut t = Theme::default();
+        t.window.hide_title_max = true;
+        t.window.max_controls = controls;
+        t
+    }
+
+    #[test]
+    fn the_strip_keeps_a_few_pixels_and_its_marks_are_buttons() {
+        let mut t = bare(MaxControls::Strip);
+        t.window.max_marks.strip = 3.0;
+        t.window.max_marks.set = MarkSet::All;
+        assert_eq!(max_insets(&t), [0.0, 3.0, 0.0, 0.0]);
+        assert_eq!(bare_kind(&t), DecoKind::Strip);
+        t.window.decoration = DecoKind::Strip;
+        let frame = [0.0, 30.0, 1200.0, 800.0];
+        let b = buttons(&t, frame);
+        assert_eq!(b.iter().map(|(b, _)| *b).collect::<Vec<_>>(), vec![Btn::Close, Btn::Minimize, Btn::Maximize]);
+        // they start at the window's top edge (a mark taller than the strip hangs from it) and stay at the left
+        assert!(b.iter().all(|(_, r)| r[1] == frame[1] && r[0] < 120.0));
+        // no title on a strip
+        assert!(title_labels(&t, frame, "Files", true).is_empty());
+        // the right side
+        t.window.max_marks.side = ButtonSide::Right;
+        assert!(buttons(&t, frame).iter().all(|(_, r)| r[0] > 1000.0));
+        // the marks are drawn
+        assert!(!mark_panels(&t, frame, true, Some(Btn::Close), 1.0).is_empty());
+    }
+
+    #[test]
+    fn the_corner_opens_only_when_asked_and_from_its_corner() {
+        let t = bare(MaxControls::Corner);
+        assert_eq!(max_insets(&t), [0.0; 4]);
+        assert_eq!(bare_kind(&t), DecoKind::Minimal);
+        let frame = [100.0, 30.0, 1200.0, 800.0];
+        assert!(mark_buttons(&t, frame, 0.0).is_empty());
+        assert!(mark_panels(&t, frame, true, None, 0.0).is_empty());
+        let z = corner_zone(&t, frame);
+        assert_eq!([z[0], z[1]], [frame[0], frame[1]]);
+        let b = mark_buttons(&t, frame, 1.0);
+        assert_eq!(b.len(), 1);
+        let p = corner_plate(&t, frame, 1.0);
+        assert!(b[0].1[0] >= p[0] && b[0].1[0] + b[0].1[2] <= p[0] + p[2] + 1.0);
+        // half way out: smaller
+        assert!(corner_plate(&t, frame, 0.5)[2] < p[2]);
+        // the menu-bar mode has no marks
+        assert!(mark_buttons(&bare(MaxControls::MenuBar), frame, 1.0).is_empty());
+    }
+
+    #[test]
+    fn pill_buttons_are_wider_and_chebrium_knows_the_new_shapes() {
+        use chebrium::theme::{Appearance, ChromeShape};
+        let mut t = with(DecoKind::Custom);
+        t.window.frame.shape = ButtonShape::Pill;
+        let b = buttons(&t, [0.0, 0.0, 1000.0, 36.0]);
+        assert!(b[0].1[2] > b[0].1[3] * 1.5);
+        assert_eq!(Appearance::parse(&chrome_text(&t)).chrome.expect("chrome").shape, ChromeShape::Pill);
+        t.window.frame.shape = ButtonShape::Dot;
+        assert_eq!(Appearance::parse(&chrome_text(&t)).chrome.expect("chrome").shape, ChromeShape::Dot);
+        // a dot is small until the pointer is over the buttons
+        let small = frame_panels(&t, [0.0, 0.0, 1000.0, 600.0], true, false, None);
+        let big = frame_panels(&t, [0.0, 0.0, 1000.0, 600.0], true, false, Some(Btn::Close));
+        let widest = |v: &[Panel]| v.iter().skip(1).map(|p| p.rect[2]).fold(0.0f32, f32::max);
+        assert!(widest(&big) > widest(&small));
     }
 
     #[test]
@@ -615,5 +983,25 @@ mod tests {
             // the window's body (with its shadow) is not a button
             assert!(p[0].rect[2] * 2.0 >= frame[2] - 1.0, "{deco:?}");
         }
+    }
+
+    #[test]
+    fn chebrium_reads_the_buttons_the_theme_lays_out() {
+        use chebrium::theme::{Appearance, ChromeShape, WinBtn};
+        for deco in [DecoKind::Mac, DecoKind::Win11, DecoKind::Gnome, DecoKind::Custom] {
+            let t = with(deco);
+            let a = Appearance::parse(&format!("{}", chrome_text(&t)));
+            let c = a.chrome.expect("chrome");
+            // the first button of the chebrium layout sits where the compositor puts its first one
+            let frame = [0.0, 0.0, 1000.0, t.window.titlebar];
+            let mut bs = buttons(&t, frame);
+            bs.sort_by(|a, b| if c.right { b.1[0].total_cmp(&a.1[0]) } else { a.1[0].total_cmp(&b.1[0]) });
+            let first = bs[0].1;
+            let edge = if c.right { 1000.0 - first[0] - first[2] } else { first[0] };
+            assert!((edge - c.margin).abs() < 0.01, "{deco:?}");
+            assert_eq!(c.shape == ChromeShape::Bar, deco == DecoKind::Win11);
+            assert_eq!(c.order[0], match bs[0].0 { Btn::Close => WinBtn::Close, Btn::Minimize => WinBtn::Minimize, Btn::Maximize => WinBtn::Maximize });
+        }
+        assert!(Appearance::parse(&chrome_text(&with(DecoKind::Aero))).chrome.is_none());
     }
 }

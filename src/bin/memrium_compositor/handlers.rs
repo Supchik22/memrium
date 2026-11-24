@@ -88,6 +88,8 @@ impl State {
             });
         }
         let icon_loader = crate::icon_loader::IconLoader::start(icons.clone());
+        // the desktop widgets that are programs of their own: what is installed (read again at the next start)
+        memrium_de::deskwidgets::set_ext(memrium_de::deskwidgets::discover());
         State {
             dh: dh.clone(),
             renderer,
@@ -117,6 +119,7 @@ impl State {
             theme: theme.clone(),
             base_theme,
             hover_btn: None,
+            corner: (None, chebrium::spring::Spring::new(0.0, 520.0, 0.78)),
             last_title_click: None,
             settings: Default::default(),
             swin: crate::state::ShellWin::new(),
@@ -175,6 +178,7 @@ impl State {
             soft_since: HashMap::new(),
             soft_check: Instant::now(),
             busy_icon: None,
+            launch: Default::default(),
             fettle_feed: Default::default(),
             typing_hid_cursor: false,
             preview: None,
@@ -197,6 +201,7 @@ impl State {
             kbd_layouts: layout.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             tray_retry: std::time::Instant::now(),
             axis_cache: std::cell::Cell::new([0.0; 2]),
+            app_of: Default::default(),
             tray_menu: None,
             tip: ((usize::MAX, 0), 0.0, None),
             launcher: { let mut l = memrium_de::launcher::Launcher::default(); l.files = Some(memrium_de::figlet::FileIndex::new()); l },
@@ -244,6 +249,8 @@ impl State {
             dbg_lock: (false, 0),
             warp_to: None,
             x_focus_origin: None,
+            hold: Default::default(),
+            pinning: Default::default(),
             manual_block: false,
             reveal: None,
             intro_t0: None,
@@ -256,7 +263,7 @@ impl State {
             ov: Spring::new(0.0, 170.0, 0.9),
             ov_drag: None,
             swipe: None,
-            ov_hover: None,
+            overview: Default::default(),
             alt_tab: None,
             saved_env: Vec::new(),
             media: None,
@@ -275,12 +282,14 @@ impl State {
             desk_guides: Vec::new(),
             desk_snap: memrium_de::deskwidgets::Snap::Smart,
             desk_target: None,
+            desk_procs: HashMap::new(),
+            desk_gone: std::collections::HashSet::new(),
+            desk_check: None,
             world: [0.0, 0.0, lw, lh],
             mons: vec![[0.0, 0.0, lw, lh]],
             main_mon: 0,
             monitor_infos: Vec::new(),
             cursor_previews: Vec::new(),
-            cursor_preview_looks: Vec::new(),
             displays_dirty: false,
             widgets_panel: crate::widgets_panel::WidgetsPanel::new(),
             text_input_state: smithay::wayland::text_input::TextInputManagerState::new::<State>(dh),
@@ -410,7 +419,7 @@ impl XdgShellHandler for State {
         let n = (self.wins.iter().filter(|w| !w.or).count() % 6) as f32;
         let (x, y) = (200.0 + 44.0 * n, 80.0 + 40.0 * n);
         let win = self.new_win(crate::role::Role::Xdg(surface), x, y);
-        let at = self.wins.iter().rposition(|o| !o.or).map(|p| p + 1).unwrap_or(0);
+        let at = self.managed_insert_at();
         self.wins.insert(at, win);
         self.apply_focus();
     }
@@ -450,7 +459,9 @@ impl XdgShellHandler for State {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         if let Some(i) = self.win_index(surface.wl_surface()) {
-            self.make_ghost(i);
+            if !self.wins[i].desk {
+                self.make_ghost(i);
+            }
             self.wins.remove(i);
             self.grab = None;
             self.apply_focus();
@@ -458,21 +469,21 @@ impl XdgShellHandler for State {
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, _serial: Serial) {
-        if !self.pointer_holds(surface.wl_surface()) {
+        if self.is_desk_surface(surface.wl_surface()) || !self.pointer_holds(surface.wl_surface()) {
             return;
         }
         self.begin_client_move(surface.wl_surface());
     }
 
     fn resize_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, _serial: Serial, edges: xdg_toplevel::ResizeEdge) {
-        if !self.pointer_holds(surface.wl_surface()) {
+        if self.is_desk_surface(surface.wl_surface()) || !self.pointer_holds(surface.wl_surface()) {
             return;
         }
         self.begin_client_resize(surface.wl_surface(), edges);
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(i) = self.win_index(surface.wl_surface()) {
+        if let Some(i) = self.win_index(surface.wl_surface()).filter(|&i| !self.wins[i].desk) {
             if self.wins[i].restore.is_none() {
                 self.toggle_maximize(i);
             }
@@ -480,7 +491,7 @@ impl XdgShellHandler for State {
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(i) = self.win_index(surface.wl_surface()) {
+        if let Some(i) = self.win_index(surface.wl_surface()).filter(|&i| !self.wins[i].desk) {
             if self.wins[i].restore.is_some() {
                 self.toggle_maximize(i);
             }
@@ -489,6 +500,7 @@ impl XdgShellHandler for State {
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<wl_output::WlOutput>) {
         match self.win_index(surface.wl_surface()) {
+            Some(i) if self.wins[i].desk => {}
             Some(i) => self.fullscreen_now(i, true),
             None => {
                 // asked before the window is mapped: the first configure carries the state
@@ -510,7 +522,7 @@ impl XdgShellHandler for State {
     }
 
     fn minimize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(i) = self.win_index(surface.wl_surface()) {
+        if let Some(i) = self.win_index(surface.wl_surface()).filter(|&i| !self.wins[i].desk) {
             self.minimize(i);
         }
     }
@@ -553,7 +565,7 @@ impl State {
     fn set_deco(&mut self, toplevel: &ToplevelSurface, mode: DecoMode) {
         let mode = if mode == DecoMode::ClientSide { DecoMode::ClientSide } else { DecoMode::ServerSide };
         toplevel.with_pending_state(|s| s.decoration_mode = Some(mode));
-        if let Some(i) = self.win_index(toplevel.wl_surface()) {
+        if let Some(i) = self.win_index(toplevel.wl_surface()).filter(|&i| !self.wins[i].desk) {
             self.wins[i].deco = if mode == DecoMode::ServerSide { Deco::Server } else { Deco::Client };
             let ins = if mode == DecoMode::ServerSide { self.client_ins(&self.wins[i]) } else { [0.0; 4] };
             self.wins[i].ins = ins;

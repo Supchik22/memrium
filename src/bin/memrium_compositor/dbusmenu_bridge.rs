@@ -28,7 +28,7 @@ enum Source {
 
 #[derive(Default)]
 struct Cached {
-    menus: Vec<Menu>,
+    menus: Arc<Vec<Menu>>,
     /// what the ids of a GTK menu do
     actions: Arc<Actions>,
     read: Option<Instant>,
@@ -184,11 +184,11 @@ impl Bridge {
     }
 
     /// The menus of an X11 window, as last read (empty until the first reading arrives); a stale one is read again.
-    pub fn menus_of(&self, xid: u64) -> Vec<Menu> {
-        let Some(conn) = &self.conn else { return Vec::new() };
-        let Some(source) = self.shared.windows.lock().ok().and_then(|w| w.get(&xid).cloned()) else { return Vec::new() };
+    pub fn menus_of(&self, xid: u64) -> Arc<Vec<Menu>> {
+        let Some(conn) = &self.conn else { return Arc::default() };
+        let Some(source) = self.shared.windows.lock().ok().and_then(|w| w.get(&xid).cloned()) else { return Arc::default() };
         let (menus, start) = {
-            let Ok(mut cache) = self.shared.cache.lock() else { return Vec::new() };
+            let Ok(mut cache) = self.shared.cache.lock() else { return Arc::default() };
             let c = cache.entry(xid).or_default();
             let stale = c.read.map_or(true, |t| t.elapsed() > REFRESH);
             let start = stale && !c.reading;
@@ -207,8 +207,8 @@ impl Bridge {
                             c.read = Some(Instant::now());
                             if let Some((menus, actions)) = read {
                                 c.actions = actions;
-                                if menus != c.menus {
-                                    c.menus = menus;
+                                if menus != *c.menus {
+                                    c.menus = Arc::new(menus);
                                     shared.dirty.store(true, Ordering::Relaxed);
                                 }
                             }

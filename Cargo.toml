@@ -12,6 +12,12 @@ name = "memrium_preview"
 path = "src/main.rs"
 
 [dependencies]
+# the first page of a PDF for its thumbnail in Files (pure Rust; 0.6 is the last that builds on rustc 1.91, see vendor/vello_*)
+hayro = "=0.6.0"
+# file names of the shared thumbnail cache (~/.cache/thumbnails: the MD5 of the file's URI)
+md-5 = "0.10"
+# the text fields of the thumbnails kept on disk (Thumb::URI, Thumb::MTime), the same version the image crate uses
+png = "0.17"
 chebrium = { git = "https://github.com/Supchik22/chebrium" }
 wgpu = { version = "25" }
 pollster = "0.4"
@@ -59,3 +65,9 @@ bzip2 = "0.5"
 xz2 = "0.1"
 zstd = "0.13"
 sevenz-rust2 = { version = "0.13", default-features = false, features = ["compress"] }
+
+# copies of the CPU rasteriser hayro draws PDF pages with: only their `rust-version` says 1.91 (they build on it; ours is 1.91)
+[patch.crates-io]
+vello_api = { path = "vendor/vello_api" }
+vello_common = { path = "vendor/vello_common" }
+vello_cpu = { path = "vendor/vello_cpu" }

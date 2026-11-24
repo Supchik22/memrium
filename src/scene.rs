@@ -184,6 +184,8 @@ pub struct DockItem {
     pub badge: u32,
     /// the card the running app draws on: Some(true) the dedicated one, Some(false) the integrated one (None: one card only, or not running)
     pub gpu: Option<bool>,
+    /// its icon is still on its way here (added from a launcher, see the compositor's `dock_pin`): the slot is empty
+    pub arriving: bool,
 }
 
 /// One window of a Dock item.
@@ -220,7 +222,7 @@ fn default_dock() -> Vec<DockItem> {
         .iter()
         .zip(names)
         .enumerate()
-        .map(|(i, (&(id, top, bot), name))| DockItem { key: format!("demo{i}"), name: name.into(), icon: DockIcon::Procedural(id, top, bot), running: i == 0, separator_before: false, windows: Vec::new(), pinned: true, badge: 0, gpu: None })
+        .map(|(i, (&(id, top, bot), name))| DockItem { key: format!("demo{i}"), name: name.into(), icon: DockIcon::Procedural(id, top, bot), running: i == 0, separator_before: false, windows: Vec::new(), pinned: true, badge: 0, gpu: None, arriving: false })
         .collect()
 }
 

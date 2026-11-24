@@ -75,10 +75,80 @@ pub fn kind_of(name: &str, is_dir: bool) -> Kind {
         "mp3" | "flac" | "ogg" | "opus" | "wav" | "m4a" | "aac" => Kind::Audio,
         "mp4" | "mkv" | "webm" | "avi" | "mov" | "m4v" => Kind::Video,
         "zip" | "tar" | "gz" | "xz" | "bz2" | "zst" | "7z" | "rar" | "iso" => Kind::Archive,
-        "rs" | "py" | "js" | "ts" | "c" | "h" | "cpp" | "hpp" | "go" | "java" | "sh" | "fish" | "nix" | "toml" | "json" | "yaml" | "yml" | "html" | "css" | "wgsl" | "lua" | "xml" => Kind::Code,
-        "txt" | "md" | "pdf" | "doc" | "docx" | "odt" | "rtf" | "log" | "csv" | "epub" | "ini" | "conf" => Kind::Text,
-        _ => Kind::Other,
+        "rs" | "py" | "js" | "mjs" | "jsx" | "ts" | "tsx" | "c" | "h" | "cpp" | "cc" | "hpp" | "go" | "java" | "kt" | "cs" | "php" | "rb" | "pl" | "swift" | "zig" | "sh" | "bash" | "fish" | "nix" | "toml"
+        | "json" | "yaml" | "yml" | "html" | "htm" | "css" | "scss" | "wgsl" | "glsl" | "lua" | "xml" | "sql" | "lock" | "cmake" | "mk" | "diff" | "patch" | "ron" | "vue" | "svelte" | "hs" | "dart" | "kts" | "pm" | "jl" | "ex" | "exs" | "erl" | "scala" | "clj" => Kind::Code,
+        "txt" | "md" | "markdown" | "rst" | "adoc" | "org" | "tex" | "pdf" | "doc" | "docx" | "odt" | "rtf" | "log" | "csv" | "epub" | "ini" | "conf" | "cfg" | "nfo" => Kind::Text,
+        // files known by their whole name: the build files of a project are code, the notes beside it are text
+        _ => match whole_name_icon(name) {
+            Some("text-x-readme" | "text-x-copying" | "text-x-changelog" | "text-x-authors" | "text-x-install" | "text-x-todo") => Kind::Text,
+            Some(_) => Kind::Code,
+            None => Kind::Other,
+        },
     }
+}
+
+/// The icon of a file that its whole name tells (the name is a kind of file in itself): `README`, `LICENSE`, `Makefile`,
+/// `Cargo.lock`, `.gitignore` ... The notes of a project (README, LICENSE, CHANGELOG, AUTHORS, INSTALL) count with or
+/// without an extension of prose (`README.md`, `LICENSE-MIT`, `CHANGELOG.txt`); `install.sh` is a script, not an INSTALL.
+fn whole_name_icon(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    let known = match lower.as_str() {
+        // a project's own files carry the logo of the tool they belong to
+        "cargo.toml" | "cargo.lock" => Some("application-x-cargo"),
+        "flake.lock" => Some("text-x-nix"),
+        "package.json" | "package-lock.json" | ".npmrc" => Some("application-x-npm"),
+        "yarn.lock" | ".yarnrc.yml" => Some("application-x-yarn"),
+        "pnpm-lock.yaml" | "pnpm-workspace.yaml" => Some("application-x-pnpm"),
+        "poetry.lock" | "uv.lock" | "pipfile.lock" => Some("text-x-python"),
+        "composer.lock" => Some("application-x-php"),
+        "gemfile.lock" => Some("text-x-ruby"),
+        "go.sum" | "go.mod" => Some("text-x-go"),
+        "bun.lock" | "deno.lock" => Some("application-x-lock"),
+        "makefile" | "gnumakefile" | "bsdmakefile" => Some("text-x-makefile"),
+        "cmakelists.txt" => Some("text-x-cmake"),
+        "dockerfile" | "containerfile" | "compose.yaml" | "compose.yml" | "docker-compose.yaml" | "docker-compose.yml" => Some("text-x-dockerfile"),
+        "justfile" => Some("text-x-justfile"),
+        ".gitignore" | ".gitattributes" | ".gitmodules" | ".dockerignore" | ".ignore" | ".npmignore" => Some("text-x-gitignore"),
+        "flake.nix" | "default.nix" | "shell.nix" => Some("text-x-nix"),
+        _ => None,
+    };
+    if known.is_some() {
+        return known;
+    }
+    // the stem of a note: `README`, `README.md`, `LICENSE-MIT`, `CHANGELOG.txt`
+    let stem = lower.split(['.', '-', '_']).next().unwrap_or("");
+    let prose = match lower.rsplit_once('.') {
+        None => true,
+        Some((_, ext)) => matches!(ext, "md" | "markdown" | "txt" | "rst" | "adoc" | "org" | "text"),
+    } || lower.starts_with("license-")
+        || lower.starts_with("licence-")
+        || lower.starts_with("copying-");
+    if !prose {
+        return None;
+    }
+    Some(match stem {
+        "readme" => "text-x-readme",
+        "license" | "licence" | "copying" | "unlicense" | "notice" | "copyright" => "text-x-copying",
+        "changelog" | "changes" | "news" | "history" | "releases" => "text-x-changelog",
+        "authors" | "contributors" | "maintainers" | "credits" | "thanks" => "text-x-authors",
+        "install" | "installing" => "text-x-install",
+        "todo" => "text-x-todo",
+        "contributing" | "security" | "conduct" => "text-x-readme",
+        _ => return None,
+    })
+}
+
+/// A name kept for good: the icon names of file types come out of the MIME database (a few hundred at most) and the callers
+/// want `&'static str`.
+fn intern(s: String) -> &'static str {
+    static NAMES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, &'static str>>> = std::sync::OnceLock::new();
+    let mut names = NAMES.get_or_init(Default::default).lock().unwrap();
+    if let Some(n) = names.get(&s) {
+        return n;
+    }
+    let kept: &'static str = Box::leak(s.clone().into_boxed_str());
+    names.insert(s, kept);
+    kept
 }
 
 #[derive(Clone, Debug)]
@@ -162,31 +232,103 @@ pub fn icon_names(e: &Entry) -> Vec<&'static str> {
                 "Pictures" => Some("folder-pictures"),
                 "Music" => Some("folder-music"),
                 "Videos" => Some("folder-videos"),
+                "Public" => Some("folder-publicshare"),
+                "Templates" => Some("folder-templates"),
                 _ => None,
             };
             if let Some(s) = special {
                 return vec![s, "folder"];
             }
         }
+        if e.path == home {
+            return vec!["user-home", "folder"];
+        }
         return vec!["folder"];
     }
     let ext = e.name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
-    let mut v: Vec<&'static str> = match ext.as_str() {
+    // what the whole name says comes first (README, LICENSE, Makefile, Cargo.lock ...), then the extension; the names are the
+    // ones our own icons carry (the pictures of `kind_icons`), then what the icon packs call them
+    let mut v: Vec<&'static str> = Vec::new();
+    v.extend(whole_name_icon(&e.name));
+    v.extend(match ext.as_str() {
         "pdf" => vec!["application-pdf"],
         "html" | "htm" => vec!["text-html"],
         "json" => vec!["application-json", "text-x-script"],
-        "md" => vec!["text-markdown", "text-x-generic"],
-        "sh" | "fish" | "bash" => vec!["text-x-script", "application-x-shellscript"],
+        "toml" => vec!["application-toml"],
+        "yaml" | "yml" => vec!["application-yaml"],
+        "nix" => vec!["text-x-nix"],
+        "lock" => vec!["application-x-lock"],
+        "md" | "markdown" => vec!["text-markdown", "text-x-generic"],
+        "sh" | "fish" | "bash" | "zsh" => vec!["application-x-shellscript", "text-x-script"],
         "rs" => vec!["text-rust", "text-x-script"],
         "py" => vec!["text-x-python", "text-x-script"],
+        "css" => vec!["text-css"],
+        "scss" | "sass" => vec!["text-x-scss", "text-css"],
+        "xml" => vec!["text-xml", "application-xml"],
+        "c" => vec!["text-x-csrc"],
+        "h" => vec!["text-x-chdr"],
+        "cpp" | "cc" | "cxx" => vec!["text-x-c++src"],
+        "hpp" | "hh" | "hxx" => vec!["text-x-c++hdr"],
+        "js" | "mjs" | "cjs" | "jsx" => vec!["text-javascript", "application-javascript"],
+        "ts" | "tsx" | "mts" => vec!["text-x-typescript"],
+        "go" => vec!["text-x-go"],
+        "php" => vec!["application-x-php", "text-x-php"],
+        "rb" => vec!["text-x-ruby", "application-x-ruby"],
+        "pl" | "pm" => vec!["text-x-perl"],
+        "swift" => vec!["text-x-swift"],
+        "kt" | "kts" => vec!["text-x-kotlin"],
+        "zig" => vec!["text-x-zig"],
+        "dart" => vec!["text-x-dart"],
+        "hs" => vec!["text-x-haskell"],
+        "ipynb" => vec!["application-x-ipynb+json"],
+        "wasm" => vec!["application-wasm"],
+        "jar" => vec!["application-x-java-archive"],
+        "apk" => vec!["application-vnd.android.package-archive"],
+        "deb" => vec!["application-vnd.debian.binary-package"],
+        "rpm" => vec!["application-x-rpm"],
+        "java" => vec!["text-x-java", "text-x-java-source"],
+        "lua" => vec!["text-x-lua"],
+        "sql" => vec!["text-x-sql", "application-sql"],
+        "log" => vec!["text-x-log"],
+        "diff" | "patch" => vec!["text-x-patch", "text-x-diff"],
+        "tex" => vec!["text-x-tex"],
+        "ini" | "conf" | "cfg" => vec!["text-x-ini"],
+        "mk" => vec!["text-x-makefile"],
+        "cmake" => vec!["text-x-cmake"],
         "iso" => vec!["application-x-cd-image", "media-optical"],
         "zip" | "7z" | "rar" => vec!["application-zip", "application-x-archive", "package-x-generic"],
         "tar" | "gz" | "xz" | "bz2" | "zst" => vec!["application-x-compressed-tar", "application-x-archive", "package-x-generic"],
-        "doc" | "docx" | "odt" => vec!["application-msword", "x-office-document"],
-        "xls" | "xlsx" | "ods" | "csv" => vec!["x-office-spreadsheet"],
-        "flatpak" => vec!["package-x-generic"],
+        // office: the logo of the program the file belongs to (Word, Excel and PowerPoint by their letters, LibreOffice by its icons)
+        "doc" | "docx" | "dotx" => vec!["application-msword", "x-office-document"],
+        "odt" | "ott" => vec!["application-vnd.oasis.opendocument.text", "x-office-document"],
+        "xls" | "xlsx" => vec!["application-vnd.ms-excel", "x-office-spreadsheet"],
+        "ods" | "ots" => vec!["application-vnd.oasis.opendocument.spreadsheet", "x-office-spreadsheet"],
+        "ppt" | "pptx" => vec!["application-vnd.ms-powerpoint", "x-office-presentation"],
+        "odp" | "otp" => vec!["application-vnd.oasis.opendocument.presentation", "x-office-presentation"],
+        "csv" => vec!["text-csv", "x-office-spreadsheet"],
+        "flatpak" => vec!["application-vnd.flatpak", "package-x-generic"],
+        // a download that is still coming (Firefox, Chrome, Safari, qBittorrent, wget2)
+        "part" | "crdownload" | "download" | "partial" | "!qb" | "tmpdownload" => vec!["application-x-partial-download"],
         _ => vec![],
-    };
+    });
+    // then the type the shared MIME database gives the name (`text/x-readme`, `application/toml` ...) and the types that is a
+    // kind of: that is how the icon packs name their pictures, and they have one for far more kinds of files than the list above.
+    // Pictures, songs and films keep their own icons (and thumbnails): the database's `.ts` is a film.
+    if !matches!(e.kind, Kind::Image | Kind::Audio | Kind::Video) {
+        if let Some(mime) = crate::mimeapps::mime_of_name(&e.name) {
+            for t in crate::mimeapps::lineage(&mime) {
+                // (the generic ones are the end of the list, below)
+                if t == "text/plain" || t == "application/octet-stream" {
+                    continue;
+                }
+                let name = intern(t.replace('/', "-"));
+                let moving = name.starts_with("video-") || name.starts_with("audio-") || name.starts_with("image-");
+                if !(moving && matches!(e.kind, Kind::Code | Kind::Text)) && !v.contains(&name) {
+                    v.push(name);
+                }
+            }
+        }
+    }
     v.push(match e.kind {
         Kind::Image => "image-x-generic",
         Kind::Audio => "audio-x-generic",
@@ -198,6 +340,375 @@ pub fn icon_names(e: &Entry) -> Vec<&'static str> {
     });
     v.push("text-x-generic");
     v
+}
+
+/// The colours a folder can be given (as Dolphin does: `Icon=folder-<colour>` in the folder's `.directory`): the end of
+/// the icon's name, its name in the menu and the colour of its spot there.
+pub const FOLDER_COLOURS: [(&str, &str, [f32; 3]); 8] = [
+    ("red", "Red", [0.90, 0.28, 0.30]),
+    ("orange", "Orange", [0.96, 0.52, 0.16]),
+    ("yellow", "Yellow", [0.96, 0.75, 0.16]),
+    ("green", "Green", [0.20, 0.72, 0.35]),
+    ("teal", "Teal", [0.12, 0.69, 0.69]),
+    ("violet", "Violet", [0.54, 0.36, 0.94]),
+    ("pink", "Pink", [0.93, 0.30, 0.61]),
+    ("grey", "Grey", [0.56, 0.58, 0.62]),
+];
+
+/// The spot of a folder that has no colour given.
+pub const FOLDER_BLUE: [f32; 3] = [0.30, 0.62, 0.95];
+
+/// The icon of a folder by what is in it, as far as the first few hundred names tell: the language of a project (a
+/// `Cargo.toml`, a `flake.nix` ...), a git repository, or the kind most of its files are of (photos, music, films, code,
+/// documents, archives). None: a mixed or empty folder, or one that is not looked into (on the network).
+pub fn folder_emblem(dir: &Path) -> Option<&'static str> {
+    if is_network_path(dir) {
+        return None;
+    }
+    let mut names: Vec<(String, bool)> = Vec::new();
+    for e in std::fs::read_dir(dir).ok()?.flatten().take(400) {
+        let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+        names.push((e.file_name().to_string_lossy().to_string(), is_dir));
+    }
+    let has = |n: &str| names.iter().any(|(m, _)| m == n);
+    const PROJECTS: [(&[&str], &str); 5] = [
+        (&["Cargo.toml"], "folder-rust"),
+        (&["package.json", "deno.json"], "folder-node"),
+        (&["pyproject.toml", "setup.py", "requirements.txt", "Pipfile"], "folder-python"),
+        (&["flake.nix", "default.nix", "shell.nix"], "folder-nix"),
+        (&["go.mod", "CMakeLists.txt", "meson.build", "Makefile", "build.gradle", "pom.xml", "build.zig"], "folder-code"),
+    ];
+    for (marks, icon) in PROJECTS {
+        if marks.iter().any(|m| has(m)) {
+            return Some(icon);
+        }
+    }
+    if has(".git") {
+        return Some("folder-git");
+    }
+    // the kind most files are of: at least three of them, and three in four of the files
+    let mut count: std::collections::HashMap<u8, usize> = Default::default();
+    let mut files = 0;
+    for (n, is_dir) in &names {
+        if *is_dir || n.starts_with('.') {
+            continue;
+        }
+        files += 1;
+        let k = match kind_of(n, false) {
+            Kind::Image => 0,
+            Kind::Audio => 1,
+            Kind::Video => 2,
+            Kind::Code => 3,
+            Kind::Text => 4,
+            Kind::Archive => 5,
+            _ => continue,
+        };
+        *count.entry(k).or_default() += 1;
+    }
+    let (&k, &n) = count.iter().max_by_key(|(_, n)| **n)?;
+    if n < 3 || n * 4 < files * 3 {
+        return None;
+    }
+    Some(["folder-pictures", "folder-music", "folder-videos", "folder-code", "folder-documents", "folder-archive"][k as usize])
+}
+
+/// The colour tags a file can be given (as Finder has them), with the colour of their spot. A tag is kept in the file's
+/// `user.xdg.tags` attribute, where Dolphin keeps its tags too, so both see the same.
+pub const TAG_COLOURS: [(&str, [f32; 3]); 7] = [
+    ("Red", [0.93, 0.27, 0.27]),
+    ("Orange", [0.97, 0.56, 0.15]),
+    ("Yellow", [0.98, 0.80, 0.18]),
+    ("Green", [0.25, 0.75, 0.35]),
+    ("Blue", [0.22, 0.52, 0.96]),
+    ("Purple", [0.66, 0.36, 0.90]),
+    ("Grey", [0.58, 0.60, 0.64]),
+];
+
+/// The colour of tag `name`: one of the colour tags (in any letter case), else a quiet grey for a tag of words.
+pub fn tag_colour(name: &str) -> [f32; 3] {
+    TAG_COLOURS.iter().find(|(n, _)| n.eq_ignore_ascii_case(name.trim())).map_or([0.72, 0.74, 0.78], |(_, c)| *c)
+}
+
+const TAGS_ATTR: &str = "user.xdg.tags";
+
+/// The tags of a file (`user.xdg.tags`, comma-separated); none when the file system keeps no attributes.
+pub fn tags_of(path: &Path) -> Vec<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let (Ok(p), Ok(name)) = (std::ffi::CString::new(path.as_os_str().as_bytes()), std::ffi::CString::new(TAGS_ATTR)) else { return Vec::new() };
+    // (the most an attribute holds: a list cut short would be written back without the rest)
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = unsafe { libc::getxattr(p.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    buf.truncate(n as usize);
+    String::from_utf8_lossy(&buf).split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()
+}
+
+/// Give a file these tags (none: the attribute goes), and note them in the list of tagged files (`tagged`).
+pub fn set_tags(path: &Path, tags: &[String]) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let p = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let name = std::ffi::CString::new(TAGS_ATTR)?;
+    let r = if tags.is_empty() {
+        let r = unsafe { libc::removexattr(p.as_ptr(), name.as_ptr()) };
+        if r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENODATA) { 0 } else { r }
+    } else {
+        let v = tags.join(",");
+        unsafe { libc::setxattr(p.as_ptr(), name.as_ptr(), v.as_ptr().cast(), v.len(), 0) }
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    note_tagged(path, !tags.is_empty());
+    Ok(())
+}
+
+/// The list of files that have tags (the attribute is the truth; this only says where to look, so that a tag can be found
+/// without walking the disk): `~/.local/share/memrium/tagged`, a path a line.
+fn tagged_list() -> PathBuf {
+    crate::apps::data_dirs().into_iter().next().unwrap_or_else(|| home().join(".local/share")).join("memrium/tagged")
+}
+
+fn note_tagged(path: &Path, has: bool) {
+    let file = tagged_list();
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let line = path.to_string_lossy().to_string();
+    let mut lines: Vec<&str> = text.lines().filter(|l| *l != line).collect();
+    if has {
+        lines.push(&line);
+    }
+    if let Some(d) = file.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(&file, lines.join("\n") + if lines.is_empty() { "" } else { "\n" });
+}
+
+/// Every file that has tag `tag` now (from the list of tagged files, each checked again), and the tags in use at all.
+pub fn tagged(tag: Option<&str>) -> (Vec<PathBuf>, Vec<String>) {
+    let text = std::fs::read_to_string(tagged_list()).unwrap_or_default();
+    let (mut files, mut used) = (Vec::new(), Vec::<String>::new());
+    for l in text.lines().filter(|l| !l.is_empty()) {
+        let p = PathBuf::from(l);
+        let tags = tags_of(&p);
+        for t in &tags {
+            if !used.iter().any(|u| u.eq_ignore_ascii_case(t)) {
+                used.push(t.clone());
+            }
+        }
+        if tag.is_some_and(|want| tags.iter().any(|t| t.eq_ignore_ascii_case(want))) {
+            files.push(p);
+        }
+    }
+    // the colour tags in their own order, then the others by name
+    used.sort_by_key(|t| (TAG_COLOURS.iter().position(|(n, _)| n.eq_ignore_ascii_case(t)).unwrap_or(99), t.to_lowercase()));
+    (files, used)
+}
+
+/// The icon a folder asks for in its `.directory` (`[Desktop Entry] Icon=`), as Dolphin writes it.
+pub fn folder_icon(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(".directory")).ok()?;
+    let mut inside = false;
+    for l in text.lines().map(str::trim) {
+        if l.starts_with('[') {
+            inside = l == "[Desktop Entry]";
+        } else if inside {
+            if let Some(v) = l.strip_prefix("Icon=") {
+                let v = v.trim();
+                return (!v.is_empty()).then(|| v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A folder's colour of the user's own ("Other…") beside the icon, in its `.directory`.
+const COLOUR_KEY: &str = "X-Memrium-Colour=";
+
+/// The colour of its own a folder was given (`set_folder_colour`).
+pub fn folder_colour(dir: &Path) -> Option<[f32; 3]> {
+    let text = std::fs::read_to_string(dir.join(".directory")).ok()?;
+    let mut inside = false;
+    for l in text.lines().map(str::trim) {
+        if l.starts_with('[') {
+            inside = l == "[Desktop Entry]";
+        } else if inside {
+            if let Some(v) = l.strip_prefix(COLOUR_KEY) {
+                return crate::theme::from_hex(v.trim());
+            }
+        }
+    }
+    None
+}
+
+/// The icon of another kind a coloured folder had (Dolphin's `folder-music`, say), kept while `Icon=` names its colour
+/// for the programs that know only that: we draw both, the icon in the colour.
+const SHAPE_KEY: &str = "X-Memrium-Icon=";
+
+/// The colour a colour icon (`folder-red` ... `folder-blue`) stands for; None for any other icon.
+pub fn colour_of_icon(icon: &str) -> Option<[f32; 3]> {
+    let name = icon.strip_prefix("folder-")?;
+    if name == "blue" {
+        return Some(FOLDER_BLUE);
+    }
+    FOLDER_COLOURS.iter().find(|f| f.0 == name).map(|f| f.2)
+}
+
+/// A line of the folder's `[Desktop Entry]` that starts with `key`, without it.
+fn entry_line(dir: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(".directory")).ok()?;
+    let mut inside = false;
+    for l in text.lines().map(str::trim) {
+        if l.starts_with('[') {
+            inside = l == "[Desktop Entry]";
+        } else if inside {
+            if let Some(v) = l.strip_prefix(key) {
+                let v = v.trim();
+                return (!v.is_empty()).then(|| v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The icon a folder has besides its colour: the one kept beside the colour, else its `Icon=` when that is no colour.
+pub fn folder_shape(dir: &Path) -> Option<String> {
+    entry_line(dir, SHAPE_KEY).or_else(|| folder_icon(dir).filter(|i| colour_of_icon(i).is_none()))
+}
+
+/// The colour a folder is drawn in: its own one, else the named one of its icon.
+pub fn folder_tint(dir: &Path) -> Option<[f32; 3]> {
+    folder_colour(dir).or_else(|| folder_icon(dir).and_then(|i| colour_of_icon(&i)))
+}
+
+/// Give a folder a named colour (`folder-red` ...), or none: the icon it had besides keeps (as `X-Memrium-Icon`, and
+/// back in `Icon=` when the colour goes).
+pub fn set_folder_paint(dir: &Path, colour_icon: Option<&str>) -> std::io::Result<()> {
+    let shape = folder_shape(dir);
+    match colour_icon {
+        Some(c) => write_entry(dir, Some(c), &shape.map(|s| format!("{SHAPE_KEY}{s}")).into_iter().collect::<Vec<_>>()),
+        None => write_entry(dir, shape.as_deref(), &[]),
+    }
+}
+
+/// Give a folder any colour. Dolphin and the others, which know only the named ones, get the nearest of those as the icon;
+/// the icon it had besides keeps.
+pub fn set_folder_colour(dir: &Path, c: [f32; 3]) -> std::io::Result<()> {
+    let far = |o: &[f32; 3]| (0..3).map(|i| (o[i] - c[i]).powi(2)).sum::<f32>();
+    let blue = ("blue", "Blue", FOLDER_BLUE);
+    let near = FOLDER_COLOURS.iter().chain([&blue]).min_by(|a, b| far(&a.2).total_cmp(&far(&b.2))).map_or("blue", |f| f.0);
+    let mut extra = vec![format!("{COLOUR_KEY}{}", crate::theme::to_hex(c))];
+    extra.extend(folder_shape(dir).map(|s| format!("{SHAPE_KEY}{s}")));
+    write_entry(dir, Some(&format!("folder-{near}")), &extra)
+}
+
+/// A folder picture in colour `to`: what has colour takes it (keeping its shading), paper and white marks stay.
+pub fn recolour_folder(img: &image::RgbaImage, to: [f32; 3]) -> image::RgbaImage {
+    use crate::theme::{hsv_to_rgb, rgb_to_hsv};
+    let hsv = |p: &image::Rgba<u8>| rgb_to_hsv([p.0[0] as f32 / 255.0, p.0[1] as f32 / 255.0, p.0[2] as f32 / 255.0]);
+    // the body's hue: the commonest among what is clearly coloured (a mark of another colour on it, a Rust gear or a
+    // git logo, is not the body and keeps its colour)
+    let mut bins = [0usize; 36];
+    for p in img.pixels().filter(|p| p.0[3] > 200) {
+        let [h, s, _] = hsv(p);
+        if s > 0.25 {
+            bins[((h.rem_euclid(1.0) * 36.0) as usize).min(35)] += 1;
+        }
+    }
+    let Some(peak) = (0..36).max_by_key(|&i| (bins[i] + bins[(i + 1) % 36] + bins[(i + 35) % 36], bins[i])).filter(|&i| bins[i] > 0) else {
+        return img.clone();
+    };
+    let body = (peak as f32 + 0.5) / 36.0;
+    // how far a hue is from the body's (0 the same, 0.5 across): near is the body, far is a mark
+    let near = |h: f32| {
+        let d = (h - body).rem_euclid(1.0);
+        let d = d.min(1.0 - d);
+        (1.0 - (d - 0.08) / 0.06).clamp(0.0, 1.0)
+    };
+    // the body's own saturation and brightness: the average of its clearly coloured part
+    let (mut sat, mut val, mut n) = (0.0f32, 0.0f32, 0.0f32);
+    for p in img.pixels().filter(|p| p.0[3] > 200) {
+        let [h, s, v] = hsv(p);
+        if s > 0.25 && near(h) > 0.5 {
+            sat += s;
+            val += v;
+            n += 1.0;
+        }
+    }
+    let (sat, val) = (sat / n, (val / n).max(0.05));
+    let [th, ts, tv] = rgb_to_hsv(to);
+    let mut out = img.clone();
+    for p in out.pixels_mut().filter(|p| p.0[3] > 0) {
+        let [h, s, v] = hsv(p);
+        let k = ((s - 0.08) / 0.17).clamp(0.0, 1.0) * near(h);
+        if k <= 0.0 {
+            continue;
+        }
+        let new = hsv_to_rgb(th, (ts * s / sat).min(1.0), (tv * v / val).min(1.0));
+        for i in 0..3 {
+            p.0[i] = (p.0[i] as f32 * (1.0 - k) + new[i] * 255.0 * k).round() as u8;
+        }
+    }
+    out
+}
+
+/// Give a folder an icon (None: its own again), in its `.directory`; the other lines of the file are kept, and a file left
+/// with nothing in it is removed.
+pub fn set_folder_icon(dir: &Path, icon: Option<&str>) -> std::io::Result<()> {
+    write_entry(dir, icon, &[])
+}
+
+/// Write `Icon=` (or take it out) with `extra` lines after it; the colour and icon of ours that were there go.
+fn write_entry(dir: &Path, icon: Option<&str>, extra: &[String]) -> std::io::Result<()> {
+    let file = dir.join(".directory");
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    let (mut inside, mut had_group, mut done) = (false, false, false);
+    for l in text.lines() {
+        let t = l.trim();
+        if t.starts_with('[') {
+            if inside && !done {
+                if let Some(i) = icon {
+                    out.push(format!("Icon={i}"));
+                    out.extend(extra.iter().cloned());
+                }
+                done = true;
+            }
+            inside = t == "[Desktop Entry]";
+            had_group |= inside;
+        } else if inside && (t.starts_with(COLOUR_KEY) || t.starts_with(SHAPE_KEY)) {
+            // (our colour and kept icon go with whatever is given now)
+            continue;
+        } else if inside && t.starts_with("Icon=") {
+            if !done {
+                if let Some(i) = icon {
+                    out.push(format!("Icon={i}"));
+                    out.extend(extra.iter().cloned());
+                }
+                done = true;
+            }
+            continue;
+        }
+        out.push(l.to_string());
+    }
+    if !done {
+        if let Some(i) = icon {
+            if !had_group {
+                out.push("[Desktop Entry]".into());
+            }
+            out.push(format!("Icon={i}"));
+            out.extend(extra.iter().cloned());
+        }
+    }
+    // (only an empty group is left: the file says nothing)
+    let said = out.iter().map(|l| l.trim()).filter(|l| !l.is_empty() && *l != "[Desktop Entry]").count();
+    if said == 0 {
+        return match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    std::fs::write(&file, out.join("\n") + "\n")
 }
 
 pub fn human_size(n: u64) -> String {
@@ -1222,6 +1733,156 @@ const QUICK_FORMATS: [usize; 3] = [0, 1, 2];
 
 #[cfg(test)]
 mod tests {
+    fn file(name: &str) -> Entry {
+        Entry { name: name.into(), path: PathBuf::from("/x").join(name), is_dir: false, size: 1, modified: 0, hidden: name.starts_with('.'), kind: kind_of(name, false), app: None }
+    }
+
+    #[test]
+    fn a_file_is_known_by_its_name_before_its_extension() {
+        let first = |n: &str| icon_names(&file(n))[0];
+        assert_eq!(first("README.md"), "text-x-readme");
+        assert_eq!(first("README"), "text-x-readme");
+        assert_eq!(first("LICENSE-MIT"), "text-x-copying");
+        assert_eq!(first("CHANGELOG.txt"), "text-x-changelog");
+        assert_eq!(first("flake.nix"), "text-x-nix");
+        assert_eq!(first("shell.nix"), "text-x-nix");
+        assert_eq!(first("Cargo.lock"), "application-x-cargo");
+        assert_eq!(first("flake.lock"), "text-x-nix");
+        assert_eq!(first("package.json"), "application-x-npm");
+        assert_eq!(first("bun.lock"), "application-x-lock");
+        assert_eq!(first("report.docx"), "application-msword");
+        assert_eq!(first("letter.odt"), "application-vnd.oasis.opendocument.text");
+        assert_eq!(first("art.psd"), "image-vnd.adobe.photoshop");
+        assert_eq!(first("scene.blend"), "application-x-blender");
+        assert_eq!(first("Makefile"), "text-x-makefile");
+        assert_eq!(first(".gitignore"), "text-x-gitignore");
+        assert_eq!(first("Cargo.toml"), "application-x-cargo");
+        assert_eq!(first("config.toml"), "application-toml");
+        // an ordinary note and a script that only has the word in its name
+        assert_eq!(first("CONCEPT.md"), "text-markdown");
+        assert_eq!(first("install.sh"), "application-x-shellscript");
+        assert_eq!(first("main.rs"), "text-rust");
+        // the build files and notes are read as code and text (so that their lines are drawn on the icon)
+        assert_eq!(kind_of("Cargo.lock", false), Kind::Code);
+        assert_eq!(kind_of("Makefile", false), Kind::Code);
+        assert_eq!(kind_of("LICENSE", false), Kind::Text);
+        assert_eq!(kind_of("a.out", false), Kind::Other);
+    }
+
+    #[test]
+    fn a_source_file_is_never_a_film() {
+        // the MIME database says `.ts` is an MPEG stream; for a file read as code that is TypeScript
+        let names = icon_names(&file("app.ts"));
+        assert_eq!(names[0], "text-x-typescript");
+        assert!(!names.iter().any(|n| n.starts_with("video-")), "{names:?}");
+    }
+    #[test]
+    fn a_folder_is_known_by_what_is_in_it() {
+        let dir = std::env::temp_dir().join(format!("memrium-emblem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mk = |sub: &str, files: &[&str]| {
+            let d = dir.join(sub);
+            std::fs::create_dir_all(&d).unwrap();
+            for f in files {
+                std::fs::write(d.join(f), "").unwrap();
+            }
+            d
+        };
+        assert_eq!(folder_emblem(&mk("rust", &["Cargo.toml", "flake.nix", "README.md"])), Some("folder-rust"), "the language wins over nix");
+        assert_eq!(folder_emblem(&mk("nix", &["flake.nix"])), Some("folder-nix"));
+        assert_eq!(folder_emblem(&mk("songs", &["a.mp3", "b.flac", "c.ogg", "cover.jpg"])), Some("folder-music"));
+        assert_eq!(folder_emblem(&mk("mixed", &["a.mp3", "b.png", "c.txt", "d.zip"])), None);
+        assert_eq!(folder_emblem(&mk("few", &["a.png", "b.png"])), None, "two pictures are not a photo folder yet");
+        std::fs::create_dir_all(dir.join("repo/.git")).unwrap();
+        assert_eq!(folder_emblem(&dir.join("repo")), Some("folder-git"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tags_are_kept_on_the_file_and_found_again() {
+        let dir = std::env::temp_dir().join(format!("memrium-tags-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // (the list of tagged files goes to a scratch data folder)
+        std::env::set_var("XDG_DATA_HOME", dir.join("data"));
+        let f = dir.join("note.txt");
+        std::fs::write(&f, "x").unwrap();
+        if set_tags(&f, &["Red".into(), "Work".into()]).is_err() {
+            eprintln!("this file system keeps no user attributes: nothing to test");
+            return;
+        }
+        assert_eq!(tags_of(&f), ["Red", "Work"]);
+        let (files, used) = tagged(Some("red"));
+        assert_eq!(files, [f.clone()]);
+        assert_eq!(used, ["Red", "Work"], "the colour tags first");
+        set_tags(&f, &[]).unwrap();
+        assert!(tags_of(&f).is_empty());
+        assert!(tagged(Some("Red")).0.is_empty());
+        assert_eq!(tag_colour("blue"), TAG_COLOURS[4].1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_colour_is_written_to_its_directory_file_and_taken_back() {
+        let dir = std::env::temp_dir().join(format!("memrium-folder-colour-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(folder_icon(&dir), None);
+        set_folder_icon(&dir, Some("folder-red")).unwrap();
+        assert_eq!(folder_icon(&dir).as_deref(), Some("folder-red"));
+        // what else Dolphin keeps there stays
+        std::fs::write(dir.join(".directory"), "[Dolphin]\nViewMode=1\n\n[Desktop Entry]\nIcon=folder-red\n").unwrap();
+        set_folder_icon(&dir, Some("folder-green")).unwrap();
+        let text = std::fs::read_to_string(dir.join(".directory")).unwrap();
+        assert!(text.contains("ViewMode=1") && text.contains("Icon=folder-green") && !text.contains("folder-red"), "{text}");
+        set_folder_icon(&dir, None).unwrap();
+        assert_eq!(folder_icon(&dir), None);
+        assert!(std::fs::read_to_string(dir.join(".directory")).unwrap().contains("ViewMode=1"));
+        // a colour of one's own, with the nearest named one for Dolphin; a named one afterwards replaces it
+        set_folder_colour(&dir, [0.93, 0.30, 0.30]).unwrap();
+        assert_eq!(folder_icon(&dir).as_deref(), Some("folder-red"));
+        assert_eq!(folder_colour(&dir).map(crate::theme::to_hex).as_deref(), Some("#ED4D4D"));
+        set_folder_icon(&dir, Some("folder-pink")).unwrap();
+        assert_eq!(folder_colour(&dir), None);
+        set_folder_icon(&dir, None).unwrap();
+        // a file with only the icon in it goes
+        std::fs::remove_file(dir.join(".directory")).unwrap();
+        set_folder_icon(&dir, Some("folder-teal")).unwrap();
+        set_folder_icon(&dir, None).unwrap();
+        assert!(!dir.join(".directory").exists());
+        // an icon of another kind (Dolphin's `folder-music`) and a colour go together: Dolphin gets the colour, we draw both
+        set_folder_icon(&dir, Some("folder-music")).unwrap();
+        assert_eq!((folder_shape(&dir).as_deref(), folder_tint(&dir)), (Some("folder-music"), None));
+        set_folder_paint(&dir, Some("folder-red")).unwrap();
+        assert_eq!(folder_icon(&dir).as_deref(), Some("folder-red"));
+        assert_eq!((folder_shape(&dir).as_deref(), folder_tint(&dir)), (Some("folder-music"), Some(FOLDER_COLOURS[0].2)));
+        set_folder_colour(&dir, [0.2, 0.3, 0.9]).unwrap();
+        assert_eq!(folder_shape(&dir).as_deref(), Some("folder-music"), "a colour of one's own keeps the icon too");
+        assert_eq!(folder_tint(&dir).map(crate::theme::to_hex).as_deref(), Some("#334DE6"));
+        set_folder_paint(&dir, Some("folder-green")).unwrap();
+        assert_eq!((folder_colour(&dir), folder_tint(&dir)), (None, Some(FOLDER_COLOURS[3].2)));
+        set_folder_paint(&dir, None).unwrap();
+        assert_eq!((folder_icon(&dir).as_deref(), folder_tint(&dir)), (Some("folder-music"), None), "no colour: the icon is back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mark_of_another_colour_keeps_its_colour_when_the_folder_is_recoloured() {
+        // a blue folder with an orange mark on it
+        let mut img = image::RgbaImage::from_pixel(20, 20, image::Rgba([60, 140, 240, 255]));
+        for x in 8..12 {
+            for y in 8..12 {
+                img.put_pixel(x, y, image::Rgba([240, 120, 30, 255]));
+            }
+        }
+        img.put_pixel(0, 0, image::Rgba([250, 250, 250, 255]));
+        let out = recolour_folder(&img, [0.9, 0.2, 0.2]);
+        let body = out.get_pixel(2, 15).0;
+        assert!(body[0] > 150 && body[2] < 120, "the body turns red: {body:?}");
+        assert_eq!(out.get_pixel(10, 10).0, [240, 120, 30, 255], "the mark keeps its colour");
+        assert_eq!(out.get_pixel(0, 0).0, [250, 250, 250, 255], "white stays");
+    }
+
     use super::*;
 
     #[test]

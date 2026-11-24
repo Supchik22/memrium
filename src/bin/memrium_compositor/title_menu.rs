@@ -29,7 +29,7 @@ impl State {
         }
         let widths: Vec<f32> = menus.iter().map(|m| self.renderer.text_width(&m.title, decor::TITLE_MENU_PX, false)).collect();
         let rects = decor::title_menu_rects(&w.chrome_theme(&self.theme), Self::frame_rect(w), &widths);
-        menus.into_iter().zip(rects).map(|(m, r)| (m.title, r)).collect()
+        menus.iter().zip(rects).map(|(m, r)| (m.title.clone(), r)).collect()
     }
 
     /// The menu name of window `i`'s title bar under `p`.

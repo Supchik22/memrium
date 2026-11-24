@@ -31,7 +31,13 @@ pub fn data_dirs() -> Vec<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     dirs.push(std::env::var("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(&home).join(".local/share")));
     let xdg = std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
-    dirs.extend(xdg.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+    // a session often lists the same folder several times (NixOS wrappers each add their own again): once is enough,
+    // every scan of the icon themes and the programs walks all of them
+    for p in xdg.split(':').filter(|s| !s.is_empty()).map(PathBuf::from) {
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
     // NixOS / Nix profiles and Flatpak may not be listed in XDG_DATA_DIRS for a bare session
     for extra in [
         "/run/current-system/sw/share".to_string(),
@@ -163,18 +169,21 @@ pub fn scan() -> Vec<AppEntry> {
 
 /// The programs of the desktop that ship beside it and have no desktop file: (executable, id, name, kind of program,
 /// icon, search words, categories). Each is listed when its executable is there.
-const OWN: [(&str, &str, &str, &str, &str, &str, &[&str]); 11] = [
-    ("memrium_files", "memrium-files", "Files", "File Manager", "system-file-manager", "folder browse explorer finder dolphin documents downloads", &["Utility", "FileManager"]),
-    ("memrium_calc", "memrium-calc", "Memrium Calculator", "Calculator", "accessories-calculator", "calc math sum arithmetic numbers", &["Utility", "Calculator"]),
-    ("memrium_player", "memrium-player", "Memrium Player", "Media Player", "multimedia-video-player", "video audio music movie mpv film", &["AudioVideo", "Player"]),
-    ("memrium_snake", "memrium-snake", "Memrium Snake", "Game", "applications-games", "snake game arcade retro nokia", &["Game", "ArcadeGame"]),
-    ("memrium_archive", "memrium-archive", "Memrium Archive", "Archive Manager", "utilities-file-archiver", "zip tar gz unzip extract compress pack archive 7z rar xz zstd bz2", &["Utility", "Archiving", "Compression"]),
-    ("memrium_convert", "memrium-convert", "Memrium Converter", "Image Converter", "applications-graphics", "convert picture image jpg jpeg png webp bmp gif tiff ico resize quality format", &["Graphics", "Utility"]),
-    ("memrium_monitor", "memrium-monitor", "Memrium Monitor", "System Monitor", "utilities-system-monitor", "processes tasks cpu memory ram kill task manager top htop resources network", &["System", "Monitor"]),
-    ("memrium_icons", "memrium-icons", "Memrium Icons", "Icon Composer", "preferences-desktop-icons", "icon icons composer glass vector draw svg shapes editor inkscape design theme", &["Graphics", "Utility"]),
-    ("memrium_view", "memrium-view", "Memrium Pictures", "Image Viewer", "image-viewer", "photo image picture gallery view png jpeg", &["Graphics", "Viewer"]),
-    ("memrium_packages", "memrium-packages", "Memrium Packages", "Package Browser", "system-software-install", "packages nix nixpkgs software install store apps programs search browse", &["System", "PackageManager"]),
-    ("memrium_maps", "memrium-maps", "Memrium Maps", "Maps", "org.gnome.Maps", "map maps openstreetmap osm 3d buildings navigation location place search street city", &["Utility", "Maps"]),
+const OWN: [(&str, &str, &str, &str, &str, &str, &[&str]); 14] = [
+    ("memrium_files", "memrium-files", "Files", "File Manager", "memrium-files", "folder browse explorer finder dolphin documents downloads", &["Utility", "FileManager"]),
+    ("memrium_calc", "memrium-calc", "Memrium Calculator", "Calculator", "memrium-calc", "calc math sum arithmetic numbers", &["Utility", "Calculator"]),
+    ("memrium_player", "memrium-player", "Memrium Player", "Media Player", "memrium-player", "video audio music movie mpv film", &["AudioVideo", "Player"]),
+    ("memrium_snake", "memrium-snake", "Memrium Snake", "Game", "memrium-snake", "snake game arcade retro nokia", &["Game", "ArcadeGame"]),
+    ("memrium_tictactoe", "memrium-tictactoe", "Memrium Tic-Tac-Toe", "Game", "memrium-tictactoe", "tic tac toe noughts crosses xo game board хрестики нулики", &["Game", "BoardGame"]),
+    ("memrium_lightsout", "memrium-lightsout", "Memrium Lights Out", "Puzzle Game", "memrium-lightsout", "lights out puzzle game logic grid вимкни світло головоломка", &["Game", "LogicGame"]),
+    ("memrium_chess", "memrium-chess", "Memrium Chess", "Game", "memrium-chess", "chess board game king queen knight шахи", &["Game", "BoardGame"]),
+    ("memrium_archive", "memrium-archive", "Memrium Archive", "Archive Manager", "memrium-archive", "zip tar gz unzip extract compress pack archive 7z rar xz zstd bz2", &["Utility", "Archiving", "Compression"]),
+    ("memrium_convert", "memrium-convert", "Memrium Converter", "Image Converter", "memrium-convert", "convert picture image jpg jpeg png webp bmp gif tiff ico resize quality format", &["Graphics", "Utility"]),
+    ("memrium_monitor", "memrium-monitor", "Memrium Monitor", "System Monitor", "memrium-monitor", "processes tasks cpu memory ram kill task manager top htop resources network", &["System", "Monitor"]),
+    ("memrium_icons", "memrium-icons", "Memrium Icons", "Icon Composer", "memrium-icons", "icon icons composer glass vector draw svg shapes editor inkscape design theme", &["Graphics", "Utility"]),
+    ("memrium_view", "memrium-view", "Memrium Pictures", "Image Viewer", "memrium-pictures", "photo image picture gallery view png jpeg", &["Graphics", "Viewer"]),
+    ("memrium_packages", "memrium-packages", "Memrium Packages", "Package Browser", "memrium-packages", "packages nix nixpkgs software install store apps programs search browse", &["System", "PackageManager"]),
+    ("memrium_maps", "memrium-maps", "Memrium Maps", "Maps", "memrium-maps", "map maps openstreetmap osm 3d buildings navigation location place search street city", &["Utility", "Maps"]),
 ];
 
 fn own_apps() -> Vec<AppEntry> {
@@ -296,11 +305,16 @@ pub fn launch_in(app: &AppEntry, socket: &str, dir: Option<&Path>) -> std::io::R
     let names = [app.id.as_str(), app.wm_class.as_str(), exe.as_str()];
     // a program with its own HiDPI switch gets it set; one seen stretched before starts on X11
     let own_switch = crate::softapps::prepare(&names, crate::softapps::scale());
-    if rule.and_then(|r| r.x11).unwrap_or_else(|| crate::apprules::gtk3_program(&names) || (!own_switch && crate::softapps::is_soft(&names))) {
+    let x11 = rule.and_then(|r| r.x11).unwrap_or_else(|| crate::apprules::gtk3_program(&names) || (!own_switch && crate::softapps::is_soft(&names)));
+    let mut line = line;
+    if x11 {
         launch.env.push(("GDK_BACKEND".into(), "x11".into()));
         launch.env.push(("QT_QPA_PLATFORM".into(), "xcb".into()));
         launch.env.push(("SDL_VIDEODRIVER".into(), "x11".into()));
         launch.env.push(("ELECTRON_OZONE_PLATFORM_HINT".into(), "x11".into()));
+        // those variables do nothing for Java's toolkit (JetBrains IDEs), which takes Wayland whenever it sees a Wayland
+        // socket, and a Flatpak keeps its Wayland socket whatever the environment says: take the socket away
+        line = without_wayland(&line);
     }
     let (line, rule_env) = with_launch(&line, launch);
     cmd.arg("-c").arg(format!("exec {line}"));
@@ -309,6 +323,10 @@ pub fn launch_in(app: &AppEntry, socket: &str, dir: Option<&Path>) -> std::io::R
     cmd.env("GTK_USE_PORTAL", "1").env("GDK_DEBUG", "portals").env("QT_QPA_PLATFORMTHEME", "xdgdesktopportal");
     cmd.env("ELECTRON_OZONE_PLATFORM_HINT", "auto").env("NIXOS_OZONE_WL", "1");
     cmd.envs(rule_env);
+    // a Java IDE outside a Flatpak finds Wayland by the variable alone
+    if x11 && crate::apprules::jetbrains_ide(&names) {
+        cmd.env_remove("WAYLAND_DISPLAY");
+    }
     // new session so closing the compositor does not take the apps with it
     cmd.process_group(0);
     if let Some(d) = dir {
@@ -321,6 +339,20 @@ pub fn launch_in(app: &AppEntry, socket: &str, dir: Option<&Path>) -> std::io::R
         eprintln!("stats: launch_in {}: prepare {:.1} ms, spawn {:.1} ms", app.name, (before_spawn - started).as_secs_f64() * 1e3, before_spawn.elapsed().as_secs_f64() * 1e3);
     }
     Ok(())
+}
+
+/// The command line of a program that must run on X11: a Flatpak gets `--nosocket=wayland` (its sandbox then has only the
+/// X11 socket, so a toolkit that picks Wayland by what it finds falls back to X11), anything else stays as it is.
+fn without_wayland(line: &str) -> String {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let flatpak = words.first().is_some_and(|w| w.ends_with("flatpak")) && words.get(1) == Some(&"run");
+    if !flatpak || words.contains(&"--nosocket=wayland") {
+        return line.to_string();
+    }
+    let at = line.find(" run").map_or(0, |i| i + 4);
+    let mut out = line.to_string();
+    out.insert_str(at, " --nosocket=wayland");
+    out
 }
 
 /// A command line with a rule's flags and environment put in. A Flatpak does not pass the environment into its sandbox: it
@@ -530,46 +562,96 @@ fn current_theme() -> Option<String> {
             Some(s)
         }
     };
-    run("kreadconfig6", &["--group", "Icons", "--key", "Theme"]).or_else(|| run("gsettings", &["get", "org.gnome.desktop.interface", "icon-theme"]))
+    run("kreadconfig6", &["--group", "Icons", "--key", "Theme"])
+        .or_else(|| run("gsettings", &["get", "org.gnome.desktop.interface", "icon-theme"]))
+        .or_else(settings_theme)
 }
 
-fn size_of_path(path: &Path) -> u32 {
-    let mut size = 48;
-    for comp in path.components() {
-        let c = comp.as_os_str().to_string_lossy();
-        if c == "scalable" {
-            return 512;
-        }
-        if let Some((a, _)) = c.split_once('x') {
-            if let Ok(n) = a.parse::<u32>() {
-                size = n;
-            }
-        } else if let Ok(n) = c.parse::<u32>() {
-            if n >= 8 && n <= 1024 {
-                size = n;
-            }
-        }
-    }
-    size
-}
-
-fn walk_icons(dir: &Path, depth: u32, out: &mut HashMap<String, Vec<(u32, PathBuf)>>) {
-    if depth > 6 {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let path = e.path();
-        if path.is_dir() {
-            walk_icons(&path, depth + 1, out);
-        } else if let Some(ext) = path.extension().and_then(|x| x.to_str()) {
-            if ext == "svg" || ext == "png" {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    out.entry(stem.to_string()).or_default().push((size_of_path(&path), path.clone()));
+/// The icon theme as the settings files say it, for a system without `kreadconfig6` and `gsettings`: `[Icons] Theme=` of
+/// kdeglobals, then `gtk-icon-theme-name` of GTK 3's settings.ini.
+fn settings_theme() -> Option<String> {
+    let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    let value = |file: &str, group: &str, key: &str| -> Option<String> {
+        let text = std::fs::read_to_string(config.join(file)).ok()?;
+        let mut inside = false;
+        for l in text.lines().map(str::trim) {
+            if l.starts_with('[') {
+                inside = l == group;
+            } else if inside {
+                if let Some((k, v)) = l.split_once('=') {
+                    if k.trim() == key && !v.trim().is_empty() {
+                        return Some(v.trim().to_string());
+                    }
                 }
             }
         }
+        None
+    };
+    value("kdeglobals", "[Icons]", "Theme").or_else(|| value("gtk-3.0/settings.ini", "[Settings]", "gtk-icon-theme-name"))
+}
+
+/// One more part of an icon's path: the size it names ("48x48", "64"), `None` for "scalable".
+fn size_step(size: u32, c: &str) -> Option<u32> {
+    if c == "scalable" {
+        return None;
     }
+    if let Some((a, _)) = c.split_once('x') {
+        return Some(a.parse::<u32>().unwrap_or(size));
+    }
+    Some(match c.parse::<u32>() {
+        Ok(n) if (8..=1024).contains(&n) => n,
+        _ => size,
+    })
+}
+
+/// The size the folders of an icon say it has (`None`: scalable), before the file's own name is looked at.
+fn size_of_dir(dir: &Path) -> Option<u32> {
+    let mut size = 48;
+    for comp in dir.components() {
+        size = size_step(size, &comp.as_os_str().to_string_lossy())?;
+    }
+    Some(size)
+}
+
+/// The icon files (svg, png) below `dir`, by name. `enter` is asked about each folder with its name and whether its
+/// files are wanted so far: `None` leaves it out, `Some(wanted)` goes in. Folders nested deeper than `max` are left.
+///
+/// A scan reads tens of thousands of entries, so it asks the system as little as it can: the kind of an entry comes
+/// with the folder's listing (no look at the file itself, which on a cold start is a disk read each), and the size a
+/// folder stands for is worked out once, not for every file in it.
+fn walk(dir: &Path, depth: u32, max: u32, wanted: bool, enter: &dyn Fn(&str, bool) -> Option<bool>, out: &mut HashMap<String, Vec<(u32, PathBuf)>>) {
+    if depth > max {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut dir_size: Option<Option<u32>> = None;
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let icon = Path::new(&name).extension().and_then(|x| x.to_str()).is_some_and(|x| x == "svg" || x == "png");
+        let is_dir = match e.file_type() {
+            // a link to a picture is a picture (themes are full of them); any other link is looked at
+            Ok(t) if t.is_symlink() => !icon && e.path().is_dir(),
+            Ok(t) => t.is_dir(),
+            Err(_) => e.path().is_dir(),
+        };
+        if is_dir {
+            if let Some(w) = enter(&name.to_string_lossy(), wanted) {
+                walk(&e.path(), depth + 1, max, w, enter, out);
+            }
+        } else if wanted && icon {
+            let Some(file) = name.to_str() else { continue };
+            let Some(stem) = Path::new(file).file_stem().and_then(|s| s.to_str()) else { continue };
+            let size = match *dir_size.get_or_insert_with(|| size_of_dir(dir)) {
+                Some(s) => size_step(s, file).unwrap_or(512),
+                None => 512,
+            };
+            out.entry(stem.to_string()).or_default().push((size, e.path()));
+        }
+    }
+}
+
+fn walk_icons(dir: &Path, depth: u32, out: &mut HashMap<String, Vec<(u32, PathBuf)>>) {
+    walk(dir, depth, 6, true, &|_, _| Some(true), out);
 }
 
 impl IconIndex {
@@ -649,7 +731,9 @@ impl IconIndex {
                 walk_mime(&base.join(t), 0, false, &mut files);
             }
         }
-        IconIndex { files, order: Vec::new(), names: Default::default(), ranks: Default::default() }
+        // (the earliest theme of the chain wins, as for the programs: our own folders and files beat the pack it inherits)
+        let order: Vec<PathBuf> = themes.iter().flat_map(|t| icon_dirs().into_iter().map(move |b| b.join(t))).collect();
+        IconIndex { files, order, names: Default::default(), ranks: Default::default() }
     }
 
     /// Every icon name of the index, sorted (the picker for a widget's icon lists them).
@@ -710,91 +794,23 @@ impl IconIndex {
 }
 
 fn walk_filtered(dir: &Path, depth: u32, out: &mut HashMap<String, Vec<(u32, PathBuf)>>) {
-    if depth > 4 {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let path = e.path();
-        let name = e.file_name().to_string_lossy().to_string();
-        if path.is_dir() {
-            // skip categories that never hold application icons
-            if matches!(name.as_str(), "actions" | "status" | "devices" | "mimetypes" | "emblems" | "places" | "panel" | "animations" | "stock" | "intl" | "preferences" | "categories") {
-                continue;
-            }
-            walk_filtered(&path, depth + 1, out);
-        } else if let Some(ext) = path.extension().and_then(|x| x.to_str()) {
-            if ext == "svg" || ext == "png" {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    out.entry(stem.to_string()).or_default().push((size_of_path(&path), path.clone()));
-                }
-            }
-        }
-    }
+    // skip categories that never hold application icons
+    let enter = |name: &str, _: bool| (!matches!(name, "actions" | "status" | "devices" | "mimetypes" | "emblems" | "places" | "panel" | "animations" | "stock" | "intl" | "preferences" | "categories")).then_some(true);
+    walk(dir, depth, 4, true, &enter, out);
 }
 
 /// Every icon file below `dir`, whatever its category.
 fn walk_all(dir: &Path, depth: u32, out: &mut HashMap<String, Vec<(u32, PathBuf)>>) {
-    if depth > 4 {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let path = e.path();
-        if path.is_dir() {
-            walk_all(&path, depth + 1, out);
-        } else if path.extension().and_then(|x| x.to_str()).is_some_and(|x| x == "svg" || x == "png") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                out.entry(stem.to_string()).or_default().push((size_of_path(&path), path.clone()));
-            }
-        }
-    }
+    walk(dir, depth, 4, true, &|_, _| Some(true), out);
 }
 
 /// Like `walk_mime`, but for the icon folders called one of `cats`.
 fn walk_cats(dir: &Path, depth: u32, wanted: bool, cats: &[&str], out: &mut HashMap<String, Vec<(u32, PathBuf)>>) {
-    if depth > 4 {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let path = e.path();
-        let name = e.file_name().to_string_lossy().to_string();
-        if path.is_dir() {
-            walk_cats(&path, depth + 1, wanted || cats.contains(&name.as_str()), cats, out);
-        } else if wanted {
-            if let Some(ext) = path.extension().and_then(|x| x.to_str()) {
-                if ext == "svg" || ext == "png" {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        out.entry(stem.to_string()).or_default().push((size_of_path(&path), path.clone()));
-                    }
-                }
-            }
-        }
-    }
+    walk(dir, depth, 4, wanted, &|name, wanted| Some(wanted || cats.contains(&name)), out);
 }
 
 fn walk_mime(dir: &Path, depth: u32, wanted: bool, out: &mut HashMap<String, Vec<(u32, PathBuf)>>) {
-    if depth > 4 {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let path = e.path();
-        let name = e.file_name().to_string_lossy().to_string();
-        if path.is_dir() {
-            let w = wanted || matches!(name.as_str(), "places" | "mimetypes" | "mimes");
-            walk_mime(&path, depth + 1, w, out);
-        } else if wanted {
-            if let Some(ext) = path.extension().and_then(|x| x.to_str()) {
-                if ext == "svg" || ext == "png" {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        out.entry(stem.to_string()).or_default().push((size_of_path(&path), path.clone()));
-                    }
-                }
-            }
-        }
-    }
+    walk(dir, depth, 4, wanted, &|name, wanted| Some(wanted || matches!(name, "places" | "mimetypes" | "mimes")), out);
 }
 
 /// Is the icon file from the plateless theme of a clear look of our icons (`iconrender::LIVE_SUFFIX`)?
@@ -812,6 +828,22 @@ pub fn load_icon_levels(path: &Path) -> Option<Vec<image::RgbaImage>> {
         (0..LEVELS).map(|m| load_icon_file(path, CELL >> m)).collect()
     } else {
         let img = image::open(path).ok()?.to_rgba8();
+        Some((0..LEVELS).map(|m| image::imageops::resize(&img, CELL >> m, CELL >> m, image::imageops::FilterType::Lanczos3)).collect())
+    }
+}
+
+/// Like `load_icon_levels` for an icon drawn large: 256, 128 and 64 px (the levels of a big block of the atlas, see
+/// `renderer::bake_app_icon_levels_big`). A PNG smaller than 256 px has nothing more to show: None.
+pub fn load_icon_levels_big(path: &Path) -> Option<Vec<image::RgbaImage>> {
+    const CELL: u32 = 256;
+    const LEVELS: u32 = 3;
+    if path.extension().and_then(|e| e.to_str()) == Some("svg") {
+        (0..LEVELS).map(|m| load_icon_file(path, CELL >> m)).collect()
+    } else {
+        let img = image::open(path).ok()?.to_rgba8();
+        if img.width() < CELL {
+            return None;
+        }
         Some((0..LEVELS).map(|m| image::imageops::resize(&img, CELL >> m, CELL >> m, image::imageops::FilterType::Lanczos3)).collect())
     }
 }
@@ -897,6 +929,93 @@ mod launch_tests {
 }
 
 #[cfg(test)]
+mod walk_tests {
+    use super::*;
+
+    /// The scan as it was written first: every entry asked whether it is a folder, the size read off the whole path.
+    fn plain(dir: &Path, depth: u32, wanted: bool, out: &mut HashMap<String, Vec<(u32, PathBuf)>>) {
+        fn size(path: &Path) -> u32 {
+            let mut size = 48;
+            for comp in path.components() {
+                let c = comp.as_os_str().to_string_lossy();
+                if c == "scalable" {
+                    return 512;
+                }
+                if let Some((a, _)) = c.split_once('x') {
+                    if let Ok(n) = a.parse::<u32>() {
+                        size = n;
+                    }
+                } else if let Ok(n) = c.parse::<u32>() {
+                    if n >= 8 && n <= 1024 {
+                        size = n;
+                    }
+                }
+            }
+            size
+        }
+        if depth > 4 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let path = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                plain(&path, depth + 1, wanted || matches!(name.as_str(), "places" | "mimetypes" | "mimes"), out);
+            } else if wanted && path.extension().and_then(|x| x.to_str()).is_some_and(|x| x == "svg" || x == "png") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    out.entry(stem.to_string()).or_default().push((size(&path), path.clone()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_quick_scan_finds_what_the_plain_one_found() {
+        let root = std::env::temp_dir().join(format!("memrium-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["48x48/places", "scalable/mimetypes", "places/64", "apps/32", "mimes/128x128", "16/places/deep/deeper"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        for f in ["48x48/places/folder.png", "scalable/mimetypes/text-plain.svg", "places/64/folder.svg", "places/64/note.txt", "apps/32/firefox.png", "mimes/128x128/256x256.png", "mimes/128x128/24.png", "16/places/deep/deeper/too-deep.png", "16/places/deep/user-home.png"] {
+            std::fs::write(root.join(f), b"x").unwrap();
+        }
+        // links: to a picture, to a folder of pictures, to nothing
+        std::os::unix::fs::symlink(root.join("48x48/places/folder.png"), root.join("48x48/places/inode-directory.png")).unwrap();
+        std::os::unix::fs::symlink(root.join("48x48"), root.join("48x48@2x")).unwrap();
+        std::os::unix::fs::symlink(root.join("gone.png"), root.join("places/64/broken.png")).unwrap();
+        let sorted = |m: HashMap<String, Vec<(u32, PathBuf)>>| {
+            let mut v: Vec<(String, Vec<(u32, PathBuf)>)> = m.into_iter().collect();
+            v.sort();
+            v
+        };
+        let (mut old, mut new) = (HashMap::new(), HashMap::new());
+        plain(&root, 0, false, &mut old);
+        walk_mime(&root, 0, false, &mut new);
+        let (old, new) = (sorted(old), sorted(new));
+        assert!(old.iter().any(|(n, l)| n == "folder" && l.len() == 3), "{old:?}");
+        assert_eq!(old, new);
+        let _ = std::fs::remove_dir_all(&root);
+        // and the themes installed here, whatever they are
+        for base in icon_dirs() {
+            let (mut old, mut new) = (HashMap::new(), HashMap::new());
+            plain(&base, 0, false, &mut old);
+            walk_mime(&base, 0, false, &mut new);
+            assert_eq!(sorted(old), sorted(new), "{}", base.display());
+        }
+    }
+
+    #[test]
+    fn a_folder_listed_twice_is_scanned_once() {
+        let dirs = data_dirs();
+        let mut once = dirs.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!(dirs.len(), once.len());
+    }
+}
+
+#[cfg(test)]
 mod find_speed {
     /// How long a found icon takes to pick (`cargo test --release --lib find_speed -- --ignored --nocapture`).
     #[test]
@@ -911,5 +1030,19 @@ mod find_speed {
             let found = index.find(name, 128);
             println!("{name}: {n} files, {:?} -> {:?}", t.elapsed(), found);
         }
+    }
+}
+
+#[cfg(test)]
+mod x11_launch_tests {
+    #[test]
+    fn a_flatpak_that_must_run_on_x11_loses_its_wayland_socket() {
+        let line = "flatpak run --branch=stable --arch=x86_64 --command=idea-wrapper --file-forwarding com.jetbrains.IntelliJ-IDEA-Community @@ %F @@";
+        let out = super::without_wayland(line);
+        assert_eq!(out, "flatpak run --nosocket=wayland --branch=stable --arch=x86_64 --command=idea-wrapper --file-forwarding com.jetbrains.IntelliJ-IDEA-Community @@ %F @@");
+        // once only, and not for a program that is no Flatpak
+        assert_eq!(super::without_wayland(&out), out);
+        assert_eq!(super::without_wayland("/bin/inkscape %F"), "/bin/inkscape %F");
+        assert_eq!(super::without_wayland("/run/current-system/sw/bin/flatpak info x"), "/run/current-system/sw/bin/flatpak info x");
     }
 }

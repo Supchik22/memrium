@@ -746,7 +746,7 @@ fn theme_preview(ui: &mut Ui, r: [f32; 4], t: &Theme) {
             ui.grad([wx - 1.0, wy - 1.0, ww + 2.0, tb + 2.0], rad, [0.55, 0.75, 0.96], [0.30, 0.52, 0.82], 0.95);
             ui.fill([wx + ww - 9.0, wy, 8.0, tb - 1.0], 1.5, [0.86, 0.28, 0.22], 1.0);
         }
-        DecoKind::Minimal => {}
+        DecoKind::Minimal | DecoKind::Strip => {}
         DecoKind::Custom => {
             use theme::{BarMaterial, ButtonColors, ButtonSide};
             let fs = &t.window.frame;
@@ -1633,7 +1633,7 @@ fn page_windows(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
         let fs = &mut w.frame;
         f.pick(ui, "Side", &mut fs.side, &[(ButtonSide::Left, "Left"), (ButtonSide::Right, "Right")]);
         f.pick(ui, "Order from the edge", &mut fs.order, &[(ButtonOrder::CloseMinMax, "x – +"), (ButtonOrder::CloseMaxMin, "x + –"), (ButtonOrder::MinMaxClose, "– + x"), (ButtonOrder::MinCloseMax, "– x +")]);
-        f.pick(ui, "Shape", &mut fs.shape, &[(ButtonShape::Circle, "Circle"), (ButtonShape::Rounded, "Rounded"), (ButtonShape::Square, "Square"), (ButtonShape::Flat, "Flat"), (ButtonShape::Bar, "Bar")]);
+        f.pick(ui, "Shape", &mut fs.shape, &[(ButtonShape::Circle, "Circle"), (ButtonShape::Rounded, "Rounded"), (ButtonShape::Square, "Square"), (ButtonShape::Pill, "Pill"), (ButtonShape::Dot, "Dot"), (ButtonShape::Flat, "Flat"), (ButtonShape::Bar, "Bar")]);
         f.pick(ui, "Colours", &mut fs.colors, &[(ButtonColors::Traffic, "Traffic"), (ButtonColors::Accent, "Accent"), (ButtonColors::Mono, "Mono"), (ButtonColors::CloseRed, "Red close")]);
         f.pick(ui, "Icons", &mut fs.glyphs, &[(GlyphShow::Hover, "On hover"), (GlyphShow::Always, "Always"), (GlyphShow::Never, "Never")]);
         f.slider(ui, "Size", &mut fs.button, 10.0, 52.0, " px");
@@ -1656,6 +1656,33 @@ fn page_windows(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
     f.slider(ui, "Title bar height", &mut w.titlebar, 24.0, 52.0, " px");
     f.slider(ui, "Gap around maximized", &mut w.max_gap, 0.0, 60.0, " px");
     f.toggle(ui, "Hide the title bar when maximized", &mut w.hide_title_max);
+    if w.hide_title_max {
+        use theme::{MarkSet, MaxControls};
+        f.pick(ui, "Buttons of a maximized window", &mut w.max_controls, &[(MaxControls::MenuBar, "In the menu bar"), (MaxControls::Corner, "Magic corner"), (MaxControls::Strip, "Thin strip")]);
+        if w.max_controls != MaxControls::MenuBar {
+            let mm = &mut w.max_marks;
+            f.pick(ui, "Corner", &mut mm.side, &[(ButtonSide::Left, "Left"), (ButtonSide::Right, "Right")]);
+            f.pick(ui, "Buttons", &mut mm.set, &[(MarkSet::Close, "Close"), (MarkSet::CloseMin, "Close, minimize"), (MarkSet::All, "All three")]);
+            f.pick(ui, "Mark shape", &mut mm.shape, &[(ButtonShape::Circle, "Circle"), (ButtonShape::Rounded, "Rounded"), (ButtonShape::Square, "Square"), (ButtonShape::Pill, "Pill"), (ButtonShape::Dot, "Dot"), (ButtonShape::Bar, "Line")]);
+            f.pick(ui, "Mark colours", &mut mm.colors, &[(ButtonColors::Traffic, "Traffic"), (ButtonColors::CloseRed, "Red close"), (ButtonColors::Accent, "Accent"), (ButtonColors::Mono, "Mono")]);
+            f.pick(ui, "Mark icons", &mut mm.glyphs, &[(GlyphShow::Hover, "On hover"), (GlyphShow::Always, "Always"), (GlyphShow::Never, "Never")]);
+            f.slider(ui, "Mark size", &mut mm.size, 5.0, 22.0, " px");
+            if w.max_controls == MaxControls::Strip {
+                f.slider(ui, "Strip height", &mut mm.strip, 1.0, 14.0, " px");
+            } else {
+                f.slider(ui, "Hot corner size", &mut mm.corner, 2.0, 64.0, " px");
+                f.toggle(ui, "Glass plate under the buttons", &mut mm.plate);
+            }
+            f.toggle(ui, "Grow under the pointer", &mut mm.grow);
+        }
+    }
+    {
+        use theme::TitleIcon;
+        f.pick(ui, "App icon in the title bar", &mut w.title_icon, &[(TitleIcon::None, "Off"), (TitleIcon::Left, "Left"), (TitleIcon::Title, "By the title"), (TitleIcon::Right, "Right")]);
+        if w.title_icon != TitleIcon::None {
+            f.slider(ui, "App icon size", &mut w.title_icon_size, 12.0, 26.0, " px");
+        }
+    }
     f.slider(ui, "Content opacity", &mut w.client_opacity, 0.3, 1.0, "");
     let mut sh = w.shadow[0];
     f.slider(ui, "Shadow strength", &mut sh, 0.0, 0.8, "");
@@ -1671,15 +1698,28 @@ fn page_windows(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
     f.note(ui, "Windows already open keep their frame until the next theme change.", true);
 }
 
-fn effect_row(ui: &mut Ui, an: &mut theme::AnimStyle, x: f32, y: f32, id: &str, label: &str) {
+/// What an effect's row keeps free after its label: the switch, the slider and its number.
+const EFFECT_CONTROLS: f32 = 44.0 + 8.0 + 50.0 + 58.0;
+
+/// An effect's label, wrapped into what the controls leave of a row of `w`, and the row's height.
+fn effect_label(ui: &mut Ui, label: &str, w: f32) -> (Vec<String>, f32) {
+    let lines = general::wrapped(ui, label, 12.5, (w - EFFECT_CONTROLS - 6.0).max(30.0));
+    let h = general::row_height(lines.len(), 12.5, 32.0);
+    (lines, h)
+}
+
+/// One effect's row, `w` wide, its middle at `y`.
+fn effect_row(ui: &mut Ui, an: &mut theme::AnimStyle, x: f32, y: f32, w: f32, id: &str, lines: &[String]) {
     let mut e = an.effects.get(id).copied().unwrap_or_else(|| theme::default_effect(id));
     let before = e;
-    ui.text(x, y + 4.5, label, 12.5, false, ui.ink, if an.enabled { 0.92 } else { 0.45 }, Align::Left);
-    ui.toggle(x + 150.0, y - 12.0, &mut e.on);
+    general::lines_at(ui, x, y, lines, 12.5, if an.enabled { 0.92 } else { 0.45 });
+    let left = x + w - EFFECT_CONTROLS;
+    ui.toggle(left, y - 12.0, &mut e.on);
+    let sx = left + 44.0 + 8.0;
     if e.on {
-        ui.slider([x + 210.0, y - 10.0, 66.0, 20.0], &mut e.speed, 0.25, 3.0, "x");
+        ui.slider([sx, y - 10.0, 50.0, 20.0], &mut e.speed, 0.25, 3.0, "x");
     } else {
-        ui.text(x + 210.0, y + 4.5, "off", 12.0, false, ui.ink, 0.4, Align::Left);
+        ui.text(sx, y + 4.5, "off", 12.0, false, ui.ink, 0.4, Align::Left);
     }
     if e != before {
         if e == theme::default_effect(id) {
@@ -1706,7 +1746,7 @@ fn page_keywords(page: Page) -> &'static str {
         Page::Keys => "keyboard shortcut keys layout run program",
         Page::Mouse => "mouse pointer speed acceleration adaptive flat scroll natural left-handed",
         Page::Touchpad => "touchpad trackpad tap click scroll natural fingers test gestures three finger swipe",
-        Page::Cursor => "cursor theme size look colour outline shadow shape arrow hand text edges loading busy starting program launch icon bounce hide typing smooth morph animate shake find",
+        Page::Cursor => "cursor theme size look colour outline shadow shape arrow hand text edges loading busy starting program launch icon bounce hide typing smooth morph animate shake find custom build sliders navigator",
         Page::Icons => "icon shape plate tile padding theme",
         Page::About => "version info credits",
         Page::Notifications => "notification toast do not disturb dnd corner position time",
@@ -1723,36 +1763,46 @@ fn page_keywords(page: Page) -> &'static str {
 fn page_animations(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
     ui.text(x, y + 52.0, "Animations", 22.0, true, ui.ink, 0.97, Align::Left);
     let a = &mut ctx.theme.animations;
-    // ---- all of them
+    // ---- all of them: in one row, or in two when the window is narrow
     let gy = y + 76.0;
-    ui.fill([x, gy, cw, 54.0], 12.0, ui.ink, 0.05);
-    ui.row(x + 16.0, gy + 14.0, "Animations");
-    ui.toggle(x + 120.0, gy + 15.0, &mut a.enabled);
-    ui.row(x + 220.0, gy + 14.0, "Speed of all");
-    ui.slider([x + 330.0, gy + 17.0, 200.0, 20.0], &mut a.speed, 0.25, 3.0, "x");
-    // ---- each one: groups in two columns
-    let colw = (cw - 28.0) / 2.0;
-    let top = gy + 80.0;
+    let (all_w, speed_w) = (ui.measure("Animations", 13.0, false), ui.measure("Speed of all", 13.0, false));
+    let toggle_x = x + (16.0 + all_w + 14.0).max(120.0);
+    let one_row = toggle_x + 56.0 + speed_w + 14.0 + 120.0 + 70.0 <= x + cw;
+    let (head_h, speed_x, speed_cy) = if one_row { (54.0, (toggle_x + 56.0).max(x + 220.0), gy + 27.0) } else { (94.0, x + 16.0, gy + 67.0) };
+    ui.fill([x, gy, cw, head_h], 12.0, ui.ink, 0.05);
+    ui.row(x + 16.0, gy + 27.0, "Animations");
+    ui.toggle(toggle_x, gy + 15.0, &mut a.enabled);
+    ui.row(speed_x, speed_cy, "Speed of all");
+    let slider_x = speed_x + speed_w + 14.0;
+    ui.slider([slider_x, speed_cy - 10.0, (x + cw - 70.0 - slider_x).clamp(40.0, 200.0), 20.0], &mut a.speed, 0.25, 3.0, "x");
+    // ---- each one: groups in two columns, in one when two would leave the labels no room
+    let half = (cw - 28.0) / 2.0;
+    let two = half >= 280.0;
+    let colw = if two { half } else { cw };
+    let top = gy + head_h + 26.0;
     let mut col_y = [top, top];
     let mut group = "";
     let mut col = 0;
+    let col_x = |col: usize| x + col as f32 * (colw + 28.0);
     for (g, id, label) in theme::EFFECTS {
         if *g != group {
             group = g;
             // Windows and Menus on the left, the Shell on the right
-            col = if *g == "Shell" { 1 } else { 0 };
+            col = if two && *g == "Shell" { 1 } else { 0 };
             if col_y[col] > top {
                 col_y[col] += 20.0;
             }
-            ui.section(x + col as f32 * (colw + 28.0), col_y[col], &g.to_uppercase());
+            ui.section(col_x(col), col_y[col], &g.to_uppercase());
             col_y[col] += 22.0;
         }
-        effect_row(ui, a, x + col as f32 * (colw + 28.0) + 4.0, col_y[col] + 10.0, id, label);
-        col_y[col] += 32.0;
+        let (lines, h) = effect_label(ui, label, colw - 4.0);
+        effect_row(ui, a, col_x(col) + 4.0, col_y[col] + h / 2.0 - 6.0, colw - 4.0, id, &lines);
+        col_y[col] += h;
     }
     // ---- the light / dark switch and the sounds, under the Shell column
-    let rx = x + colw + 28.0;
-    let mut ry = col_y[1] + 10.0;
+    let side = two as usize;
+    let rx = col_x(side);
+    let mut ry = col_y[side] + 10.0;
     ui.section(rx, ry, "LIGHT / DARK SWITCH");
     ry += 26.0;
     let mut sel = match a.switch {
@@ -1764,21 +1814,27 @@ fn page_animations(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) 
         a.switch = [theme::SwitchAnim::Circle, theme::SwitchAnim::Fade, theme::SwitchAnim::None][sel];
     }
     ry += 46.0;
+    // the controls start after the longest of these labels
+    let names = ["Duration", "Glowing edge", "Interface sounds", "Volume"];
+    let name_w = names.iter().map(|n| ui.measure(n, 13.0, false)).fold(0.0f32, f32::max);
+    let sx = rx + (4.0 + name_w + 14.0).max(110.0);
+    let sw = (rx + colw - 78.0 - sx).max(40.0);
     ui.row(rx + 4.0, ry - 4.0, "Duration");
-    ui.slider([rx + 110.0, ry - 4.0, colw - 200.0, 20.0], &mut a.switch_ms, 150.0, 2500.0, " ms");
+    ui.slider([sx, ry - 14.0, sw, 20.0], &mut a.switch_ms, 150.0, 2500.0, " ms");
     ry += 34.0;
     ui.row(rx + 4.0, ry - 4.0, "Glowing edge");
-    ui.toggle(rx + 150.0, ry - 8.0, &mut a.rim);
+    ui.toggle(sx, ry - 16.0, &mut a.rim);
     ry += 40.0;
     ui.section(rx, ry, "SOUNDS");
     ry += 26.0;
     ui.row(rx + 4.0, ry - 4.0, "Interface sounds");
-    ui.toggle(rx + 150.0, ry - 8.0, &mut a.sounds);
+    ui.toggle(sx, ry - 16.0, &mut a.sounds);
     ry += 34.0;
     ui.row(rx + 4.0, ry - 4.0, "Volume");
-    ui.slider([rx + 110.0, ry - 4.0, colw - 180.0, 20.0], &mut a.sound_volume, 0.0, 1.5, "");
+    ui.slider([sx, ry - 14.0, sw, 20.0], &mut a.sound_volume, 0.0, 1.5, "");
     let ny = col_y[0].max(ry) + 34.0;
-    ui.text(x, ny, "A switched-off animation does not play at all: what it moves jumps to where it ends.", 12.0, false, ui.ink, 0.55, Align::Left);
+    let note = general::wrapped(ui, "A switched-off animation does not play at all: what it moves jumps to where it ends.", 12.0, cw);
+    general::lines_at(ui, x, ny - 4.5 + (note.len() - 1) as f32 * general::line_pitch(12.0) / 2.0, &note, 12.0, 0.55);
 }
 
 /// Whether the "Ours" icon kind is offered on the icons page.
@@ -1893,7 +1949,7 @@ fn page_icons(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) -> [f
                 std::sync::Mutex::new(if t.colour_clear { ClearStyle::Colour } else { t.clear })
             });
             let mut style = *cell.lock().unwrap();
-            let opts = [(ClearStyle::Frost, "Frost"), (ClearStyle::Contrast, "Contrast"), (ClearStyle::Ink, "Ink"), (ClearStyle::Colour, "Colour")];
+            let opts = [(ClearStyle::Frost, "Frost"), (ClearStyle::Contrast, "Contrast"), (ClearStyle::Ink, "Ink"), (ClearStyle::Colour, "Colour"), (ClearStyle::Auto, "Auto")];
             if f.pick(ui, "Clear style", &mut style, &opts) {
                 *cell.lock().unwrap() = style;
                 crate::iconrender::set_clear(style);
@@ -1903,6 +1959,7 @@ fn page_icons(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) -> [f
                 ClearStyle::Contrast => "White symbols with a shadow on smoky glass",
                 ClearStyle::Ink => "Dark symbols on milky glass",
                 ClearStyle::Colour => "The symbols keep their own colours",
+                ClearStyle::Auto => "Frost, turning to Contrast over light pictures",
             }, true);
         }
     }

@@ -134,9 +134,14 @@ impl State {
                 None => (None, None),
             });
             let ctx = DrawCtx { screen: self.size, apps: &self.apps, pinned: &pinned, theme: &self.theme, bar, anchor, icon_cell: &|a: &AppEntry| renderer.app_icon_get(&a.id) };
-            let (lp, ll) = self.launcher.draw(&ctx);
+            let (mut lp, ll) = self.launcher.draw(&ctx);
+            // the Dock comes up over the Launchpad for what is brought to it, under the icon that is carried
+            let (dp, dl) = self.dock_over_launcher();
+            let under = self.launcher.lifted_from().unwrap_or(lp.len()).min(lp.len());
+            lp.splice(under..under, dp);
             shell.extend(lp);
             labels.extend(ll);
+            labels.extend(dl);
         }
         let mut toast_labels = Vec::new();
         self.toast_panels(&mut shell, &mut toast_labels);
@@ -201,7 +206,8 @@ impl State {
             _ => None,
         };
         for (i, w) in self.wins.iter().enumerate() {
-            if !w.mapped || w.min_k.x > 0.985 || w.deco != Deco::Server {
+            // (in the overview the minimized have cards, with their titles)
+            if !w.mapped || (w.min_k.x > 0.985 && self.ov.x <= 0.001) || w.deco != Deco::Server {
                 continue;
             }
             let f = Self::frame_rect(w);
@@ -214,16 +220,56 @@ impl State {
                     tf = [f[0] + shift, f[1], f[2] - shift, f[3]];
                 }
             }
-            let (x0, x1) = decor::title_span(&self.theme, tf);
-            let title = ellipsize(&self.renderer, &w.title, 13.0, (x1 - x0).max(40.0));
             let th = w.chrome_theme(&self.theme);
+            // the program's icon in the title bar: the title makes room for it
+            let ws = &self.theme.window;
+            let with_icon = ws.title_icon != memrium_de::theme::TitleIcon::None && !matches!(th.window.decoration, DecoKind::Minimal | DecoKind::Strip) && w.ins[1] > 0.0;
+            let mut icon_at = None;
+            let title;
+            if with_icon {
+                use memrium_de::theme::{TitleAlign, TitleIcon};
+                let (s, gap) = (ws.title_icon_size, 6.0);
+                let room = s + gap;
+                let (x0, x1) = decor::title_span(&self.theme, tf);
+                let centred = !(ws.title_align == TitleAlign::Left || matches!(th.window.decoration, DecoKind::Win11 | DecoKind::Aero));
+                title = ellipsize(&self.renderer, &w.title, 13.0, (x1 - x0 - room).max(40.0));
+                match ws.title_icon {
+                    TitleIcon::Right => {
+                        icon_at = Some(x1 - s / 2.0);
+                        tf[2] -= room;
+                    }
+                    TitleIcon::Title if centred && !title.is_empty() => {
+                        // the icon and the title together in the middle
+                        let tw = self.renderer.text_width(&title, 13.0, true);
+                        let mid = (x0 + x1) / 2.0;
+                        icon_at = Some(mid - (room + tw) / 2.0 + s / 2.0);
+                        tf[0] += room / 2.0;
+                    }
+                    _ => {
+                        icon_at = Some(x0 + s / 2.0);
+                        tf[0] += room;
+                        tf[2] -= room;
+                    }
+                }
+            } else {
+                let (x0, x1) = decor::title_span(&self.theme, tf);
+                title = ellipsize(&self.renderer, &w.title, 13.0, (x1 - x0).max(40.0));
+            }
             let mut labels = decor::title_labels(&th, tf, &title, Some(i) == focus);
             let mut panels = Vec::new();
+            if let Some(ix) = icon_at {
+                let (s, iy) = (ws.title_icon_size, f[1] + th.window.titlebar / 2.0);
+                let fade = if Some(i) == focus { 1.0 } else { 0.6 };
+                match self.app_index_for_window(w).and_then(|a| self.renderer.app_icon_get(&self.apps[a].id)) {
+                    Some(c) => panels.push(Panel::app_icon(ix, iy, s, c, fade)),
+                    None => panels.push(Panel::glyph(ix, iy, s * 0.85, "app-window", if self.theme.dark { [0.9; 3] } else { [0.25; 3] }, 0.8 * fade)),
+                }
+            }
             if !menus.is_empty() {
                 let rects: Vec<[f32; 4]> = menus.iter().map(|(_, r)| *r).collect();
                 let open = self.menu.open.then(|| self.title_menu.as_ref().filter(|(id, _)| *id == w.id).and_then(|(_, n)| menus.iter().position(|(m, _)| m == n))).flatten();
                 let under = if open.is_none() && title_hover == Some(i) { menus.iter().position(|(_, r)| Self::in_rect(self.mouse, *r)) } else { None };
-                panels = decor::title_menu_panels(&th, &rects, open.or(under), open.is_some());
+                panels.extend(decor::title_menu_panels(&th, &rects, open.or(under), open.is_some()));
                 labels.extend(decor::title_menu_labels(&th, f, &menus, Some(i) == focus));
             }
             panels.extend(self.renderer.label_panels(&labels));
@@ -236,6 +282,11 @@ impl State {
             shells.push((stamp, self.shell_item(k)));
         }
         let desktop = if self.capture_alone { None } else { self.desktop_item() };
+        let desk_over = if self.capture_alone { None } else { self.desk_over_item() };
+        // (before the launch copies and the opening's shift: where the icons are)
+        if !self.capture_alone && !self.capturing {
+            self.note_icons(&shell, desktop.as_ref());
+        }
         let preview = self.alt_tab_layout().or_else(|| self.preview_layout());
         self.tooltip_panels(&mut shell);
         if let Some(l) = &preview {
@@ -247,10 +298,12 @@ impl State {
         let intro = if self.capturing { None } else { self.intro_rems() };
         let wall_view = if self.capturing { None } else { Some(self.wall_view_now()) };
         let ime = self.ime_popup_origins();
-        let ov_cards = if self.ov.x > 0.001 { self.ov_layout() } else { Vec::new() };
-        self.ov_labels(&ov_cards, &mut shell);
-        self.ov_strip_panels(&mut shell);
-        let mut items = build_items(&self.wins, &self.popups, &self.surfaces, ime, focus, &docks, &title_panels, &self.theme, self.hover_btn, shells, desktop, &self.ghosts, self.renderer.scale().max(1.0), &self.rules, (self.ws_pos.x, self.size[0]), (self.ov.x.max(0.0), &ov_cards, self.ov_hover));
+        let ov = self.ov_frame();
+        // over all of the shell: the icon of a program that is starting, on its way to the pointer
+        self.launch_panels(&mut shell);
+        self.pinning_panels(&mut shell);
+        let mut items = build_items(&self.wins, &self.popups, &self.surfaces, ime, focus, &docks, &title_panels, &self.theme, self.hover_btn, (self.corner.0, self.corner.1.x), shells, desktop, desk_over, &self.ghosts, self.renderer.scale().max(1.0), &self.rules, (self.ws_pos.x, self.size[0]), &ov);
+        super::overview_draw::Src { wins: &self.wins, surfaces: &self.surfaces, titles: &title_panels, theme: &self.theme, rules: &self.rules }.items(&ov, self.overview.wall.as_ref().map(|w| &w.1), &mut items);
         if let Some(l) = &preview {
             items.extend(crate::dock::preview_items(l, &self.wins, &self.surfaces, self.theme.dark, self.theme.accent));
         }

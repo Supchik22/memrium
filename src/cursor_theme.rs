@@ -110,8 +110,10 @@ fn icons_dir() -> PathBuf {
 fn stamp(prefs: &CursorPrefs, accent: [f32; 3]) -> String {
     let p = prefs;
     format!(
-        "v2 {:?} {:.0} {:.2} {:.2} {:.1} {:?} {:?} {:?} {:.2} {:.2} {:?} {:?} {:.3} {:.3} {:.3}",
-        p.look, p.hue, p.sat, p.bright, p.outline, p.edge, p.arrow, p.busy, p.busy_speed, p.shadow, p.hand, p.beam, accent[0], accent[1], accent[2]
+        "v3 {:?} {:.0} {:.2} {:.2} {:.1} {:?} {:?} {:?} {:.2} {:.2} {:?} {:?} {:?} {:.3} {:.3} {:.3} {}",
+        p.look, p.hue, p.sat, p.bright, p.outline, p.edge, p.arrow, p.busy, p.busy_speed, p.shadow, p.hand, p.beam, p.resize, accent[0], accent[1], accent[2],
+        // the shapes built with the sliders, every number of them
+        serde_json::to_string(&p.custom).unwrap_or_default()
     )
 }
 
@@ -511,6 +513,38 @@ mod tests {
         let pos = u32::from_le_bytes(f[last + 8..last + 12].try_into().unwrap()) as usize;
         let (w, h) = (u32::from_le_bytes(f[pos + 16..pos + 20].try_into().unwrap()) as usize, u32::from_le_bytes(f[pos + 20..pos + 24].try_into().unwrap()) as usize);
         assert_eq!(pos + 36 + 4 * w * h, f.len());
+    }
+
+    #[test]
+    fn the_stamp_follows_every_shape_setting() {
+        use crate::cursor::custom::Gen;
+        let accent = [0.3, 0.5, 0.9];
+        let base = CursorPrefs::default();
+        let was = stamp(&base, accent);
+        assert_ne!(stamp(&CursorPrefs { resize: crate::cursor::ResizeStyle::Dot, ..base.clone() }, accent), was, "resize");
+        fn each<G: Gen>(get: fn(&mut CursorPrefs) -> &mut crate::cursor::custom::Made<G>) {
+            let accent = [0.3, 0.5, 0.9];
+            let mut on = CursorPrefs::default();
+            assert_ne!(
+                {
+                    get(&mut on).on = true;
+                    stamp(&on, accent)
+                },
+                stamp(&CursorPrefs::default(), accent)
+            );
+            for d in G::DIALS {
+                let mut p = on.clone();
+                let v = (d.get)(&mut get(&mut p).shape);
+                *v += (d.hi - d.lo) * 0.01;
+                assert_ne!(stamp(&p, accent), stamp(&on, accent), "{}", d.label);
+            }
+        }
+        each(|p| &mut p.custom.arrow);
+        each(|p| &mut p.custom.hand);
+        each(|p| &mut p.custom.beam);
+        each(|p| &mut p.custom.resize);
+        each(|p| &mut p.custom.busy);
+        each(|p| &mut p.custom.signs);
     }
 
     #[test]

@@ -89,6 +89,8 @@ pub struct Launcher {
     /// where the pointer went down and on what; `dragging` once it has moved far enough
     pressed: Option<(Hit, [f32; 2])>,
     dragging: bool,
+    /// where in the last drawn panels what is dragged begins (what is to lie under it is put in there)
+    lifted_from: std::cell::Cell<Option<usize>>,
     /// the pointer went down while the Launchpad was up (a press that opened it, coming up over it, is not a click on it)
     down: bool,
 }
@@ -237,6 +239,7 @@ impl Default for Launcher {
             pad_hits: RefCell::new(Vec::new()),
             pressed: None,
             dragging: false,
+            lifted_from: std::cell::Cell::new(None),
             down: false,
         }
     }
@@ -733,6 +736,50 @@ impl Launcher {
     /// The Plasma menu is pinned: it stays open after a launch and when something else is clicked.
     pub fn is_pinned(&self) -> bool {
         self.pinned.get()
+    }
+
+    /// The program being dragged in the Launchpad (a folder is none).
+    pub fn dragged_app(&self, list: &[AppEntry]) -> Option<usize> {
+        if !(self.open && self.grid && self.dragging && self.down) {
+            return None;
+        }
+        self.app_of_hit(self.pressed?.0, list)
+    }
+
+    fn app_of_hit(&self, hit: Hit, list: &[AppEntry]) -> Option<usize> {
+        match hit {
+            Hit::App(i) | Hit::InFolder(i) => (i < list.len()).then_some(i),
+            Hit::Slot(s) => match self.layout.slots.get(s)? {
+                Slot::App { id } => list.iter().position(|a| &a.id == id),
+                Slot::Folder { .. } => None,
+            },
+            Hit::Title => None,
+        }
+    }
+
+    /// The drag was taken elsewhere (onto the Dock): nothing in the Launchpad moves.
+    pub fn cancel_drag(&mut self) {
+        self.pressed = None;
+        self.dragging = false;
+        self.down = false;
+    }
+
+    /// The program drawn at `p` (a launcher of any kind that lists programs).
+    pub fn app_at(&self, p: [f32; 2], list: &[AppEntry]) -> Option<usize> {
+        if self.grid {
+            // (an open folder's apps are noted after the grid's cells they lie over)
+            let hit = self.pad_hits.borrow().iter().rev().find(|(r, _)| inside(p, *r)).map(|(_, h)| *h)?;
+            return self.app_of_hit(hit, list);
+        }
+        if self.figlet {
+            return None;
+        }
+        self.hits.borrow().iter().find(|(r, _)| inside(p, *r)).map(|(_, i)| *i).filter(|i| *i < list.len())
+    }
+
+    /// See `lifted_from`.
+    pub fn lifted_from(&self) -> Option<usize> {
+        if self.grid { self.lifted_from.get() } else { None }
     }
 
     /// Is the pointer over an app of the last drawn frame?
@@ -1413,6 +1460,7 @@ impl Launcher {
         // while a folder is open the grid behind it is only to look at
         let live = self.folder.is_none();
         let lifted = if self.dragging { self.pressed.map(|(h, _)| h) } else { None };
+        self.lifted_from.set(None);
         let mut hover_drop: Option<usize> = None;
         let grid_labels = l.len();
         for pg in (pos.floor().max(0.0) as usize)..=((pos.ceil().max(0.0)) as usize).min(pages - 1) {
@@ -1554,6 +1602,7 @@ impl Launcher {
         if let (Some(h), true) = (lifted, self.dragging) {
             let m = self.mouse;
             let from = p.len();
+            self.lifted_from.set(Some(from));
             match h {
                 Hit::Slot(s) => match self.layout.slots.get(s) {
                     Some(Slot::App { id }) => {

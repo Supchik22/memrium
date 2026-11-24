@@ -6,7 +6,9 @@
 
 mod damage;
 mod dock;
+mod dock_pin;
 mod pointer;
+mod pointer_hold;
 mod fileicons;
 mod headless;
 mod record;
@@ -14,6 +16,7 @@ mod flyout;
 mod gestures;
 mod semindex;
 mod keygrab;
+mod launch;
 mod livetext;
 mod voice;
 mod popup;
@@ -35,6 +38,7 @@ mod fettle_feed;
 mod idle;
 mod ime;
 mod widgets_panel;
+mod desk_apps;
 mod desk_widgets;
 mod media;
 mod handlers;

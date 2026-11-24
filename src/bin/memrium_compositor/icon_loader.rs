@@ -4,7 +4,7 @@
 //! pictures into the atlas (`State::pump_icons`).
 
 use memrium_de::apps::{IconIndex, IconSlot};
-use memrium_de::renderer::{bake_app_icon_levels, BakedIcon, TileStyle};
+use memrium_de::renderer::{bake_app_icon_levels, bake_app_icon_levels_big, BakedIcon, TileStyle};
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     mpsc::{channel, Receiver, Sender},
@@ -33,10 +33,13 @@ struct Job {
     tile: Option<TileStyle>,
     /// the icon is looked up in this icon pack alone (a preview in Settings), not in the theme in use
     pack: Option<String>,
+    /// the icon at 256 px for a big block of the atlas
+    big: bool,
 }
 
 pub struct Done {
     pub id: String,
+    pub big: bool,
     /// None: no such icon
     pub icon: Option<BakedIcon>,
     /// it comes from the plateless theme of a clear look: the shell draws its plate as live glass
@@ -82,10 +85,14 @@ impl IconLoader {
                             std::thread::sleep(Duration::from_millis(20));
                         },
                     };
-                    let path = index.find(&job.icon, 128);
-                    let icon = path.as_deref().and_then(memrium_de::apps::load_icon_levels).map(|levels| bake_app_icon_levels(levels, job.tile));
+                    let path = index.find(&job.icon, if job.big { 256 } else { 128 });
+                    let icon = if job.big {
+                        path.as_deref().and_then(memrium_de::apps::load_icon_levels_big).map(|levels| bake_app_icon_levels_big(levels, job.tile))
+                    } else {
+                        path.as_deref().and_then(memrium_de::apps::load_icon_levels).map(|levels| bake_app_icon_levels(levels, job.tile))
+                    };
                     let live = job.pack.is_none() && path.as_deref().is_some_and(memrium_de::apps::is_live_icon);
-                    if done_tx.send(Done { id: job.id, icon, live }).is_err() {
+                    if done_tx.send(Done { id: job.id, big: job.big, icon, live }).is_err() {
                         return;
                     }
                 })
@@ -97,14 +104,21 @@ impl IconLoader {
     /// Ask for an icon (once: a second ask while it is on its way does nothing).
     pub fn request(&mut self, id: &str, icon: &str, tile: Option<TileStyle>) {
         if self.pending.insert(id.to_string()) {
-            let _ = self.tx.send(Job { id: id.to_string(), icon: icon.to_string(), tile, pack: None });
+            let _ = self.tx.send(Job { id: id.to_string(), icon: icon.to_string(), tile, pack: None, big: false });
         }
     }
 
     /// Like `request`, for an icon of one icon pack (`id` is its key in the atlas).
     pub fn request_pack(&mut self, id: &str, pack: &str, icon: &str, tile: Option<TileStyle>) {
         if self.pending.insert(id.to_string()) {
-            let _ = self.tx.send(Job { id: id.to_string(), icon: icon.to_string(), tile, pack: Some(pack.to_string()) });
+            let _ = self.tx.send(Job { id: id.to_string(), icon: icon.to_string(), tile, pack: Some(pack.to_string()), big: false });
+        }
+    }
+
+    /// Ask for the 256 px picture of an icon that is drawn large (once while it is on its way).
+    pub fn request_big(&mut self, id: &str, icon: &str, tile: Option<TileStyle>) {
+        if self.pending.insert(format!("{id}\u{1}big")) {
+            let _ = self.tx.send(Job { id: id.to_string(), icon: icon.to_string(), tile, pack: None, big: true });
         }
     }
 
@@ -114,7 +128,7 @@ impl IconLoader {
         while out.len() < max {
             match self.rx.try_recv() {
                 Ok(d) => {
-                    self.pending.remove(&d.id);
+                    self.pending.remove(&if d.big { format!("{}\u{1}big", d.id) } else { d.id.clone() });
                     out.push(d);
                 }
                 Err(_) => break,

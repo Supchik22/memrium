@@ -1,15 +1,105 @@
 //! The General, Appearance and Keyboard pages of Settings.
 
 use super::*;
-use crate::theme::{ControlLook, ScrollClick, ScrollShow, SidebarSize};
+use crate::theme::{ControlFlavour, ControlLook, ScrollClick, ScrollShow, SidebarSize};
 use chebrium::ui::Cursor;
 
+#[path = "settings_cursor.rs"]
+mod shape_editor;
+
+/// Which shape preset the roundness and the corner smoothing amount to: 0 pill, 1 squircle, 2 rounded square, 3 square.
+fn control_shape(round: f32, smoothing: f32) -> usize {
+    if round >= 0.95 {
+        0
+    } else if round >= 0.35 && smoothing >= 0.7 {
+        1
+    } else if round >= 0.35 {
+        2
+    } else {
+        3
+    }
+}
+
+/// The (roundness, corner smoothing) of a shape preset; the pill and the square keep the smoothing they had.
+fn shape_values(shape: usize, smoothing: f32) -> (f32, f32) {
+    match shape {
+        0 => (1.0, smoothing),
+        1 => (0.55, 1.0),
+        2 => (0.55, 0.0),
+        _ => (0.0, smoothing),
+    }
+}
+
 fn group(ui: &mut Ui, r: [f32; 4]) {
-    ui.fill(r, 12.0, ui.ink, 0.05);
+    ui.card(r, 12.0);
 }
 
 fn separator(ui: &mut Ui, x: f32, y: f32, w: f32) {
     ui.fill([x + 16.0, y, w - 32.0, 1.0], 0.0, ui.ink, 0.09);
+}
+
+/// `text` in the language in use, broken into lines of at most `room` px: between words, inside a word only where the
+/// word alone is wider than that.
+pub(super) fn wrapped(ui: &mut Ui, text: &str, size: f32, room: f32) -> Vec<String> {
+    wrap_lines(&crate::i18n::tr(text), room, &mut |s| ui.measure_raw(s, size, false))
+}
+
+fn wrap_lines(text: &str, room: f32, width: &mut dyn FnMut(&str) -> f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let longer = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+        if width(&longer) <= room {
+            line = longer;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        for ch in word.chars() {
+            line.push(ch);
+            // (a single letter stays, however narrow the room is)
+            if width(&line) > room && line.chars().count() > 1 {
+                line.pop();
+                lines.push(std::mem::take(&mut line));
+                line.push(ch);
+            }
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// The line pitch of wrapped text of `size`.
+pub(super) fn line_pitch(size: f32) -> f32 {
+    (size * 1.28).round()
+}
+
+/// Wrapped lines drawn centred on `cy` (text of one line sits where `Ui::row` puts it).
+pub(super) fn lines_at(ui: &mut Ui, x: f32, cy: f32, lines: &[String], size: f32, alpha: f32) {
+    let pitch = line_pitch(size);
+    let first = cy + 4.5 - (lines.len() as f32 - 1.0) * pitch / 2.0;
+    for (i, line) in lines.iter().enumerate() {
+        ui.text_raw(x, first + i as f32 * pitch, line, size, false, ui.ink, alpha, Align::Left);
+    }
+}
+
+/// How tall a row is whose label takes `lines` lines, and never less than `least`.
+pub(super) fn row_height(lines: usize, size: f32, least: f32) -> f32 {
+    (lines as f32 * line_pitch(size) + 8.0).max(least)
+}
+
+/// A label with a wide control after it: in one row when both fit, else the control goes under the label. Returns the
+/// control's box and how much taller that made the row.
+fn control_box(ui: &mut Ui, label: &str, x: f32, top: f32, cw: f32, want: f32) -> ([f32; 4], f32) {
+    if ui.measure(label, 13.0, false) + 12.0 + want <= cw - 32.0 {
+        ([x + cw - 16.0 - want, top + 12.0, want, 28.0], 0.0)
+    } else {
+        let w = (cw - 32.0).min(want);
+        ([x + cw - 16.0 - w, top + 46.0, w, 28.0], 36.0)
+    }
 }
 
 /// A round radio button with its label; true when it was clicked.
@@ -181,11 +271,21 @@ pub(super) fn page_appearance(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32
 
     // ---- how the controls look, and the GTK theme
     let cy = sy + 232.0 + 16.0;
-    group(ui, [x, cy, cw, 418.0 + 4.0 * 46.0]);
+    group(ui, [x, cy, cw, 418.0 + 6.0 * 46.0]);
     ui.section(px, cy + 26.0, "CONTROLS");
     let c = &mut ctx.theme.ui.controls;
     let mut f = Form::new(px, cy + 60.0, pw, 46.0);
-    f.pick(ui, "Style", &mut c.look, &[(ControlLook::Keys, "Keys"), (ControlLook::Flat, "Flat")]);
+    f.pick(ui, "Style", &mut c.look, &[(ControlLook::Keys, "Keys"), (ControlLook::Flat, "Flat"), (ControlLook::Glass, "Glass"), (ControlLook::Frost, "Frost"), (ControlLook::Soft, "Soft"), (ControlLook::Mono, "Mono"), (ControlLook::Pearl, "Pearl")]);
+    // the shape is a preset of the two sliders below and of the corner smoothing of the whole desktop: a squircle is a rounded square whose
+    // corners bend in gradually (not a circle's arc)
+    let corners = &mut ctx.theme.ui.corners;
+    let mut shape = control_shape(c.round, *corners);
+    if f.pick(ui, "Shape", &mut shape, &[(0, "Pill"), (1, "Squircle"), (2, "Rounded"), (3, "Square")]) {
+        let (round, smooth) = shape_values(shape, *corners);
+        c.round = round;
+        *corners = smooth;
+    }
+    f.pick(ui, "Mono flavour", &mut c.flavour, &[(ControlFlavour::Plain, "Plain"), (ControlFlavour::Halo, "Halo"), (ControlFlavour::Edge, "Edge"), (ControlFlavour::Aurora, "Aurora"), (ControlFlavour::Line, "Line"), (ControlFlavour::Tint, "Tint")]);
     f.slider(ui, "Depth", &mut c.depth, 0.0, 1.5, "");
     f.slider(ui, "Roundness", &mut c.round, 0.0, 1.0, "");
     f.slider(ui, "Thickness", &mut c.thickness, 0.0, 1.0, "");
@@ -266,16 +366,19 @@ fn labels_block(ui: &mut Ui, style: &mut crate::keys::KeyStyle, x: f32, y: f32, 
     ui.section(x, y, "SHORTCUT LABELS");
     let custom = style.super_label == SuperLabel::Custom;
     let gy = y + 12.0;
-    let h = 52.0 + if custom { 44.0 } else { 0.0 } + 52.0;
+    let (super_box, more) = control_box(ui, "Super key is shown as", x, gy, cw, 340.0);
+    let symbols = wrapped(ui, "Use ⌃ ⌥ ⇧ ␣ for Ctrl, Alt, Shift and Space", 13.0, cw - 32.0 - 56.0);
+    let symbols_h = row_height(symbols.len(), 13.0, 52.0);
+    let h = 52.0 + more + if custom { 44.0 } else { 0.0 } + symbols_h;
     group(ui, [x, gy, cw, h]);
     let rx = x + cw - 16.0;
     ui.row(x + 16.0, gy + 31.0, "Super key is shown as");
     let labels: Vec<&str> = SUPER_LABELS.iter().map(|s| s.1).collect();
     let mut sel = SUPER_LABELS.iter().position(|(l, _)| *l == style.super_label).unwrap_or(0);
-    if ui.segmented([rx - 340.0, gy + 12.0, 340.0, 28.0], &labels, &mut sel) {
+    if ui.segmented(super_box, &labels, &mut sel) {
         style.super_label = SUPER_LABELS[sel].0;
     }
-    let mut cy = gy + 52.0;
+    let mut cy = gy + 52.0 + more;
     if custom {
         separator(ui, x, cy, cw);
         ui.row(x + 16.0, cy + 28.0, "Text");
@@ -283,8 +386,8 @@ fn labels_block(ui: &mut Ui, style: &mut crate::keys::KeyStyle, x: f32, y: f32, 
         cy += 44.0;
     }
     separator(ui, x, cy, cw);
-    ui.row(x + 16.0, cy + 31.0, "Use ⌃ ⌥ ⇧ ␣ for Ctrl, Alt, Shift and Space");
-    ui.toggle(rx - 44.0, cy + 14.0, &mut style.symbols);
+    lines_at(ui, x + 16.0, cy + symbols_h / 2.0 + 1.0, &symbols, 13.0, 0.92);
+    ui.toggle(rx - 44.0, cy + symbols_h / 2.0 - 12.0, &mut style.symbols);
 
     // ---- a sample menu, written the way the choice makes it
     let py = gy + h + 14.0;
@@ -382,11 +485,12 @@ fn layouts_block(ui: &mut Ui, input: &mut crate::input::InputPrefs, x: f32, y: f
     // ---- the switch
     ui.section(x, sy, "SWITCHING");
     let wy = sy + 12.0;
-    group(ui, [x, wy, cw, 52.0]);
+    let (switch_box, more) = control_box(ui, "Switch with", x, wy, cw, 470.0);
+    group(ui, [x, wy, cw, 52.0 + more]);
     ui.row(x + 16.0, wy + 31.0, "Switch with");
     let labels: Vec<&str> = SWITCH_KEYS.iter().map(|s| s.1).collect();
     let mut sel = switch_index(&options);
-    if ui.segmented([rx - 470.0, wy + 12.0, 470.0, 28.0], &labels, &mut sel) {
+    if ui.segmented(switch_box, &labels, &mut sel) {
         options = with_switch(&options, sel);
     }
 
@@ -396,7 +500,7 @@ fn layouts_block(ui: &mut Ui, input: &mut crate::input::InputPrefs, x: f32, y: f
         input.xkb_variant = nv;
         input.xkb_options = options;
     }
-    sy + 12.0 + 52.0 + 30.0 - y
+    sy + 12.0 + 52.0 + more + 30.0 - y
 }
 
 pub(super) fn page_keys(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
@@ -407,28 +511,31 @@ pub(super) fn page_keys(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: 
     let used = labels_block(ui, &mut ctx.cfg.keys.style, x, y + 94.0, cw);
     let y = y + used;
     ui.section(x, y + 94.0, "SHORTCUTS");
-    ui.text(x, y + 120.0, "Shortcuts are written like Ctrl+Alt+T or Super+Up. Empty turns one off.", 12.0, false, ui.ink, 0.55, Align::Left);
-    let y = y + 36.0;
+    let note = wrapped(ui, "Shortcuts are written like Ctrl+Alt+T or Super+Up. Empty turns one off.", 12.0, cw);
+    let note_h = (note.len() - 1) as f32 * line_pitch(12.0);
+    lines_at(ui, x, y + 115.5 + note_h / 2.0, &note, 12.0, 0.55);
+    let top = y + 142.0 + note_h;
     let keys = &mut ctx.cfg.keys;
-    let half = (cw - 24.0) / 2.0;
-    let per_col = ACTIONS.len().div_ceil(2);
-    for (i, (id, label, _)) in ACTIONS.iter().enumerate() {
-        let (col, row) = (i / per_col, i % per_col);
-        let (cx, cy) = (x + col as f32 * (half + 24.0), y + 124.0 + row as f32 * 36.0);
-        ui.text(cx, cy + 4.5, label, 12.0, false, ui.ink, 0.9, Align::Left);
+    let labels: Vec<String> = ACTIONS.iter().map(|(_, label, _)| crate::i18n::tr(label).into_owned()).collect();
+    let sheet = ShortcutSheet::new(cw, &labels, &mut |s| ui.measure_raw(s, 12.0, false));
+    for (i, (id, _, _)) in ACTIONS.iter().enumerate() {
+        let row = &sheet.rows[i];
+        let (cx, cy) = (x + row.x, top + row.y);
+        lines_at(ui, cx, cy, &row.lines, 12.0, 0.9);
         let mut chord = keys.chord(id);
         let before = chord.clone();
-        if ui.text_field([cx + half - 138.0, cy - 13.0, 138.0, 26.0], &format!("key-{id}"), &mut chord) && chord != before {
+        let field = [cx + sheet.col - sheet.field, cy - 13.0, sheet.field, 26.0];
+        if ui.text_field(field, &format!("key-{id}"), &mut chord) && chord != before {
             // keep what was typed, spelled the usual way
             keys.set(id, chord.trim().to_string());
         }
         // a shortcut used twice only works for the first action: say so
         let mine = normalize(&keys.chord(id));
         if !mine.is_empty() && ACTIONS.iter().any(|(o, ..)| o != id && normalize(&keys.chord(o)) == mine && ACTIONS.iter().position(|(a, ..)| a == o) < Some(i)) {
-            ui.fill([cx + half - 148.0, cy - 5.0, 6.0, 10.0], 3.0, [0.95, 0.35, 0.3], 0.9);
+            ui.fill([field[0] - 9.0, cy - 5.0, 6.0, 10.0], 3.0, [0.95, 0.35, 0.3], 0.9);
         }
     }
-    let by = y + 124.0 + per_col as f32 * 36.0 + 18.0;
+    let by = top + sheet.height + 18.0;
     ui.section(x, by, "RUN A PROGRAM");
     while keys.commands.len() < 3 {
         keys.commands.push(Default::default());
@@ -442,6 +549,53 @@ pub(super) fn page_keys(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: 
     ui.text(x, by + 30.0 + 3.0 * 38.0, "Shortcut on the left, command on the right.", 12.0, false, ui.ink, 0.55, Align::Left);
 }
 
+/// Where the shortcuts' rows go: each label wrapped into what its field leaves free, in two columns while there is
+/// room for them.
+struct ShortcutSheet {
+    col: f32,
+    field: f32,
+    height: f32,
+    rows: Vec<ShortcutRow>,
+}
+
+struct ShortcutRow {
+    x: f32,
+    /// the middle of the row
+    y: f32,
+    lines: Vec<String>,
+}
+
+impl ShortcutSheet {
+    const GAP: f32 = 24.0;
+    /// between a label and its field: the red dot of a shortcut used twice stands in it
+    const CLEAR: f32 = 16.0;
+
+    fn new(cw: f32, labels: &[String], width: &mut dyn FnMut(&str) -> f32) -> ShortcutSheet {
+        let half = (cw - Self::GAP) / 2.0;
+        // two columns only while a label keeps some words to a line
+        let cols = if half >= 280.0 { 2 } else { 1 };
+        let col = if cols == 2 { half } else { cw };
+        let field = 138f32.min(col * 0.45);
+        let room = (col - field - Self::CLEAR).max(30.0);
+        let wrapped: Vec<Vec<String>> = labels.iter().map(|l| wrap_lines(l, room, width)).collect();
+        // the second column starts at half of the height, not of the count: some rows are taller
+        let tall: Vec<f32> = wrapped.iter().map(|l| row_height(l.len(), 12.0, 36.0)).collect();
+        let all: f32 = tall.iter().sum();
+        let (mut at, mut column, mut height) = (0.0f32, 0usize, 0.0f32);
+        let mut rows = Vec::with_capacity(labels.len());
+        for (lines, h) in wrapped.into_iter().zip(tall) {
+            if column + 1 < cols && at + h / 2.0 > all / cols as f32 {
+                column += 1;
+                at = 0.0;
+            }
+            rows.push(ShortcutRow { x: column as f32 * (col + Self::GAP), y: at + h / 2.0, lines });
+            at += h;
+            height = height.max(at);
+        }
+        ShortcutSheet { col, field, height, rows }
+    }
+}
+
 /// A settings row whose slider track shows the colours it goes through (lined up with the Form's plain sliders).
 fn colour_row(ui: &mut Ui, f: &mut Form, label: &str, v: &mut f32, colour: &dyn Fn(f32) -> [f32; 3]) {
     ui.row(f.x, f.y, label);
@@ -451,42 +605,15 @@ fn colour_row(ui: &mut Ui, f: &mut Form, label: &str, v: &mut f32, colour: &dyn 
 
 /// One drawn cursor shape with these preferences, in `r` (logical px). The picture lives in the shell's icon atlas: the
 /// shell draws it when a page asks for it (`want`), the next frame shows it.
-fn cursor_preview(ui: &mut Ui, r: [f32; 4], shape: crate::cursor::Shape, prefs: &crate::cursor::CursorPrefs, cell: &dyn Fn(&str) -> Option<u32>, want: &mut Vec<String>) {
-    let key = crate::cursor::preview_key(shape, prefs, ui.accent);
-    match cell(&key) {
-        Some(c) => ui.d.image(r, 0.0, c),
-        None => want.push(key),
-    }
-}
-
-/// One row of choices shown as the cursors they give: a tile per choice with the cursor drawn that way and its name under
-/// it; the chosen one ringed in the accent. Tiles have one width on every row, from the same left edge as the controls.
+/// `slot` names the place on the page: a place has one cell of the atlas, drawn over when what it shows changes.
 #[allow(clippy::too_many_arguments)]
-fn shape_tiles<T: Copy + PartialEq>(ui: &mut Ui, x0: f32, y: f32, label: &str, v: &mut T, opts: &[(T, &str)], shape: crate::cursor::Shape, base: &crate::cursor::CursorPrefs, set: fn(&mut crate::cursor::CursorPrefs, T), cell: &dyn Fn(&str) -> Option<u32>, want: &mut Vec<String>) {
-    ui.row(x0, y + 37.0, label);
-    let (tw, th, gap) = (if opts.len() > 4 { 78.0 } else { 104.0 }, 62.0, 10.0);
-    for (k, (val, name)) in opts.iter().enumerate() {
-        let r = [x0 + 150.0 + k as f32 * (tw + gap), y + 6.0, tw, th];
-        let hov = ui.hit(r);
-        let sel = *v == *val;
-        if sel {
-            ui.fill([r[0] - 2.0, r[1] - 2.0, r[2] + 4.0, r[3] + 4.0], 13.0, ui.accent, 0.9);
-            ui.fill(r, 11.0, if ui.dark { [0.149, 0.149, 0.149] } else { [0.96, 0.97, 1.0] }, 1.0);
-        }
-        ui.fill(r, 11.0, ui.ink, if hov { 0.10 } else { 0.05 });
-        // the cursor as this choice draws it (the current look with only this choice changed)
-        let mut p = base.clone();
-        set(&mut p, *val);
-        cursor_preview(ui, [r[0] + r[2] / 2.0 - 16.0, r[1] + 6.0, 32.0, 32.0], shape, &p, cell, want);
-        ui.text(r[0] + r[2] / 2.0, r[1] + r[3] - 8.0, name, 11.5, sel, ui.ink, if sel { 0.95 } else { 0.7 }, Align::Center);
-        if hov {
-            ui.want_cursor(Cursor::Pointer);
-            if ui.click && !sel {
-                *v = *val;
-                ui.changed = true;
-            }
-        }
+fn cursor_preview(ui: &mut Ui, r: [f32; 4], slot: &str, shape: crate::cursor::Shape, prefs: &crate::cursor::CursorPrefs, cell: &dyn Fn(&str) -> Option<u32>, want: &mut Vec<String>) {
+    let key = crate::cursor::preview_key(slot, shape, prefs, ui.accent);
+    if let Some(c) = cell(crate::cursor::preview_slot(&key)).or_else(|| cell(&key)) {
+        ui.d.image(r, 0.0, c);
     }
+    // (wanted every frame: the shell draws the cell again only when the key is another)
+    want.push(key);
 }
 
 pub(super) fn page_mouse(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
@@ -574,8 +701,7 @@ pub(super) fn page_touchpad(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, 
 }
 
 pub(super) fn page_cursor(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw: f32) {
-    use crate::cursor::{CursorLook, LaunchAnim, Shape, ARROWS, BEAMS, BUSY_STYLES, EDGES, HANDS, LAUNCH_ANIMS, LOOKS, RESIZES};
-    use crate::input::Accel;
+    use crate::cursor::{BusyStyle, CursorLook, LaunchAnim, Shape, BUSY_STYLES, EDGES, LAUNCH_ANIMS, LOOKS};
     ui.text(x, y + 52.0, "Cursor", 22.0, true, ui.ink, 0.97, Align::Left);
     let input = &mut ctx.cfg.input;
     const PITCH: f32 = 46.0;
@@ -633,7 +759,7 @@ pub(super) fn page_cursor(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw
     // a scrap of the accent colour for the cursor to stand on, as it will on a wallpaper
     ui.grad(hero, 12.0, ui.accent, [ui.accent[0] * 0.55, ui.accent[1] * 0.55, ui.accent[2] * 0.7], 0.55);
     if drawn {
-        cursor_preview(ui, [hero[0] + hero[2] / 2.0 - 32.0, hero[1] + hero[3] / 2.0 - 32.0, 64.0, 64.0], Shape::Default, c, ctx.app_icon, ctx.want_icons);
+        cursor_preview(ui, [hero[0] + hero[2] / 2.0 - 38.0, hero[1] + hero[3] / 2.0 - 38.0, 76.0, 76.0], "hero", Shape::Default, c, ctx.app_icon, ctx.want_icons);
     } else {
         ui.text(hero[0] + hero[2] / 2.0, hero[1] + hero[3] / 2.0 + 4.0, "The theme's own cursor", 12.0, false, [1.0; 3], 0.9, Align::Center);
     }
@@ -676,7 +802,8 @@ pub(super) fn page_cursor(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw
         let pitch = (room / shapes.len() as f32).min(48.0);
         let sx = x + 16.0 + (room - pitch * shapes.len() as f32) / 2.0;
         for (i, sh) in shapes.iter().enumerate() {
-            cursor_preview(ui, [sx + pitch * i as f32 + (pitch - 32.0) / 2.0, top + ph - 48.0, 32.0, 32.0], *sh, c, ctx.app_icon, ctx.want_icons);
+            let side = pitch.min(38.0);
+            cursor_preview(ui, [sx + pitch * i as f32 + (pitch - side) / 2.0, top + ph - 32.0 - side / 2.0, side, side], &format!("strip{i}"), *sh, c, ctx.app_icon, ctx.want_icons);
         }
     }
     next = top + ph + 34.0;
@@ -702,37 +829,38 @@ pub(super) fn page_cursor(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, cw
         f.slider_text(ui, "Shadow", &mut shadow, 0.0, 100.0, &|v| if v < 0.5 { "Off".into() } else { format!("{v:.0}%") });
         c.shadow = shadow.round() / 100.0;
 
-        // ---- each shape's own choice: the choices are the cursors themselves
+        // ---- each shape's own choice: the choices are the cursors themselves, the last is the shape built with sliders
         ui.section(x, next, "SHAPES");
-        let rows = 4.0;
-        let row_h = 74.0;
-        let top = next + 12.0;
-        group(ui, [x, top, cw, rows * row_h + 8.0]);
-        for i in 1..4 {
-            separator(ui, x, top + 4.0 + i as f32 * row_h, cw);
-        }
-        let mut yy = top + 4.0;
-        let base = c.clone();
-        shape_tiles(ui, x + 16.0, yy, "Arrow", &mut c.arrow, &ARROWS, Shape::Default, &base, |p, v| p.arrow = v, ctx.app_icon, ctx.want_icons);
-        yy += row_h;
-        let base = c.clone();
-        shape_tiles(ui, x + 16.0, yy, "Over links", &mut c.hand, &HANDS, Shape::Pointer, &base, |p, v| p.hand = v, ctx.app_icon, ctx.want_icons);
-        yy += row_h;
-        let base = c.clone();
-        shape_tiles(ui, x + 16.0, yy, "Over text", &mut c.beam, &BEAMS, Shape::Text, &base, |p, v| p.beam = v, ctx.app_icon, ctx.want_icons);
-        yy += row_h;
-        let base = c.clone();
-        shape_tiles(ui, x + 16.0, yy, "Over edges", &mut c.resize, &RESIZES, Shape::ResizeNwse, &base, |p, v| p.resize = v, ctx.app_icon, ctx.want_icons);
-        next = top + rows * row_h + 8.0 + 34.0;
+        let mut pv = shape_editor::Previews { cell: ctx.app_icon, want: &mut *ctx.want_icons };
+        next = shape_editor::shapes(ui, &mut pv, c, x, next + 12.0, cw) + 34.0;
     }
 
     // ---- the busy cursor
-    let (mut f, n) = card(ui, next, "LOADING", if drawn { 2 } else { 1 });
+    let (mut f, mut n) = card(ui, next, "LOADING", if drawn { 2 } else { 1 });
+    let busy_editor = drawn && c.custom.busy.on;
     if drawn {
-        f.pick(ui, "Style", &mut c.busy, &BUSY_STYLES);
+        let mut style: Option<BusyStyle> = (!c.custom.busy.on).then_some(c.busy);
+        let mut opts: Vec<(Option<BusyStyle>, &str)> = BUSY_STYLES.iter().map(|(v, name)| (Some(*v), *name)).collect();
+        opts.push((None, "Custom"));
+        if f.pick(ui, "Style", &mut style, &opts) {
+            match style {
+                Some(s) => {
+                    c.busy = s;
+                    c.custom.busy.on = false;
+                }
+                None => {
+                    let base = c.clone();
+                    c.custom.busy.choose(&base);
+                }
+            }
+        }
     }
     f.slider(ui, "Speed", &mut c.busy_speed, 0.25, 3.0, "×");
     c.busy_speed = (c.busy_speed * 20.0).round() / 20.0;
+    if busy_editor {
+        let mut pv = shape_editor::Previews { cell: ctx.app_icon, want: &mut *ctx.want_icons };
+        n = shape_editor::busy(ui, &mut pv, c, x, n - 24.0, cw) + 34.0;
+    }
 
     // ---- the starting program's icon beside the busy cursor
     let rows = match (c.launch_icon, c.launch_anim) {
@@ -908,4 +1036,38 @@ pub(super) fn page_displays(ui: &mut Ui, ctx: &mut SettingsCtx, x: f32, y: f32, 
         actions.push(SettingsAction::ApplyDisplays);
     }
     ui.text(x, f.y + 6.0, "Changes take effect when you press Apply.", 12.0, false, ui.ink, 0.55, Align::Left);
+}
+
+#[cfg(test)]
+mod sheet_tests {
+    use super::{wrap_lines, ShortcutSheet};
+
+    #[test]
+    fn no_label_reaches_its_field() {
+        let mut width = |s: &str| s.chars().count() as f32 * 7.0;
+        let mut labels: Vec<String> = crate::keys::ACTIONS.iter().map(|(_, l, _)| l.to_string()).collect();
+        // a long translation, a word that cannot be broken between words, a script without spaces
+        labels.extend(["Показати всі вікна (огляд; три пальці вгору на тачпаді) і ще трохи слів".to_string(), "Verknüpfungsverwaltungseinstellungen".repeat(2), "显示所有窗口".repeat(8), String::new()]);
+        for cw in [240.0, 378.0, 470.0, 583.0, 584.0, 648.0, 780.0] {
+            let sheet = ShortcutSheet::new(cw, &labels, &mut width);
+            let room = sheet.col - sheet.field - ShortcutSheet::CLEAR;
+            assert_eq!(sheet.rows.len(), labels.len());
+            let mut last: std::collections::HashMap<i32, f32> = Default::default();
+            for (row, label) in sheet.rows.iter().zip(&labels) {
+                assert!(row.x + sheet.col <= cw + 0.1, "{cw}: a column leaves the page");
+                for line in &row.lines {
+                    assert!(width(line) <= room.max(30.0) + 0.1, "{cw}: {line:?} is under the field");
+                }
+                let half = super::row_height(row.lines.len(), 12.0, 36.0) / 2.0;
+                let end = last.entry(row.x as i32).or_insert(0.0);
+                assert!(row.y - half >= *end - 0.1, "{cw}: {label:?} covers the row above");
+                *end = row.y + half;
+                assert!(*end <= sheet.height + 0.1);
+                let spaceless = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+                assert_eq!(spaceless(&row.lines.concat()), spaceless(label), "{cw}: text was lost");
+            }
+            assert_eq!(last.len(), if cw >= 584.0 { 2 } else { 1 }, "{cw}");
+        }
+        assert_eq!(wrap_lines("", 50.0, &mut width), [""]);
+    }
 }
